@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { Grid3x3 } from "lucide-react";
 
 const tabs = [
   {
@@ -36,23 +37,10 @@ const tabs = [
     ),
   },
   {
-    href: "/split",
-    label: "Split",
-    icon: (
-      <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4" />
-      </svg>
-    ),
-  },
-  {
-    href: "/signature",
-    label: "Signature",
-    icon: (
-      <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M4 18c5-8 11-8 16 0" />
-        <path strokeLinecap="round" strokeLinejoin="round" d="M5 18h14" />
-      </svg>
-    ),
+    href: "/tools",
+    label: "More",
+    icon: <Grid3x3 className="h-5 w-5" strokeWidth={1.5} />,
+    matchPrefix: true,
   },
 ];
 
@@ -63,7 +51,10 @@ export default function MobileTabBar() {
     <nav className="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background/95 backdrop-blur-md sm:hidden">
       <div className="flex h-14">
         {tabs.map((tab) => {
-          const active = pathname === tab.href;
+          const active =
+            "matchPrefix" in tab && tab.matchPrefix
+              ? pathname === tab.href || (tab.href === "/tools" && pathname !== "/" && pathname !== "/compress" && pathname !== "/merge")
+              : pathname === tab.href;
           return (
             <Link
               key={tab.href}

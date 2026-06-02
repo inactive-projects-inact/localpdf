@@ -4,11 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PDFDocument } from "pdf-lib";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
+import { useFileHistory } from "../components/FileHistoryProvider";
+import { getToolDefinition } from "../lib/tool-registry";
 import {
   applySignature,
   clearSignatureCanvas,
   initDrawCanvas,
   isValidImageFile,
+  isValidPdfFile,
   PLACEMENT_CONFIG,
   SIGNATURE_MODES,
   undoLastStroke,
@@ -19,6 +22,8 @@ const MODE_TABS = [
   { id: SIGNATURE_MODES.TYPE, label: "Type" },
   { id: SIGNATURE_MODES.UPLOAD, label: "Upload" },
 ];
+
+const TOOL = getToolDefinition("signature");
 
 export default function SignatureMain() {
   const [pdfFile, setPdfFile] = useState(null);
@@ -35,6 +40,7 @@ export default function SignatureMain() {
   const [status, setStatus] = useState("idle");
   const [stage, setStage] = useState("idle");
   const [errorMessage, setErrorMessage] = useState(null);
+  const { pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const canvasRef = useRef(null);
   const strokeHistoryRef = useRef([]);
@@ -54,10 +60,20 @@ export default function SignatureMain() {
   }, []);
 
   useEffect(() => {
+    if (pendingFiles.length > 0 && (!pendingTool || pendingTool === "signature") && !pdfFile) {
+      const nextFile = pendingFiles[0];
+      queueMicrotask(() => {
+        setPdfFile(nextFile);
+        clearPendingFiles();
+      });
+    }
+  }, [pendingFiles, pendingTool, pdfFile, clearPendingFiles]);
+
+  useEffect(() => {
     let cancelled = false;
 
     const refreshPageCount = async () => {
-      if (!pdfFile || pdfFile.type !== "application/pdf" || pdfFile.size === 0) {
+      if (!isValidPdfFile(pdfFile)) {
         setPageCount(1);
         setPageNumber(1);
         return;
@@ -111,12 +127,7 @@ export default function SignatureMain() {
   };
 
   const handleSign = async () => {
-    if (!pdfFile) {
-      toast.error("Please select a valid PDF.");
-      return;
-    }
-
-    if (pdfFile.type !== "application/pdf") {
+    if (!isValidPdfFile(pdfFile)) {
       toast.error("Please select a valid PDF.");
       return;
     }
@@ -208,7 +219,7 @@ export default function SignatureMain() {
               <input
                 id="pdf-input"
                 type="file"
-                accept="application/pdf"
+                accept={TOOL.input.acceptAttribute}
                 onChange={handlePdfChange}
                 className="block w-full cursor-pointer rounded-xl border border-border bg-background px-4 py-3 text-sm text-foreground file:mr-4 file:rounded-lg file:border-0 file:bg-indigo-500 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
               />
@@ -382,7 +393,7 @@ export default function SignatureMain() {
                 <input
                   id="sig-upload"
                   type="file"
-                  accept="image/png,image/jpeg,image/jpg"
+                  accept={getToolDefinition("jpg2pdf").input.acceptAttribute}
                   onChange={(event) => {
                     const file = event.target.files?.[0] ?? null;
                     if (file && !isValidImageFile(file)) {

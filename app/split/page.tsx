@@ -8,11 +8,12 @@ import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import ShortcutHint from "../components/ShortcutHint";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
+import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
 
 type SplitMode = "range" | "all";
 type SplitStatus = "idle" | "loading" | "splitting" | "done" | "error";
 
-const MAX_SIZE = 500 * 1024 * 1024;
+const TOOL = getToolDefinition("split");
 
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -21,15 +22,6 @@ function downloadBlob(blob: Blob, filename: string) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
-}
-
-async function validatePdf(file: File): Promise<boolean> {
-  try {
-    const header = await file.slice(0, 5).text();
-    return header.startsWith("%PDF-");
-  } catch {
-    return false;
-  }
 }
 
 export default function SplitPage() {
@@ -44,7 +36,7 @@ export default function SplitPage() {
   const [resultBlob, setResultBlob] = useState<Blob | null>(null);
   const [resultFilename, setResultFilename] = useState("split.pdf");
 
-  const { addFile, pendingFiles, clearPendingFiles } = useFileHistory();
+  const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const resetResult = useCallback(() => {
     setResultBlob(null);
@@ -67,7 +59,7 @@ export default function SplitPage() {
       setStatus("loading");
       resetResult();
 
-      const valid = await validatePdf(uploaded);
+      const valid = await hasPdfHeader(uploaded);
       if (!valid) {
         setStatus("error");
         toast.error("This file is not a valid PDF.", { id: "split-load" });
@@ -96,9 +88,12 @@ export default function SplitPage() {
 
   // Auto-load file dropped on HeroDropzone
   useEffect(() => {
-    if (pendingFiles.length > 0 && !file) {
-      void loadPdf(pendingFiles[0]);
-      clearPendingFiles();
+    if (pendingFiles.length > 0 && !file && (!pendingTool || pendingTool === "split")) {
+      const nextFile = pendingFiles[0];
+      queueMicrotask(() => {
+        void loadPdf(nextFile);
+        clearPendingFiles();
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -113,10 +108,10 @@ export default function SplitPage() {
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
-    accept: { "application/pdf": [".pdf"] },
+    accept: TOOL.input.accept,
     multiple: false,
     maxFiles: 1,
-    maxSize: MAX_SIZE,
+    maxSize: TOOL.input.maxSizeBytes,
     noClick: file !== null,
     noKeyboard: true,
     onDropRejected: (rejections) => {

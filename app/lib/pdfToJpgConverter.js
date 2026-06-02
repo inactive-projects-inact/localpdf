@@ -1,5 +1,6 @@
 import * as pdfjsLib from "pdfjs-dist";
 import JSZip from "jszip";
+import { isFileAcceptedByTool } from "./tool-registry";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -19,7 +20,7 @@ function ensureBrowserFile(file) {
 }
 
 export function isValidPdfFile(file) {
-  return typeof File !== "undefined" && file instanceof File && file.type === "application/pdf" && file.size > 0;
+  return typeof File !== "undefined" && file instanceof File && isFileAcceptedByTool(file, "pdf2jpg");
 }
 
 function baseNameFromFileName(fileName) {
@@ -57,7 +58,7 @@ function getZeroPadWidth(totalPages) {
 export async function convertPdfToJpg(file, onProgress = null) {
   ensureBrowserFile(file);
 
-  if (file.type !== "application/pdf") {
+  if (!isFileAcceptedByTool(file, "pdf2jpg")) {
     throw new TypeError("Please select a valid PDF file.");
   }
 
@@ -73,7 +74,7 @@ export async function convertPdfToJpg(file, onProgress = null) {
     pdfDoc = await loadingTask.promise;
   } catch (err) {
     await loadingTask.destroy().catch(() => {});
-    if (err instanceof pdfjsLib.PasswordException || err?.name === "PasswordException") {
+    if (err?.name === "PasswordException") {
       throw new Error("This PDF is password-protected. Decryption is not supported.");
     }
     throw new Error("This PDF could not be read. It may be corrupt or unsupported.");

@@ -1,3 +1,5 @@
+import { isFileAcceptedByTool } from "./tool-registry";
+
 export const PRESETS = {
   low: {
     imageQuality: 0.85,
@@ -30,7 +32,7 @@ function isBrowserFile(file) {
 }
 
 export function isValidPdfFile(file) {
-  return isBrowserFile(file) && file.type === "application/pdf" && file.size > 0;
+  return isBrowserFile(file) && isFileAcceptedByTool(file, "compress");
 }
 
 function baseNameFromFileName(fileName) {

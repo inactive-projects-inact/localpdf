@@ -52,7 +52,7 @@ export async function compressPdf(
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("Canvas is not supported in this browser");
 
-      await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+      await page.render({ canvasContext: ctx, viewport }).promise;
 
       const jpegBytes = await canvasToJpegBytes(canvas, jpegQuality);
 

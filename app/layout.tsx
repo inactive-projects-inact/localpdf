@@ -1,17 +1,9 @@
 import type { Metadata } from "next";
-import { Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 import ThemeProvider from "./components/ThemeProvider";
 import FileHistoryProvider from "./components/FileHistoryProvider";
 import ToastManager from "./components/ToastManager";
 import CookieConsent from "./components/CookieConsent";
-
-const jakarta = Plus_Jakarta_Sans({
-  variable: "--font-jakarta",
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700", "800"],
-  display: "swap",
-});
 
 export const metadata: Metadata = {
   title: {
@@ -39,9 +31,10 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://localpdf.dev"),
   alternates: { canonical: "https://localpdf.dev" },
   manifest: "/manifest.json",
-  verification: {
-    google: "abc123DEF456ghi789JKL012mno345PQR678stu901",
-  },
+  // verification: {
+  //   google: "REPLACE_WITH_REAL_TOKEN_FROM_GOOGLE_SEARCH_CONSOLE",
+  //   // Go to search.google.com/search-console → Add Property → HTML tag method
+  // },
   openGraph: {
     type: "website",
     siteName: "LocalPDF",
@@ -74,7 +67,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${jakarta.variable} h-full scroll-smooth antialiased`}
+      className="h-full scroll-smooth antialiased"
       suppressHydrationWarning
     >
       <head>

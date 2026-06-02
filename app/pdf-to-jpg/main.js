@@ -1,19 +1,22 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
+import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import { convertPdfToJpg, isValidPdfFile } from "../lib/pdfToJpgConverter";
+import { getToolDefinition } from "../lib/tool-registry";
 
-const MAX_SIZE = 500 * 1024 * 1024;
+const TOOL = getToolDefinition("pdf2jpg");
 
 export default function PdfToJpgMain() {
   const [file, setFile] = useState(null);
   const [status, setStatus] = useState("idle");
   const [errorMessage, setErrorMessage] = useState(null);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
+  const { pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const resetState = useCallback(() => {
     setFile(null);
@@ -58,18 +61,28 @@ export default function PdfToJpgMain() {
     void handleConvert(acceptedFiles[0]);
   }, [handleConvert]);
 
+  useEffect(() => {
+    if (pendingFiles.length > 0 && (!pendingTool || pendingTool === "pdf2jpg") && !file) {
+      const nextFile = pendingFiles[0];
+      queueMicrotask(() => {
+        clearPendingFiles();
+        void handleConvert(nextFile);
+      });
+    }
+  }, [pendingFiles, pendingTool, file, clearPendingFiles, handleConvert]);
+
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
-    accept: { "application/pdf": [".pdf"] },
+    accept: TOOL.input.accept,
     multiple: false,
     maxFiles: 1,
-    maxSize: MAX_SIZE,
+    maxSize: TOOL.input.maxSizeBytes,
     noClick: true,
     noKeyboard: true,
     onDropRejected: (rejections) => {
       const err = rejections[0]?.errors[0];
       if (err?.code === "file-too-large") {
-        toast.error("File exceeds the 500 MB limit.");
+        toast.error(`File exceeds the ${Math.round(TOOL.input.maxSizeBytes / 1024 / 1024)} MB limit.`);
       } else {
         toast.error("Please select a valid PDF file.");
       }
@@ -116,7 +129,7 @@ export default function PdfToJpgMain() {
             </div>
 
             <p className="mt-4 text-base font-semibold text-foreground">
-              {isDragActive ? "Drop your PDF here" : "Drag & drop a PDF file"}
+              {isDragActive ? TOOL.input.dragActiveTitle : TOOL.input.emptyTitle}
             </p>
             <p className="mt-1 text-sm text-muted">or</p>
 
@@ -129,9 +142,9 @@ export default function PdfToJpgMain() {
                 }}
                 className="inline-flex items-center justify-center rounded-xl bg-sky-500 px-6 py-2.5 text-sm font-semibold text-white shadow-md transition-transform hover:scale-105 active:scale-95"
               >
-                Browse file
+                {TOOL.input.browseLabel}
               </button>
-              <p className="text-xs text-muted">PDF only, processed locally</p>
+              <p className="text-xs text-muted">{TOOL.input.helperText}</p>
             </div>
           </div>
         )}

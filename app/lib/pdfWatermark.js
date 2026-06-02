@@ -1,4 +1,5 @@
 import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
+import { isFileAcceptedByTool } from "./tool-registry";
 
 export const CONFIG = {
   WATERMARK_TYPE: "text", // 'text' | 'image'
@@ -17,16 +18,11 @@ function ensureBrowserFile(file) {
 }
 
 export function isValidPdfFile(file) {
-  return ensureBrowserFile(file) && file.type === "application/pdf" && file.size > 0;
+  return ensureBrowserFile(file) && isFileAcceptedByTool(file, "watermark");
 }
 
 export function isValidImageFile(file) {
-  if (!ensureBrowserFile(file) || file.size === 0) {
-    return false;
-  }
-
-  const mimeType = file.type.toLowerCase();
-  return mimeType === "image/png" || mimeType === "image/jpeg" || mimeType === "image/jpg";
+  return ensureBrowserFile(file) && isFileAcceptedByTool(file, "jpg2pdf");
 }
 
 function baseNameFromFileName(fileName) {

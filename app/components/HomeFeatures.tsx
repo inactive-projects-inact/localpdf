@@ -1,44 +1,34 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { toast } from "sonner";
 import Reveal from "./Reveal";
 import type { HomeToolId } from "../lib/design-system";
-import { homeToolRoutes } from "../lib/design-system";
+import { orderedHomeTools } from "../lib/design-system";
 
 interface TileProps {
   tool: HomeToolId;
-  name: string;
-  desc: string;
-  iconClass: string;
   delay: number;
   icon: React.ReactNode;
   onSelect: (tool: HomeToolId) => void;
 }
 
-function FeatureTile({ tool, name, desc, iconClass, delay, icon, onSelect }: TileProps) {
+function FeatureTile({ tool, delay, icon, onSelect }: TileProps) {
   const router = useRouter();
+  const definition = orderedHomeTools.find((item) => item.id === tool);
+  if (!definition) return null;
 
   const handleClick = () => {
     onSelect(tool);
-    const route = homeToolRoutes[tool];
-    if (route) {
-      router.push(route);
-      return;
-    }
-    toast.message("Coming soon", {
-      description: `${name} is on the way. Try Compress, Merge, or Split today.`,
-    });
-    document.getElementById("top")?.scrollIntoView({ behavior: "smooth" });
+    router.push(definition.route);
   };
 
   return (
     <Reveal delay={delay}>
       <button type="button" className="tile-lp" onClick={handleClick}>
-        <div className={`tile-lp__icon-wrap ${iconClass}`}>{icon}</div>
+        <div className={`tile-lp__icon-wrap ${definition.accentClass}`}>{icon}</div>
         <div className="min-w-0 flex-1 text-left">
-          <div className="text-[15px] font-semibold text-foreground">{name}</div>
-          <div className="mt-0.5 text-[13px] text-muted">{desc}</div>
+          <div className="text-[15px] font-semibold text-foreground">{definition.label}</div>
+          <div className="mt-0.5 text-[13px] text-muted">{definition.homeDescription}</div>
         </div>
         <span className="tile-lp__chevron" aria-hidden="true">
           ›
@@ -66,12 +56,9 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
               <h3 className="text-lg font-bold text-accent">Quick Fix</h3>
               <p className="mt-1 text-[13px] text-muted">Get things done fast</p>
             </Reveal>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
               <FeatureTile
                 tool="compress"
-                name="Compress"
-                desc="Shrink file size instantly"
-                iconClass="tile-lp__icon-wrap--green"
                 delay={0}
                 onSelect={onSelectTool}
                 icon={
@@ -82,9 +69,6 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
               />
               <FeatureTile
                 tool="merge"
-                name="Merge"
-                desc="Combine PDFs into one"
-                iconClass="tile-lp__icon-wrap--purple"
                 delay={120}
                 onSelect={onSelectTool}
                 icon={
@@ -95,14 +79,21 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
               />
               <FeatureTile
                 tool="split"
-                name="Split"
-                desc="Extract or divide pages"
-                iconClass="tile-lp__icon-wrap--blue"
                 delay={240}
                 onSelect={onSelectTool}
                 icon={
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4" />
+                  </svg>
+                }
+              />
+              <FeatureTile
+                tool="rotate"
+                delay={360}
+                onSelect={onSelectTool}
+                icon={
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M21 3a8 8 0 10-6.5 13.5M21 3v4M21 3h-4" />
                   </svg>
                 }
               />
@@ -117,9 +108,6 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
             <div className="grid gap-4 sm:grid-cols-2">
               <FeatureTile
                 tool="jpg2pdf"
-                name="JPG→PDF"
-                desc="Images to PDF document"
-                iconClass="tile-lp__icon-wrap--orange"
                 delay={0}
                 onSelect={onSelectTool}
                 icon={
@@ -131,9 +119,6 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
               />
               <FeatureTile
                 tool="pdf2jpg"
-                name="PDF→JPG"
-                desc="Export pages as images"
-                iconClass="tile-lp__icon-wrap--teal"
                 delay={120}
                 onSelect={onSelectTool}
                 icon={
@@ -154,9 +139,6 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
             <div className="grid gap-4 sm:grid-cols-2">
               <FeatureTile
                 tool="watermark"
-                name="Watermark"
-                desc="Stamp text or logos"
-                iconClass="tile-lp__icon-wrap--blue"
                 delay={0}
                 onSelect={onSelectTool}
                 icon={
@@ -167,9 +149,6 @@ export default function HomeFeatures({ onSelectTool }: HomeFeaturesProps) {
               />
               <FeatureTile
                 tool="signature"
-                name="Signature"
-                desc="Sign documents digitally"
-                iconClass="tile-lp__icon-wrap--amber"
                 delay={120}
                 onSelect={onSelectTool}
                 icon={

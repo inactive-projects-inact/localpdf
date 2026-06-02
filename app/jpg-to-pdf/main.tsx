@@ -1,18 +1,17 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
+import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import { convertImagesToPdf, isAcceptedImageFile } from "../lib/jpgToPdfConverter";
+import { getToolDefinition } from "../lib/tool-registry";
 
 type ConvertStatus = "idle" | "converting" | "done" | "error";
 
-const INPUT_ACCEPT = {
-  "image/jpeg": [".jpg", ".jpeg"],
-  "image/png": [".png"],
-};
+const TOOL = getToolDefinition("jpg2pdf");
 
 let pdfLibReady: Promise<void> | null = null;
 
@@ -55,6 +54,7 @@ export default function JpgToPdfMain() {
   const [files, setFiles] = useState<File[]>([]);
   const [status, setStatus] = useState<ConvertStatus>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const { pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const totalSize = useMemo(() => files.reduce((sum, file) => sum + file.size, 0), [files]);
 
@@ -102,18 +102,29 @@ export default function JpgToPdfMain() {
     [runConversion, status],
   );
 
+  useEffect(() => {
+    if (pendingFiles.length > 0 && (!pendingTool || pendingTool === "jpg2pdf") && files.length === 0) {
+      const nextFiles = pendingFiles;
+      queueMicrotask(() => {
+        clearPendingFiles();
+        handleIncomingFiles(nextFiles);
+      });
+    }
+  }, [pendingFiles, pendingTool, files.length, clearPendingFiles, handleIncomingFiles]);
+
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
-    accept: INPUT_ACCEPT,
-    multiple: true,
+    accept: TOOL.input.accept,
+    multiple: TOOL.input.multiple,
+    maxSize: TOOL.input.maxSizeBytes,
     noClick: true,
     noKeyboard: true,
     onDrop: handleIncomingFiles,
     onDropRejected: (rejections) => {
       const err = rejections[0]?.errors[0];
       if (err?.code === "file-too-large") {
-        toast.error("One of the images exceeds the allowed file size.");
+        toast.error(`One of the images exceeds the ${Math.round(TOOL.input.maxSizeBytes / 1024 / 1024)} MB limit.`);
       } else {
-        toast.error("Only JPEG and PNG images are accepted.");
+        toast.error(TOOL.input.invalidMessage);
       }
     },
   });
@@ -157,7 +168,7 @@ export default function JpgToPdfMain() {
           </div>
 
           <p className="mt-4 text-base font-semibold text-foreground">
-            {isDragActive ? "Drop your images here" : "Drag & drop JPG or PNG files"}
+            {isDragActive ? TOOL.input.dragActiveTitle : TOOL.input.emptyTitle}
           </p>
           <p className="mt-1 text-sm text-muted">or</p>
 
@@ -171,9 +182,9 @@ export default function JpgToPdfMain() {
               disabled={isConverting}
               className="inline-flex items-center justify-center rounded-xl bg-orange-500 px-6 py-2.5 text-sm font-semibold text-white shadow-md transition-transform hover:scale-105 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              Browse files
-            </button>
-            <p className="text-xs text-muted">JPEG and PNG only</p>
+                {TOOL.input.browseLabel}
+              </button>
+            <p className="text-xs text-muted">{TOOL.input.helperText}</p>
           </div>
         </div>
 

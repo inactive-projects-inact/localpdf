@@ -1,7 +1,0 @@
-User-agent: *
-Allow: /
-Disallow: /api/
-Disallow: /admin/
-Crawl-delay: 10
-
-Sitemap: https://localpdf.dev/sitemap.xml

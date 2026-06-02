@@ -17,18 +17,34 @@ export const toolAccents = {
   compress: { color: colors.green, bg: "#0F2A1A", label: "Compress" },
   merge: { color: "#9B59B6", bg: "#1A0F2A", label: "Merge" },
   split: { color: "#3498DB", bg: "#0F1A2A", label: "Split" },
+  rotate: { color: "#10B981", bg: "#0F2A1A", label: "Rotate" },
+  textToPdf: { color: "#3B3BFF", bg: "#0F0F2A", label: "Text to PDF" },
+  resize: { color: "#3B82F6", bg: "#0F1A2A", label: "Resize" },
+  pageNumbers: { color: "#FF4D4D", bg: "#2A0F0F", label: "Page Numbers" },
+  crop: { color: "#F59E0B", bg: "#2A200F", label: "Crop" },
+  jpg2pdf: { color: "#F97316", bg: "#2A1608", label: "JPG->PDF" },
+  pdf2jpg: { color: "#0EA5E9", bg: "#071D2A", label: "PDF->JPG" },
+  watermark: { color: "#38BDF8", bg: "#08202A", label: "Watermark" },
+  redact: { color: "#FF4D4D", bg: "#2A0F0F", label: "Redact" },
+  signature: { color: "#6366F1", bg: "#11112A", label: "Signature" },
+  pdfToWord: { color: "#3B82F6", bg: "#0F1A2A", label: "PDF to Word" },
+  wordToPdf: { color: "#3B3BFF", bg: "#0F0F2A", label: "Word to PDF" },
+  pdfToExcel: { color: "#10B981", bg: "#0F2A1A", label: "PDF to Excel" },
+  excelToPdf: { color: "#F59E0B", bg: "#2A200F", label: "Excel to PDF" },
+  protect: { color: "#FF4D4D", bg: "#2A0F0F", label: "Protect PDF" },
+  unlock: { color: "#10B981", bg: "#0F2A1A", label: "Unlock PDF" },
+  ocr: { color: "#3B3BFF", bg: "#0F0F2A", label: "OCR PDF" },
+  organize: { color: "#3B82F6", bg: "#0F1A2A", label: "Organize PDF" },
 } as const;
 
 export type ToolName = keyof typeof toolAccents;
 
-export type HomeToolId = ToolName | "jpg2pdf" | "pdf2jpg" | "watermark" | "signature";
-
-export const homeToolRoutes: Partial<Record<HomeToolId, string>> = {
-  compress: "/compress",
-  merge: "/merge",
-  split: "/split",
-  jpg2pdf: "/jpg-to-pdf",
-  pdf2jpg: "/pdf-to-jpg",
-  watermark: "/watermark",
-  signature: "/signature",
-};
+export {
+  getToolDefinition,
+  homeToolRoutes,
+  isFileAcceptedByTool,
+  orderedHomeTools,
+  toolRegistry,
+  validateFilesForTool,
+} from "./tool-registry";
+export type { ToolId as HomeToolId, ToolId } from "./tool-registry";

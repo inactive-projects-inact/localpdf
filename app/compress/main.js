@@ -7,8 +7,9 @@ import AppShell from "../components/AppShell";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import { PRESETS, compressPdf, isValidPdfFile } from "../lib/pdfCompressor";
+import { getToolDefinition } from "../lib/tool-registry";
 
-const MAX_SIZE = 100 * 1024 * 1024;
+const TOOL = getToolDefinition("compress");
 
 export default function CompressMain() {
   const [file, setFile] = useState(null);
@@ -18,7 +19,7 @@ export default function CompressMain() {
   const [progress, setProgress] = useState({ stage: "idle", current: 0, total: 0 });
   const [result, setResult] = useState(null);
 
-  const { pendingFiles, clearPendingFiles } = useFileHistory();
+  const { pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const selectedPreset = PRESETS[presetKey] ?? PRESETS.medium;
   const progressPercent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
@@ -45,12 +46,12 @@ export default function CompressMain() {
   }, []);
 
   useEffect(() => {
-    if (pendingFiles.length > 0 && !file) {
+    if (pendingFiles.length > 0 && !file && (!pendingTool || pendingTool === "compress")) {
       const nextFile = pendingFiles[0];
       clearPendingFiles();
       Promise.resolve().then(() => handleFile(nextFile));
     }
-  }, [pendingFiles, file, handleFile, clearPendingFiles]);
+  }, [pendingFiles, pendingTool, file, handleFile, clearPendingFiles]);
 
   const onDrop = useCallback((acceptedFiles) => {
     const uploaded = acceptedFiles[0];
@@ -59,12 +60,11 @@ export default function CompressMain() {
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
-    accept: { "application/pdf": [".pdf"] },
+    accept: TOOL.input.accept,
     multiple: false,
     maxFiles: 1,
-    maxSize: MAX_SIZE,
+    maxSize: TOOL.input.maxSizeBytes,
     noClick: file !== null,
-    noKeyboard: true,
     onDropRejected: (rejections) => {
       const err = rejections[0]?.errors[0];
       if (err?.code === "file-too-large") {
@@ -131,7 +131,7 @@ export default function CompressMain() {
               <input
                 id="pdf-input"
                 type="file"
-                accept="application/pdf"
+                accept={TOOL.input.acceptAttribute}
                 onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
                 className="block w-full cursor-pointer rounded-xl border border-border bg-background px-4 py-3 text-sm text-foreground file:mr-4 file:rounded-lg file:border-0 file:bg-compress file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
               />

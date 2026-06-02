@@ -24,6 +24,8 @@
  *   });
  */
 
+import { isFileAcceptedByTool } from "./tool-registry";
+
 // --- Constants ---------------------------------------------------------------
 
 /** A4 page dimensions in PDF points (72 DPI) */
@@ -32,9 +34,6 @@ const PAGE = {
   HEIGHT: 841.89,
   MARGIN: 28.35, // 10mm margin on each side
 };
-
-/** Accepted MIME types */
-const ACCEPTED_TYPES = new Set(["image/jpeg", "image/jpg", "image/png"]);
 
 // --- Internal Helpers --------------------------------------------------------
 
@@ -97,7 +96,7 @@ function validateFile(file, index) {
   if (!(file instanceof File)) {
     throw new TypeError(`[File ${index + 1}] Expected a File object, got ${typeof file}.`);
   }
-  if (!ACCEPTED_TYPES.has(file.type.toLowerCase())) {
+  if (!isFileAcceptedByTool(file, "jpg2pdf")) {
     throw new TypeError(
       `[File ${index + 1}] "${file.name}" - unsupported type "${file.type}". ` +
         "Only JPEG and PNG are accepted.",
@@ -210,5 +209,5 @@ export async function convertImagesToPdf(files, fileName = "converted.pdf") {
  * @returns {boolean}
  */
 export function isAcceptedImageFile(file) {
-  return file instanceof File && ACCEPTED_TYPES.has(file.type.toLowerCase());
+  return file instanceof File && isFileAcceptedByTool(file, "jpg2pdf");
 }

@@ -1,4 +1,5 @@
 import { PDFDocument } from "pdf-lib";
+import { isFileAcceptedByTool } from "./tool-registry";
 
 export const SIGNATURE_MODES = {
   DRAW: "draw",
@@ -42,16 +43,11 @@ function isBrowserFile(file) {
 }
 
 export function isValidPdfFile(file) {
-  return isBrowserFile(file) && file.type === "application/pdf" && file.size > 0;
+  return isBrowserFile(file) && isFileAcceptedByTool(file, "signature");
 }
 
 export function isValidImageFile(file) {
-  if (!isBrowserFile(file) || file.size === 0) {
-    return false;
-  }
-
-  const mimeType = String(file.type || "").toLowerCase();
-  return mimeType === "image/png" || mimeType === "image/jpeg" || mimeType === "image/jpg";
+  return isBrowserFile(file) && isFileAcceptedByTool(file, "jpg2pdf");
 }
 
 function baseNameFromFileName(fileName) {
@@ -451,7 +447,7 @@ export async function applySignature(pdfFile, mode, payload, options = {}, onPro
     throw new Error("The selected PDF file is empty.");
   }
 
-  if (pdfFile.type !== "application/pdf") {
+  if (!isFileAcceptedByTool(pdfFile, "signature")) {
     throw new Error("Only PDF files are accepted.");
   }
 

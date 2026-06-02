@@ -6,9 +6,7 @@ import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import { useFileHistory } from "./FileHistoryProvider";
 import type { HomeToolId } from "../lib/design-system";
-import { homeToolRoutes } from "../lib/design-system";
-
-const MAX_SIZE = 500 * 1024 * 1024;
+import { getToolDefinition, validateFilesForTool } from "../lib/design-system";
 
 interface HeroDropzoneProps {
   selectedTool: HomeToolId;
@@ -24,49 +22,50 @@ export default function HeroDropzone({
   pulseOnView = false,
 }: HeroDropzoneProps) {
   const router = useRouter();
-  const { setPendingFiles } = useFileHistory();
-  const [title, setTitle] = useState(
-    variant === "hero" ? "Drag & Drop your PDF here" : "Ready? Drop your PDF here.",
-  );
+  const { setPendingUpload } = useFileHistory();
+  const tool = getToolDefinition(selectedTool);
+  const defaultTitle = variant === "hero" ? tool.input.emptyTitle : `Ready? ${tool.input.emptyTitle}.`;
+  const [readyState, setReadyState] = useState<{ tool: HomeToolId; title: string } | null>(null);
   const [pulseVisible, setPulseVisible] = useState(false);
 
   const onDrop = useCallback(
     (acceptedFiles: File[]) => {
       if (acceptedFiles.length === 0) return;
 
-      if (!homeToolRoutes[selectedTool] && selectedTool !== "compress") {
-        toast.message("Coming soon", {
-          description: "This tool isn't available yet. We'll open Compress for now.",
+      void (async () => {
+        const validFiles = await validateFilesForTool(acceptedFiles, selectedTool);
+        if (validFiles.length === 0) {
+          toast.error(tool.input.invalidMessage);
+          return;
+        }
+
+        setPendingUpload(selectedTool, validFiles);
+        setReadyState({
+          tool: selectedTool,
+          title:
+            validFiles.length === 1
+              ? `${tool.input.readySingular}: ${validFiles[0].name}`
+              : `${validFiles.length} ${tool.input.readyPlural} - opening tool...`,
         });
-      }
-
-      setPendingFiles(acceptedFiles);
-      const names = acceptedFiles.map((f) => f.name);
-      setTitle(
-        names.length === 1
-          ? `Ready: ${names[0]}`
-          : `${names.length} PDFs ready — opening tool…`,
-      );
-
-      const target =
-        homeToolRoutes[selectedTool] ?? (acceptedFiles.length > 1 ? "/merge" : "/compress");
-      router.push(target);
+        router.push(tool.route);
+      })();
     },
-    [router, selectedTool, setPendingFiles],
+    [router, selectedTool, setPendingUpload, tool],
   );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop,
-    accept: { "application/pdf": [".pdf"] },
+    accept: tool.input.accept,
+    multiple: tool.input.multiple,
+    maxFiles: tool.input.maxFiles,
     noClick: true,
-    noKeyboard: true,
-    maxSize: MAX_SIZE,
+    maxSize: tool.input.maxSizeBytes,
     onDropRejected: (rejections) => {
       const err = rejections[0]?.errors[0];
       if (err?.code === "file-too-large") {
-        toast.error("File exceeds the 500 MB limit.");
+        toast.error(`File exceeds the ${Math.round(tool.input.maxSizeBytes / 1024 / 1024)} MB limit.`);
       } else {
-        toast.error(`Only PDF files are accepted. Got: ${rejections[0]?.file.name ?? "unknown"}`);
+        toast.error(`${tool.input.invalidMessage} Got: ${rejections[0]?.file.name ?? "unknown"}`);
       }
     },
   });
@@ -89,6 +88,7 @@ export default function HeroDropzone({
   );
 
   const isHero = variant === "hero";
+  const title = readyState?.tool === selectedTool ? readyState.title : defaultTitle;
 
   return (
     <div
@@ -99,7 +99,7 @@ export default function HeroDropzone({
         isDragActive ? "is-dragover" : ""
       } ${pulseVisible ? "is-visible" : ""} ${isHero ? "mt-8" : ""}`}
     >
-      <input {...getInputProps()} aria-label="Upload PDF files" />
+      <input {...getInputProps()} aria-label={`Upload ${tool.input.label}`} />
 
       {isHero && (
         <svg className="mb-4 h-12 w-12 text-accent" viewBox="0 0 48 48" fill="none" aria-hidden="true">
@@ -119,7 +119,7 @@ export default function HeroDropzone({
       )}
 
       <p className={`text-foreground ${isHero ? "text-xl font-semibold" : "text-2xl font-bold"}`}>
-        {isDragActive ? "Drop your PDFs here" : title}
+        {isDragActive ? tool.input.dragActiveTitle : title}
       </p>
 
       <p className="my-3 text-sm text-muted">or</p>
@@ -132,12 +132,10 @@ export default function HeroDropzone({
         }}
         className="dropzone-lp__btn"
       >
-        Browse Files — Start Now
+        {tool.input.browseLabel} - Start Now
       </button>
 
-      {!isHero && (
-        <p className="mt-3 text-[13px] text-muted">No account. No install. Free.</p>
-      )}
+      {!isHero && <p className="mt-3 text-[13px] text-muted">{tool.input.helperText}</p>}
     </div>
   );
 }

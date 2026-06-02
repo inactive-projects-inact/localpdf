@@ -1,9 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import AppShell from "../components/AppShell";
 import { toast } from "sonner";
+import { useFileHistory } from "../components/FileHistoryProvider";
 import { applyWatermark, CONFIG, isValidImageFile, isValidPdfFile } from "../lib/pdfWatermark";
+import { getToolDefinition } from "../lib/tool-registry";
+
+const TOOL = getToolDefinition("watermark");
 
 export default function WatermarkMain() {
   const [pdfFile, setPdfFile] = useState(null);
@@ -13,12 +17,23 @@ export default function WatermarkMain() {
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [errorMessage, setErrorMessage] = useState(null);
+  const { pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const progressPercent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
 
   const resetProgress = () => {
     setProgress({ current: 0, total: 0 });
   };
+
+  useEffect(() => {
+    if (pendingFiles.length > 0 && (!pendingTool || pendingTool === "watermark") && !pdfFile) {
+      const nextFile = pendingFiles[0];
+      queueMicrotask(() => {
+        setPdfFile(nextFile);
+        clearPendingFiles();
+      });
+    }
+  }, [pendingFiles, pendingTool, pdfFile, clearPendingFiles]);
 
   const handleApply = async () => {
     if (!isValidPdfFile(pdfFile)) {
@@ -88,7 +103,7 @@ export default function WatermarkMain() {
               <input
                 id="pdf-input"
                 type="file"
-                accept="application/pdf"
+                accept={TOOL.input.acceptAttribute}
                 onChange={(e) => setPdfFile(e.target.files?.[0] ?? null)}
                 className="block w-full cursor-pointer rounded-xl border border-border bg-background px-4 py-3 text-sm text-foreground file:mr-4 file:rounded-lg file:border-0 file:bg-sky-500 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
               />
@@ -122,7 +137,7 @@ export default function WatermarkMain() {
                 <span className="text-sm font-semibold text-foreground">Watermark image</span>
                 <input
                   type="file"
-                  accept="image/png,image/jpeg"
+                  accept={getToolDefinition("jpg2pdf").input.acceptAttribute}
                   onChange={(e) => setImageFile(e.target.files?.[0] ?? null)}
                   className="block w-full cursor-pointer rounded-xl border border-border bg-background px-4 py-3 text-sm text-foreground file:mr-4 file:rounded-lg file:border-0 file:bg-sky-500 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white"
                 />
