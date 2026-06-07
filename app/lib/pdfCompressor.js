@@ -59,7 +59,7 @@ function downloadPdfBytes(pdfBytes, originalName) {
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
-  URL.revokeObjectURL(objectUrl);
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
 function transferOrClone(value) {
@@ -98,10 +98,13 @@ export async function compressPdf(pdfFile, presetKey = "medium", onProgress = nu
       if (settled) return;
       settled = true;
       signal?.removeEventListener("abort", handleAbort);
+      worker.removeEventListener("message", handleMessage);
+      worker.removeEventListener("error", handleError);
       worker.terminate();
     };
 
     const handleAbort = () => {
+      worker.postMessage({ type: "abort" });
       cleanup();
       reject(createAbortError());
     };
@@ -129,12 +132,14 @@ export async function compressPdf(pdfFile, presetKey = "medium", onProgress = nu
       }
     };
 
-    signal?.addEventListener("abort", handleAbort, { once: true });
-    worker.addEventListener("message", handleMessage);
-    worker.addEventListener("error", (err) => {
+    const handleError = (err) => {
       cleanup();
       reject(new Error(err.message || "Could not parse this PDF. The file may be corrupt or malformed."));
-    });
+    };
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
+    worker.addEventListener("message", handleMessage);
+    worker.addEventListener("error", handleError);
 
     worker.postMessage({
       type: "compress",

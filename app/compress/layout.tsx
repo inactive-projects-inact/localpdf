@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Compress PDF Online Free — Reduce PDF File Size | LocalPDF",
-  description: "Reduce your PDF file size online for free. Our browser-based PDF compressor keeps your data private — no uploading to servers, no sign-up required.",
+  title: "Compress PDF - Destructive Image-Page Compression | LocalPDF",
+  description: "Compress PDFs locally in the browser. Image-containing pages may be rasterized into flat JPEG pages; text-only pages are preserved when possible.",
   alternates: { canonical: "https://localpdf.dev/compress" },
 };
 

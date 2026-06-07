@@ -37,7 +37,8 @@ type PageStatus = { pageNumber: number; status: PageStatusKind; confidence?: num
 type OcrWord = { text: string; confidence: number; bbox: { x0: number; y0: number; x1: number; y1: number } };
 type PageArtifact = {
   pageNumber: number;
-  imageBytes?: Uint8Array;
+  canvasWidth: number;
+  canvasHeight: number;
   words: OcrWord[];
   text: string;
   confidence: number;
@@ -72,6 +73,8 @@ const LANGUAGES = [
   { label: "Russian", code: "rus" },
 ];
 const DPR_BY_MODE: Record<AccuracyMode, number> = { fast: 1, balanced: 2, precise: 3 };
+const MAX_RENDER_PIXELS = 12_000_000;
+const MAX_RENDER_SIDE = 4096;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -105,7 +108,7 @@ function extractWords(data: unknown): OcrWord[] {
   return words;
 }
 
-function preprocessCanvas(canvas: HTMLCanvasElement) {
+async function preprocessCanvas(canvas: HTMLCanvasElement) {
   const context = canvas.getContext("2d", { willReadFrequently: true });
   if (!context) return;
   const width = canvas.width;
@@ -113,16 +116,21 @@ function preprocessCanvas(canvas: HTMLCanvasElement) {
   const image = context.getImageData(0, 0, width, height);
   const source = image.data;
   const gray = new Uint8ClampedArray(source.length);
+
+  // Yield during grayscale conversion
   for (let i = 0; i < source.length; i += 4) {
+    if (i % 400000 === 0) await yieldToBrowser();
     const value = clamp((0.299 * source[i] + 0.587 * source[i + 1] + 0.114 * source[i + 2]) * 1.4, 0, 255);
     gray[i] = value;
     gray[i + 1] = value;
     gray[i + 2] = value;
     gray[i + 3] = source[i + 3];
   }
+
   const sharpened = new Uint8ClampedArray(gray);
   const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
   for (let y = 1; y < height - 1; y++) {
+    if (y % 100 === 0) await yieldToBrowser();
     for (let x = 1; x < width - 1; x++) {
       let sum = 0;
       for (let ky = -1; ky <= 1; ky++) {
@@ -141,14 +149,6 @@ function preprocessCanvas(canvas: HTMLCanvasElement) {
   context.putImageData(new ImageData(sharpened, width, height), 0, 0);
 }
 
-function dataUrlToBytes(dataUrl: string) {
-  const base64 = dataUrl.split(",")[1] ?? "";
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
 function safeOutputName(file: File, extension: string) {
   return `${file.name.replace(/\.pdf$/i, "")}-ocr.${extension}`;
 }
@@ -159,6 +159,14 @@ function getDownloadBlob(result: ResultState) {
     return new Blob([buffer], { type: "application/pdf" });
   }
   return new Blob([result.text ?? ""], { type: "text/plain;charset=utf-8" });
+}
+
+function mapVisualPointToPdf(x: number, y: number, pageWidth: number, pageHeight: number, rotation: number) {
+  const normalized = ((rotation % 360) + 360) % 360;
+  if (normalized === 90) return { x: pageWidth - y, y: x };
+  if (normalized === 180) return { x: pageWidth - x, y: pageHeight - y };
+  if (normalized === 270) return { x: y, y: pageHeight - x };
+  return { x, y };
 }
 
 function StatusIcon({ status }: { status: PageStatusKind }) {
@@ -190,6 +198,7 @@ export default function OcrPage() {
   const [isMobile, setIsMobile] = useState(false);
   const schedulerRef = useRef<import("tesseract.js").Scheduler | null>(null);
   const cancelRef = useRef(false);
+  const runIdRef = useRef(0);
   const fileInputOpenRef = useRef<(() => void) | null>(null);
   const objectUrlRef = useRef<string | null>(null);
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
@@ -214,7 +223,15 @@ export default function OcrPage() {
   }, []);
 
   const inspectPdf = useCallback(async (file: File) => {
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
+    if (file.size > TOOL.input.maxSizeBytes) {
+      toast.error(`PDF is too large. Maximum size is ${formatBytes(TOOL.input.maxSizeBytes)}.`);
+      return;
+    }
     setIsInspecting(true);
+    let pdf: { getPage: (pageNumber: number) => Promise<{ getTextContent: () => Promise<{ items: unknown[] }>; cleanup?: () => void }>; numPages: number; cleanup?: () => Promise<unknown>; destroy?: () => Promise<unknown> } | null = null;
+    let firstPage: { getTextContent: () => Promise<{ items: unknown[] }>; cleanup?: () => void } | null = null;
     try {
       if (!(await hasPdfHeader(file))) {
         toast.error("Please choose a valid PDF file.");
@@ -223,10 +240,12 @@ export default function OcrPage() {
       const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
       GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const pdf = await getDocument({ data: bytes.slice(0) }).promise;
-      const firstPage = await pdf.getPage(1);
+      if (runIdRef.current !== runId) return;
+      pdf = await getDocument({ data: bytes.slice(0) }).promise;
+      firstPage = await pdf.getPage(1);
       const textContent = await firstPage.getTextContent();
       const hasSelectableText = textContent.items.some((item: unknown) => Boolean((item as { str?: string }).str?.trim()));
+      if (runIdRef.current !== runId) return;
       setPdfInfo({ file, pageCount: pdf.numPages, hasSelectableText });
       setRangeStart(1);
       setRangeEnd(pdf.numPages);
@@ -234,12 +253,18 @@ export default function OcrPage() {
       setStep(1);
       setResult(null);
       resetResultUrl();
-      await pdf.cleanup?.();
-      await pdf.destroy?.();
-    } catch {
-      toast.error("OCR failed. Please try a different file.");
+    } catch (error) {
+      if (runIdRef.current === runId) {
+        const message = error instanceof Error && /password|encrypted/i.test(error.message)
+          ? "Encrypted PDFs cannot be OCRed in this browser-only tool."
+          : "OCR failed. Please try a different file.";
+        toast.error(message);
+      }
     } finally {
-      setIsInspecting(false);
+      firstPage?.cleanup?.();
+      await pdf?.cleanup?.();
+      await pdf?.destroy?.();
+      if (runIdRef.current === runId) setIsInspecting(false);
     }
   }, [resetResultUrl]);
 
@@ -258,15 +283,21 @@ export default function OcrPage() {
     noKeyboard: true,
     onDropRejected: () => toast.error("Please choose a valid PDF file."),
   });
-  fileInputOpenRef.current = open;
+
+  useEffect(() => {
+    fileInputOpenRef.current = open;
+  }, [open]);
 
   useEffect(() => {
     if (pendingFiles.length > 0 && (!pendingTool || pendingTool === "ocr")) {
       const [file] = pendingFiles;
-      if (file) void inspectPdf(file);
+      if (file) {
+        window.setTimeout(() => {
+          void inspectPdf(file);
+        }, 0);
+      }
       clearPendingFiles();
     }
-    return () => {};
   }, [clearPendingFiles, inspectPdf, pendingFiles, pendingTool]);
 
   useEffect(() => {
@@ -307,16 +338,13 @@ export default function OcrPage() {
 
   useEffect(() => {
     return () => {
+      runIdRef.current += 1;
       cancelRef.current = true;
       const scheduler = schedulerRef.current as { terminate?: () => Promise<unknown> } | null;
       void scheduler?.terminate?.();
       resetResultUrl();
     };
   }, [resetResultUrl]);
-
-  const updateStatus = useCallback((pageNumber: number, patch: Partial<PageStatus>) => {
-    setPageStatuses((prev) => prev.map((item) => (item.pageNumber === pageNumber ? { ...item, ...patch } : item)));
-  }, []);
 
   async function pageHasText(pdfPage: { getTextContent: () => Promise<{ items: unknown[] }> }) {
     const textContent = await pdfPage.getTextContent();
@@ -330,7 +358,11 @@ export default function OcrPage() {
     },
     dpr: number,
   ) {
-    const viewport = pdfPage.getViewport({ scale: dpr });
+    const baseViewport = pdfPage.getViewport({ scale: 1 });
+    const pixelScale = Math.sqrt(MAX_RENDER_PIXELS / Math.max(1, baseViewport.width * baseViewport.height));
+    const sideScale = Math.min(MAX_RENDER_SIDE / Math.max(1, baseViewport.width), MAX_RENDER_SIDE / Math.max(1, baseViewport.height));
+    const scale = Math.max(0.5, Math.min(dpr, pixelScale, sideScale));
+    const viewport = pdfPage.getViewport({ scale });
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(viewport.width);
     canvas.height = Math.ceil(viewport.height);
@@ -363,40 +395,47 @@ export default function OcrPage() {
       };
     }
 
-    const { PDFDocument, StandardFonts } = await import("pdf-lib");
+    const { PDFDocument, StandardFonts, degrees } = await import("pdf-lib");
     const originalBytes = new Uint8Array(await pdfInfo.file.arrayBuffer());
-    const sourcePdf = await PDFDocument.load(originalBytes, { ignoreEncryption: true });
+    const sourcePdf = await PDFDocument.load(originalBytes);
     const outputPdf = await PDFDocument.create();
     const font = await outputPdf.embedFont(StandardFonts.Helvetica);
     const artifactMap = new Map(artifacts.map((item) => [item.pageNumber, item]));
 
     for (let pageIndex = 0; pageIndex < pdfInfo.pageCount; pageIndex++) {
+      if (pageIndex % 2 === 0) await yieldToBrowser();
       const pageNumber = pageIndex + 1;
       const artifact = artifactMap.get(pageNumber);
-      if (!artifact?.imageBytes) {
-        const [copied] = await outputPdf.copyPages(sourcePdf, [pageIndex]);
-        outputPdf.addPage(copied);
+      
+      const [copied] = await outputPdf.copyPages(sourcePdf, [pageIndex]);
+      const page = outputPdf.addPage(copied);
+
+      if (!artifact || artifact.skipped || artifact.failed || artifact.words.length === 0) {
         continue;
       }
-      const sourcePage = sourcePdf.getPage(pageIndex);
-      const { width: pageWidth, height: pageHeight } = sourcePage.getSize();
-      const page = outputPdf.addPage([pageWidth, pageHeight]);
-      const image = await outputPdf.embedPng(artifact.imageBytes);
-      const imageDims = image.scale(1);
-      page.drawImage(image, { x: 0, y: 0, width: pageWidth, height: pageHeight });
+
+      const { width: pageWidth, height: pageHeight } = page.getSize();
+      const rotation = page.getRotation().angle;
+      const visualWidth = rotation === 90 || rotation === 270 ? pageHeight : pageWidth;
+      const visualHeight = rotation === 90 || rotation === 270 ? pageWidth : pageHeight;
+      
       artifact.words.forEach((word) => {
         const text = word.text.trim();
         if (!text) return;
-        const x = (word.bbox.x0 / imageDims.width) * pageWidth;
-        const y = pageHeight - (word.bbox.y1 / imageDims.height) * pageHeight;
-        const size = clamp(((word.bbox.y1 - word.bbox.y0) / imageDims.height) * pageHeight, 3, 48);
+        const visualX = (word.bbox.x0 / artifact.canvasWidth) * visualWidth;
+        const visualY = visualHeight - (word.bbox.y1 / artifact.canvasHeight) * visualHeight;
+        const point = mapVisualPointToPdf(visualX, visualY, pageWidth, pageHeight, rotation);
+        const size = clamp(((word.bbox.y1 - word.bbox.y0) / artifact.canvasHeight) * visualHeight, 3, 48);
         try {
-          page.drawText(text, { x, y, size, font, opacity: 0 });
+          page.drawText(text, { x: point.x, y: point.y, size, font, opacity: 0, rotate: degrees(rotation) });
         } catch {
           // Some scripts exceed the built-in PDF font; text-only output still preserves them.
         }
       });
     }
+
+    // Yield to let UI update before the heavy synchronous save
+    await yieldToBrowser();
     const bytes = await outputPdf.save();
     return {
       mode: "pdf" as const,
@@ -413,6 +452,8 @@ export default function OcrPage() {
 
   const startOcr = useCallback(async () => {
     if (!pdfInfo || !canStart) return;
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
     cancelRef.current = false;
     setStep(3);
     setProgress(0);
@@ -433,6 +474,7 @@ export default function OcrPage() {
     let pdf: { getPage: (pageNumber: number) => Promise<unknown>; cleanup?: () => Promise<unknown>; destroy?: () => Promise<unknown> } | null = null;
 
     const applyStatus = (pageNumber: number, patch: Partial<PageStatus>) => {
+      if (runIdRef.current !== runId) return;
       latestStatuses = latestStatuses.map((item) => (item.pageNumber === pageNumber ? { ...item, ...patch } : item));
       setPageStatuses(latestStatuses);
     };
@@ -444,7 +486,7 @@ export default function OcrPage() {
       scheduler = createScheduler();
       schedulerRef.current = scheduler;
       const language = secondaryLanguage && secondaryLanguage !== primaryLanguage ? `${primaryLanguage}+${secondaryLanguage}` : primaryLanguage;
-      const workers = await Promise.all(
+      await Promise.all(
         [0, 1].map(async () => {
           const worker = await createWorker(language);
           if (accuracyMode === "precise") await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK });
@@ -452,37 +494,52 @@ export default function OcrPage() {
           return worker;
         }),
       );
+      if (runIdRef.current !== runId || cancelRef.current) return;
 
       const bytes = new Uint8Array(await pdfInfo.file.arrayBuffer());
+      if (runIdRef.current !== runId || cancelRef.current) return;
       pdf = await getDocument({ data: bytes.slice(0) }).promise;
       const dpr = DPR_BY_MODE[accuracyMode];
       let completed = 0;
+      const batchSize = isMobile || accuracyMode === "precise" ? 1 : 2;
 
       const processPage = async (pageNumber: number) => {
         const started = performance.now();
         let canvas: HTMLCanvasElement | null = null;
+        let page: {
+          getTextContent: () => Promise<{ items: unknown[] }>;
+          getViewport: (options: { scale: number }) => { width: number; height: number };
+          render: (options: { canvasContext: CanvasRenderingContext2D; viewport: unknown }) => { promise: Promise<unknown> };
+          cleanup?: () => void;
+        } | null = null;
         applyStatus(pageNumber, { status: "processing", note: undefined });
         setCurrentPageLabel(`Processing page ${pageNumber} of ${pdfInfo.pageCount}...`);
         try {
-          const page = await pdf?.getPage(pageNumber) as {
+          if (runIdRef.current !== runId || cancelRef.current) return;
+          page = await pdf?.getPage(pageNumber) as {
             getTextContent: () => Promise<{ items: unknown[] }>;
             getViewport: (options: { scale: number }) => { width: number; height: number };
             render: (options: { canvasContext: CanvasRenderingContext2D; viewport: unknown }) => { promise: Promise<unknown> };
+            cleanup?: () => void;
           };
+          if (runIdRef.current !== runId || cancelRef.current) return;
           if (await pageHasText(page)) {
             const textContent = await page.getTextContent();
             const text = textContent.items.map((item: unknown) => (item as { str?: string }).str ?? "").join(" ").trim();
-            artifacts.push({ pageNumber, words: [], text, confidence: 100, skipped: true });
+            artifacts.push({ pageNumber, canvasWidth: 1, canvasHeight: 1, words: [], text, confidence: 100, skipped: true });
             applyStatus(pageNumber, { status: "skipped", confidence: 100, note: "Already searchable" });
             return;
           }
           canvas = await renderPageCanvas(page, dpr);
-          if (enhanceImage) preprocessCanvas(canvas);
-          const imageBytes = outputMode === "pdf" ? dataUrlToBytes(canvas.toDataURL("image/png")) : undefined;
+          const cWidth = canvas.width;
+          const cHeight = canvas.height;
+          if (enhanceImage) await preprocessCanvas(canvas);
+          if (runIdRef.current !== runId || cancelRef.current) return;
           const ocrResult = await scheduler?.addJob("recognize", canvas);
+          if (runIdRef.current !== runId || cancelRef.current) return;
           const data = ocrResult?.data as { text?: string; confidence?: number };
           const confidence = Math.round(data.confidence ?? 0);
-          artifacts.push({ pageNumber, imageBytes, words: extractWords(data), text: data.text ?? "", confidence });
+          artifacts.push({ pageNumber, canvasWidth: cWidth, canvasHeight: cHeight, words: extractWords(data), text: data.text ?? "", confidence });
           succeeded += 1;
           applyStatus(pageNumber, {
             status: confidence < 50 ? "failed" : "done",
@@ -491,9 +548,10 @@ export default function OcrPage() {
           });
         } catch {
           failed += 1;
-          artifacts.push({ pageNumber, words: [], text: "", confidence: 0, failed: true });
+          artifacts.push({ pageNumber, canvasWidth: 1, canvasHeight: 1, words: [], text: "", confidence: 0, failed: true });
           applyStatus(pageNumber, { status: "failed", confidence: 0, note: "Low quality - partial result" });
         } finally {
+          page?.cleanup?.();
           if (canvas) {
             canvas.width = 0;
             canvas.height = 0;
@@ -502,31 +560,43 @@ export default function OcrPage() {
           }
           completed += 1;
           durations.push(performance.now() - started);
-          setProgress(Math.round((completed / selectedPages.length) * 100));
-          setRemainingLabel(estimateRemaining(durations, selectedPages.length - completed));
+          if (runIdRef.current === runId) {
+            setProgress(Math.round((completed / selectedPages.length) * 100));
+            setRemainingLabel(estimateRemaining(durations, selectedPages.length - completed));
+          }
         }
       };
 
-      for (let index = 0; index < selectedPages.length; index += 2) {
-        if (cancelRef.current) break;
-        await Promise.all(selectedPages.slice(index, index + 2).map((pageNumber) => processPage(pageNumber)));
+      for (let index = 0; index < selectedPages.length; index += batchSize) {
+        if (runIdRef.current !== runId || cancelRef.current) break;
+        await Promise.all(selectedPages.slice(index, index + batchSize).map((pageNumber) => processPage(pageNumber)));
         await yieldToBrowser();
       }
 
       const partial = cancelRef.current || failed > 0;
+      if (runIdRef.current !== runId) return;
+      if (artifacts.filter((item) => !item.failed).length === 0) throw new Error("No OCR output was produced.");
+      setCurrentPageLabel("Finalizing PDF...");
+      setRemainingLabel("Almost done");
+      await yieldToBrowser();
       const finalResult = await buildResult(artifacts, partial, selectedPages.length, latestStatuses);
+      if (runIdRef.current !== runId) return;
       setResult(finalResult);
       setStep(4);
       addFile({ filename: finalResult.filename, size: finalResult.outputSize, timestamp: Date.now(), tool: "ocr" });
       if (partial) toast.warning(`OCR partially complete - ${succeeded} of ${selectedPages.length} pages succeeded.`, { id: "ocr" });
       else toast.success(`OCR complete! ${succeeded} pages processed.`, { id: "ocr" });
-      await Promise.all(workers.map((worker) => worker.terminate()));
-    } catch {
-      toast.error("OCR failed. Please try a different file.", { id: "ocr" });
-      setStep(2);
+    } catch (error) {
+      if (runIdRef.current === runId) {
+        const message = error instanceof Error && /password|encrypted/i.test(error.message)
+          ? "Encrypted PDFs cannot be OCRed in this browser-only tool."
+          : "OCR failed. Please try a different file.";
+        toast.error(message, { id: "ocr" });
+        setStep(2);
+      }
     } finally {
       await scheduler?.terminate?.();
-      schedulerRef.current = null;
+      if (schedulerRef.current === scheduler) schedulerRef.current = null;
       await pdf?.cleanup?.();
       await pdf?.destroy?.();
     }
@@ -536,7 +606,7 @@ export default function OcrPage() {
     buildResult,
     canStart,
     enhanceImage,
-    outputMode,
+    isMobile,
     pdfInfo,
     primaryLanguage,
     resetResultUrl,
@@ -668,7 +738,7 @@ export default function OcrPage() {
 
             <div className="mt-6 grid gap-3 sm:grid-cols-2">
               {[
-                ["pdf", "Searchable PDF", "Original appearance preserved. Text becomes selectable and searchable."],
+                ["pdf", "Searchable PDF", "Copies original pages and adds an invisible OCR text layer. Output may be larger."],
                 ["text", "Text Only", "Extract all text into a downloadable .txt file."],
               ].map(([mode, title, description]) => (
                 <button key={mode} type="button" onClick={() => setOutputMode(mode as OutputMode)} className={`rounded-lg border p-4 text-left ${outputMode === mode ? "border-[#3B3BFF] bg-[#3B3BFF]/10" : "border-border"}`}>
@@ -692,7 +762,7 @@ export default function OcrPage() {
                 {[
                   ["fast", "Fast", "1x DPR canvas"],
                   ["balanced", "Balanced", "2x DPR canvas"],
-                  ["precise", "Precise", "3x DPR canvas, Tesseract PSM mode 6"],
+                  ["precise", "Precise", "Up to 3x DPR canvas, capped on large pages"],
                 ].map(([mode, title, description]) => (
                   <button key={mode} type="button" onClick={() => setAccuracyMode(mode as AccuracyMode)} className={`rounded-lg border p-3 text-left ${accuracyMode === mode ? "border-[#3B3BFF] bg-[#3B3BFF]/10" : "border-border"}`}>
                     <span className="block font-semibold text-foreground">{title}</span>
@@ -774,6 +844,9 @@ export default function OcrPage() {
             {result.mode === "text" && <pre className="mt-5 max-h-52 overflow-auto rounded-lg border border-border bg-background p-4 text-sm text-body">{(result.text ?? "").slice(0, 500)}</pre>}
 
             <SizeComparisonBadge originalSize={pdfInfo.file.size} compressedSize={result.outputSize} />
+            <p className="mt-3 text-sm text-muted">
+              {result.mode === "pdf" ? "Searchable PDFs copy original pages and add a hidden text layer, so output size may increase." : "Text output contains recognized text only and does not preserve page appearance."}
+            </p>
 
             <button type="button" onClick={() => setStep(2)} className="mt-6 inline-flex items-center justify-center gap-2 rounded-lg border border-border px-4 py-2 text-sm font-semibold text-foreground">
               <RotateCcw className="h-4 w-4" /> Run OCR again with different settings

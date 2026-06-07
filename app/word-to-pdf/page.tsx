@@ -4,13 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import Link from "next/link";
-import { ChevronRight, FileType, Upload, Download, Home } from "lucide-react";
+import { AlertTriangle, ChevronRight, FileType, Upload, Download, Home } from "lucide-react";
 import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
 
 const ACCENT = "#3B3BFF";
+const MAX_DOCX_BYTES = 20 * 1024 * 1024;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -50,24 +51,19 @@ export default function WordToPdfPage() {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
+  const runIdRef = useRef(0);
   const { addFile } = useFileHistory();
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
-      if ((e.key === "d" || e.key === "D") && result) handleDownload();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result]);
 
   const handleFile = useCallback((f: File) => {
     if (!f.name.toLowerCase().endsWith(".docx")) {
       toast.error("Please select a valid .docx file.");
       return;
     }
+    if (f.size > MAX_DOCX_BYTES) {
+      toast.error("File too large. Maximum size is 20MB for browser conversion.");
+      return;
+    }
+    runIdRef.current += 1;
     setFile(f);
     setResult(null);
     setStep("configure");
@@ -86,21 +82,38 @@ export default function WordToPdfPage() {
     },
     multiple: false,
     maxFiles: 1,
-    onDropRejected: () => toast.error("Please select a valid .docx file."),
+    maxSize: MAX_DOCX_BYTES,
+    onDropRejected: () => toast.error("Please select a valid .docx file under 20MB."),
   });
 
   const handleConvert = useCallback(async () => {
     if (!file) return;
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
     setProcessing(true);
     setResult(null);
 
     try {
+      if (file.size > MAX_DOCX_BYTES) {
+        throw new Error("File too large. Maximum size is 20MB for browser conversion.");
+      }
+
       toast.loading("Reading Word document...", { id: "word2pdf" });
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const mammoth = await import("mammoth") as any;
       const ab = await file.arrayBuffer();
-      const { value: html } = await mammoth.convertToHtml({ arrayBuffer: ab });
+      // Yield to prevent UI freeze during mammoth load
+      await new Promise(resolve => setTimeout(resolve, 50));
+      const { value: html } = await mammoth.convertToHtml(
+        { arrayBuffer: ab },
+        {
+          convertImage: mammoth.images.imgElement(async (image: { contentType: string; read: (encoding: "base64") => Promise<string> }) => ({
+            src: `data:${image.contentType};base64,${await image.read("base64")}`,
+          })),
+        },
+      );
+      if (runIdRef.current !== runId) return;
 
       toast.loading("Building PDF...", { id: "word2pdf" });
 
@@ -118,14 +131,18 @@ export default function WordToPdfPage() {
       let page = pdfDoc.addPage([width, height]);
       let y = height - margin;
 
+      function addPage() {
+        page = pdfDoc.addPage([width, height]);
+        y = height - margin;
+      }
+
       function ensureSpace(needed: number) {
         if (y - needed < margin) {
-          page = pdfDoc.addPage([width, height]);
-          y = height - margin;
+          addPage();
         }
       }
 
-      function drawText(text: string, font: typeof regularFont, size: number, color = rgb(0, 0, 0)) {
+      function drawText(text: string, font: typeof regularFont, size: number, color = rgb(0, 0, 0), x = margin, maxWidth = contentWidth) {
         if (!text.trim()) return;
 
         // Word-wrap
@@ -135,7 +152,7 @@ export default function WordToPdfPage() {
         for (const word of words) {
           const testLine = line ? `${line} ${word}` : word;
           const w = font.widthOfTextAtSize(testLine, size);
-          if (w > contentWidth && line) {
+          if (w > maxWidth && line) {
             lines.push(line);
             line = word;
           } else {
@@ -146,20 +163,31 @@ export default function WordToPdfPage() {
 
         for (const l of lines) {
           ensureSpace(size + 4);
-          page.drawText(l, { x: margin, y, size, font, color });
+          page.drawText(l, { x, y, size, font, color });
           y -= size + 4;
         }
       }
 
-      // Parse HTML into blocks
-      const parser = new DOMParser();
-      const dom = parser.parseFromString(html, "text/html");
-      const body = dom.body;
+      async function drawImage(src: string) {
+        const match = /^data:(image\/(?:png|jpeg|jpg));base64,(.+)$/i.exec(src);
+        if (!match) return;
+        const binary = atob(match[2]);
+        const imageBytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) imageBytes[index] = binary.charCodeAt(index);
+        const image = match[1].includes("png") ? await pdfDoc.embedPng(imageBytes) : await pdfDoc.embedJpg(imageBytes);
+        const scale = Math.min(contentWidth / image.width, (height - margin * 2) / image.height, 1);
+        const imageWidth = image.width * scale;
+        const imageHeight = image.height * scale;
+        ensureSpace(imageHeight + 8);
+        page.drawImage(image, { x: margin, y: y - imageHeight, width: imageWidth, height: imageHeight });
+        y -= imageHeight + 8;
+      }
 
-      for (const node of Array.from(body.childNodes)) {
-        if (!(node instanceof Element)) continue;
+      async function drawElement(node: Element): Promise<void> {
         const tag = node.tagName.toLowerCase();
-        const text = node.textContent ?? "";
+        const text = (node.textContent ?? "").replace(/\s+/g, " ").trim();
+        const style = node.getAttribute("style") ?? "";
+        if (/page-break-before:\s*always|break-before:\s*page/i.test(style)) addPage();
 
         if (tag === "h1") {
           ensureSpace(baseSize * 2 + 8);
@@ -178,46 +206,96 @@ export default function WordToPdfPage() {
           drawText(text, regularFont, baseSize);
           y -= 3;
         } else if (tag === "ul" || tag === "ol") {
-          for (const li of Array.from(node.querySelectorAll("li"))) {
-            drawText(`• ${li.textContent ?? ""}`, regularFont, baseSize);
-            y -= 1;
-          }
+          Array.from(node.children)
+            .filter((child) => child.tagName.toLowerCase() === "li")
+            .forEach((li, index) => {
+              const prefix = tag === "ol" ? `${index + 1}. ` : "- ";
+              drawText(`${prefix}${li.textContent ?? ""}`, regularFont, baseSize, rgb(0, 0, 0), margin + 12, contentWidth - 12);
+              y -= 1;
+            });
           y -= 2;
-        } else if (text.trim()) {
+        } else if (tag === "table") {
+          const rows = Array.from(node.querySelectorAll("tr"));
+          for (const row of rows) {
+            const cells = Array.from(row.children).filter((cell) => ["td", "th"].includes(cell.tagName.toLowerCase()));
+            const cellWidth = contentWidth / Math.max(1, cells.length);
+            ensureSpace(baseSize + 8);
+            cells.forEach((cell, index) => {
+              const cellFont = cell.tagName.toLowerCase() === "th" ? boldFont : regularFont;
+              drawText((cell.textContent ?? "").replace(/\s+/g, " ").trim(), cellFont, baseSize - 1, rgb(0, 0, 0), margin + index * cellWidth, cellWidth - 6);
+            });
+            y -= 2;
+          }
+          y -= 4;
+        } else if (tag === "img") {
+          await drawImage(node.getAttribute("src") ?? "");
+        } else if (text) {
           drawText(text, regularFont, baseSize);
         }
+
+        if (/page-break-after:\s*always|break-after:\s*page/i.test(style)) addPage();
       }
 
+      // Parse HTML into blocks
+      const parser = new DOMParser();
+      const dom = parser.parseFromString(html, "text/html");
+      const body = dom.body;
+
+      for (let i = 0; i < body.childNodes.length; i++) {
+        if (i % 10 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+
+        const node = body.childNodes[i];
+        if (!(node instanceof Element)) continue;
+        if (runIdRef.current !== runId) return;
+        await drawElement(node);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 0));
+      if (runIdRef.current !== runId) return;
       const pdfBytes = await pdfDoc.save();
+      if (runIdRef.current !== runId) return;
       const baseName = file.name.replace(/\.docx$/i, "");
       setResult({ bytes: pdfBytes, name: `converted-${baseName}.pdf` });
       setStep("result");
       toast.success("Done! Your PDF is ready.", { id: "word2pdf" });
     } catch (err) {
+      if (runIdRef.current !== runId) return;
       const msg = err instanceof Error ? err.message : "Conversion failed.";
       toast.error(msg, { id: "word2pdf" });
     } finally {
-      setProcessing(false);
+      if (runIdRef.current === runId) setProcessing(false);
     }
   }, [file, pageSize, fontScale, marginSize]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
-    const blob = new Blob([result.bytes.buffer as ArrayBuffer], { type: "application/pdf" });
+    const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], { type: "application/pdf" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = result.name;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
     toast.success("Download started!");
   }, [result]);
 
   const reset = useCallback(() => {
+    runIdRef.current += 1;
     setFile(null);
     setResult(null);
     setStep("upload");
   }, []);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
+      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleDownload, result]);
 
   return (
     <AppShell>
@@ -243,8 +321,8 @@ export default function WordToPdfPage() {
             <FileType className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Word to PDF</h1>
-            <p className="mt-1 text-sm text-muted">Upload a .docx file and download a clean, formatted PDF instantly.</p>
+            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Limited Word to PDF</h1>
+            <p className="mt-1 text-sm text-muted">Convert .docx content to PDF with browser-only layout limits.</p>
           </div>
         </div>
 
@@ -294,6 +372,13 @@ export default function WordToPdfPage() {
               <button onClick={reset} className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium text-muted hover:text-foreground transition-colors border border-border hover:border-foreground/20">
                 Change
               </button>
+            </div>
+
+            <div className="flex gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-700 dark:text-amber-400">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>
+                <strong>Limited DOCX conversion:</strong> Paragraphs, headings, lists, simple tables, page-break hints, and embedded PNG/JPG images are attempted. Custom fonts, columns, headers/footers, comments, tracked changes, complex table styling, and exact Word pagination are not preserved.
+              </p>
             </div>
 
             {/* Options */}

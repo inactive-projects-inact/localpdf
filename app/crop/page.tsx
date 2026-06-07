@@ -11,12 +11,12 @@ import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import {
   applyCropPreset,
-  cropPdf,
   validateCropMargins,
   type CropMarginsMm,
   type CropScopeMode,
 } from "../lib/pdf-crop";
-import { downloadBlob, renderPdfPageToCanvas } from "../lib/pdf-utils";
+import { downloadBlob, renderPdfPageToCanvas, getPdfjs } from "../lib/pdf-utils";
+import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
 
 const TOOL = getToolDefinition("crop");
@@ -69,12 +69,11 @@ export default function CropPage() {
   const [rangeStart, setRangeStart] = useState(1);
   const [rangeEnd, setRangeEnd] = useState(1);
   const [margins, setMargins] = useState<CropMarginsMm>({ top: 10, bottom: 10, left: 10, right: 10 });
-  const [status, setStatus] = useState<"idle" | "loading" | "processing" | "done" | "error">("idle");
-  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
-  const [resultFilename, setResultFilename] = useState("cropped.pdf");
+
+  const worker = useProcessorWorker();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const previewTaskRef = useRef(0);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const validateRange = useCallback((): string | null => {
@@ -89,30 +88,35 @@ export default function CropPage() {
   }, [mode, singlePage, rangeStart, rangeEnd, pageCount, pageWidth, pageHeight, margins]);
 
   const loadPdf = useCallback(async (uploaded: File) => {
-    setStatus("loading");
+    worker.reset();
     const valid = await hasPdfHeader(uploaded);
     if (!valid) {
-      setStatus("error");
+      toast.error("Invalid PDF.");
       return;
     }
     try {
-      const { PDFDocument } = await import("pdf-lib");
       const bytes = await uploaded.arrayBuffer();
-      const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
-      const count = pdf.getPageCount();
-      const size = pdf.getPage(0).getSize();
+      const { getDocument } = await getPdfjs();
+      const pdf = await getDocument({ data: bytes.slice(0) }).promise;
+      const count = pdf.numPages;
+      const page1 = await pdf.getPage(1);
+      const viewport = page1.getViewport({ scale: 1 });
+      await pdf.destroy();
+
       setFile(uploaded);
       setPdfBytes(bytes);
       setPageCount(count);
-      setPageWidth(size.width);
-      setPageHeight(size.height);
+      setPageWidth(viewport.width);
+      setPageHeight(viewport.height);
       setRangeEnd(count);
-      setStatus("idle");
+      
+      const canvas = document.createElement("canvas");
+      await renderPdfPageToCanvas(bytes, 1, canvas);
+      offscreenCanvasRef.current = canvas;
     } catch {
-      setStatus("error");
       toast.error("Could not read PDF.");
     }
-  }, []);
+  }, [worker]);
 
   useEffect(() => {
     if (pendingFiles.length > 0 && !file && (!pendingTool || pendingTool === "crop")) {
@@ -133,56 +137,64 @@ export default function CropPage() {
     noKeyboard: true,
   });
 
-  const updatePreview = useCallback(async () => {
-    if (!pdfBytes || !canvasRef.current || validateRange()) return;
-    const taskId = ++previewTaskRef.current;
-    try {
-      const result = await cropPdf({ pdfBytes, mode, singlePage, rangeStart, rangeEnd, margins });
-      if (taskId !== previewTaskRef.current) return;
-      await renderPdfPageToCanvas(new Uint8Array(result).slice().buffer, 1, canvasRef.current);
-    } catch {
-      if (pdfBytes) await renderPdfPageToCanvas(pdfBytes, 1, canvasRef.current);
-    }
-  }, [pdfBytes, mode, singlePage, rangeStart, rangeEnd, margins, validateRange]);
+  const updatePreview = useCallback(() => {
+    if (!offscreenCanvasRef.current || !canvasRef.current || validateRange()) return;
+    const base = offscreenCanvasRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = base.width;
+    canvas.height = base.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    
+    ctx.drawImage(base, 0, 0);
+
+    const scaleX = canvas.width / pageWidth;
+    const scaleY = canvas.height / pageHeight;
+    const top = (margins.top * 72 / 25.4) * scaleY;
+    const bottom = (margins.bottom * 72 / 25.4) * scaleY;
+    const left = (margins.left * 72 / 25.4) * scaleX;
+    const right = (margins.right * 72 / 25.4) * scaleX;
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.4)";
+    ctx.fillRect(0, 0, canvas.width, top);
+    ctx.fillRect(0, canvas.height - bottom, canvas.width, bottom);
+    ctx.fillRect(0, top, left, canvas.height - top - bottom);
+    ctx.fillRect(canvas.width - right, top, right, canvas.height - top - bottom);
+  }, [pageWidth, pageHeight, margins, validateRange]);
 
   useEffect(() => {
-    if (!pdfBytes) return;
-    const t = window.setTimeout(() => void updatePreview(), 200);
-    return () => window.clearTimeout(t);
-  }, [pdfBytes, updatePreview]);
+    updatePreview();
+  }, [updatePreview]);
 
   const applyPreset = (preset: "header" | "footer" | "sides" | "square") => {
     setMargins(applyCropPreset(preset, pageWidth, pageHeight));
   };
 
-  const handleCrop = async () => {
-    if (!pdfBytes || !file) return;
+  const handleCrop = () => {
+    if (!file) return;
     const err = validateRange();
     if (err) {
       toast.error(err.includes("Invalid crop") ? err : "Invalid page range. Please check your inputs.", { id: "crop" });
       return;
     }
 
-    setStatus("processing");
-    toast.loading("Cropping PDF...", { id: "crop" });
-    try {
-      const result = await cropPdf({ pdfBytes, mode, singlePage, rangeStart, rangeEnd, margins });
-      const blob = new Blob([new Uint8Array(result)], { type: "application/pdf" });
-      const base = file.name.replace(/\.pdf$/i, "") || "document";
-      const filename = `cropped-${base}.pdf`;
-      setResultBlob(blob);
-      setResultFilename(filename);
-      setStatus("done");
-      toast.success("Done! PDF cropped successfully.", { id: "crop" });
-      addFile({ filename, size: blob.size, timestamp: Date.now(), tool: "crop" });
-    } catch (e) {
-      setStatus("error");
-      const msg = e instanceof Error && e.message === "Invalid crop values"
-        ? "Invalid crop values. Margins cannot exceed page dimensions."
-        : "Something went wrong. Please try again.";
-      toast.error(msg, { id: "crop" });
-    }
+    const base = file.name.replace(/\.pdf$/i, "") || "document";
+    const filename = `cropped-${base}.pdf`;
+
+    worker.process(file, {
+      tool: "crop",
+      options: { mode, singlePage, rangeStart, rangeEnd, margins }
+    }, filename);
   };
+
+  useEffect(() => {
+    if (worker.status === "done" && worker.resultBlob && worker.resultFilename) {
+      toast.success("Done! PDF cropped successfully.", { id: "crop" });
+      addFile({ filename: worker.resultFilename, size: worker.resultBlob.size, timestamp: Date.now(), tool: "crop" });
+    } else if (worker.status === "error") {
+      toast.error(worker.error || "Something went wrong.", { id: "crop" });
+    }
+  }, [worker.status, worker.resultBlob, worker.resultFilename, worker.error, addFile]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -190,17 +202,17 @@ export default function CropPage() {
       if (e.key.toLowerCase() === "u" && !file) {
         e.preventDefault();
         open();
-      } else if (e.key.toLowerCase() === "d" && status === "done" && resultBlob) {
+      } else if (e.key.toLowerCase() === "d" && worker.status === "done" && worker.resultBlob) {
         e.preventDefault();
-        downloadBlob(resultBlob, resultFilename);
+        downloadBlob(worker.resultBlob, worker.resultFilename!);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [file, status, resultBlob, resultFilename, open]);
+  }, [file, worker.status, worker.resultBlob, worker.resultFilename, open]);
 
   const hasFile = file && pageCount > 0;
-  const isDone = status === "done" && resultBlob;
+  const isDone = worker.status === "done" && worker.resultBlob;
 
   const setMargin = (key: keyof CropMarginsMm, value: number) => {
     setMargins((m) => ({ ...m, [key]: Math.max(0, value) }));
@@ -329,18 +341,18 @@ export default function CropPage() {
           </>
         )}
 
-        {isDone && file && resultBlob && <SizeComparisonBadge originalSize={file.size} compressedSize={resultBlob.size} />}
+        {isDone && file && worker.resultBlob && <SizeComparisonBadge originalSize={file.size} compressedSize={worker.resultBlob.size} />}
 
         {hasFile && (
           <div className="mt-8 flex items-center gap-2 pb-20 sm:justify-end sm:pb-0">
             <button
               type="button"
-              disabled={status === "processing"}
-              onClick={() => (isDone && resultBlob ? downloadBlob(resultBlob, resultFilename) : void handleCrop())}
+              disabled={worker.status === "processing"}
+              onClick={() => (isDone && worker.resultBlob ? downloadBlob(worker.resultBlob, worker.resultFilename!) : void handleCrop())}
               className="rounded-xl px-8 py-3.5 font-semibold text-white disabled:opacity-50"
               style={{ backgroundColor: ACCENT }}
             >
-              {isDone ? "Download PDF" : "Crop PDF"}
+              {worker.status === "processing" ? `${worker.message || "Cropping"} ${worker.progress}%` : isDone ? "Download PDF" : "Crop PDF"}
             </button>
             <ShortcutHint shortcut={isDone ? "D" : "U"} />
           </div>

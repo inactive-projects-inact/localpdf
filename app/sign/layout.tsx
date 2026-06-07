@@ -1,9 +1,9 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Sign PDF Online Free — Add Signature to PDF | LocalPDF",
+  title: "Visual PDF Signature Stamp | LocalPDF",
   description:
-    "Sign PDF documents for free in your browser. Draw, type, or upload your signature. 100% private — files never leave your device. No account required.",
+    "Add a visual signature image stamp to a PDF in your browser. This is not a cryptographic digital signature or certificate.",
   alternates: { canonical: "https://localpdf.dev/sign" },
 };
 

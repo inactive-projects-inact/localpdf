@@ -1,130 +1,100 @@
-# Antigravity Agent Routing Configuration
+# PDF Tools Repository Rules
 
-## Agent: ARCHITECT
-- Model: gemini-3.1-pro-high
-- Target_Phase: "Merge Feature - Phase 2"
-- Scope: "Merge processing pipeline only"
-- Permissions: 
-  - read_only: true
-  - file_system: ["letra/merge/**"]
+## Project Philosophy
 
-### System Prompt
-You are the ARCHITECT AGENT for this PDF repository.
-Your task is to analyze the merge feature and produce the implementation blueprint.
+This is a browser-first PDF utility suite.
 
-STRICT RULES:
-- Do not edit files.
-- Do not write code.
-- Do not output full files.
+Priority order:
 
-You must analyze the workspace and explicitly output:
-1. Files to change
-2. Functions to change
-3. Message protocol shape (Worker communication)
-4. Worker architecture & memory strategy
-5. Cancellation & corrupted-input handling strategy
-6. Complete validation checklist
+1. Correctness
+2. Honesty
+3. Reliability
+4. Performance
+5. Features
 
-Optimize for minimum code churn and maximum reliability.
+Never implement fake functionality.
+
+If a feature cannot be implemented correctly with the current stack, provide an explicit unsupported state rather than a misleading success path.
 
 ---
 
-## Agent: BUILDER
-- Model: claude-4.6-sonnet-thinking
-- Target_Phase: "Merge Feature - Phase 2"
-- Scope: "Merge processing pipeline only"
-- Permissions:
-  - read_write: true
-  - execute_code: true
+## Engineering Standards
 
-### System Prompt
-You are the BUILDER AGENT for this PDF repository.
-Your task is to implement the Architect’s plan for the merge feature only.
+* TypeScript strict mode.
+* No `any` escape hatches.
+* No dead code.
+* No unused state.
+* No silent failures.
+* No fake progress indicators.
+* No hidden data loss.
 
-STRICT RULES:
-- Edit files directly via targeted diffs.
-- Do not print full files or explain unchanged code.
-- Keep diffs small, atomic, and targeted.
-- Preserve the existing UI unless it blocks absolute correctness.
+---
 
-Required Outcomes:
-- Merge UI consumes the worker thread seamlessly.
-- Worker handles the heavy PDF compilation; no main-thread pdf-lib work remains in `letra/merge/page.tsx`.
-- Progress tracking is real-time but throttled (not wasteful).
-- Cancellation and repeated merges work cleanly without freezing.
+## Performance Standards
 
-At the end of your modifications, output ONLY:
+Avoid:
+
+* main-thread blocking PDF operations
+* repeated ArrayBuffer copies
+* unnecessary PDF parsing passes
+* memory leaks
+* stale worker state
+
+Prefer:
+
+* Web Workers for heavy operations
+* transferable buffers where possible
+* incremental cleanup
+* cancellation support
+
+---
+
+## Reliability Standards
+
+All PDF processing features should:
+
+* support repeated runs
+* support cancellation
+* handle corrupted files safely
+* handle unsupported files safely
+* clean up resources after completion
+
+Never allow stale worker results to overwrite active jobs.
+
+---
+
+## User Trust Rules
+
+Do not claim support for functionality that is not truly implemented.
+
+Examples:
+
+* visual PDF stamping is not cryptographic signing
+* text extraction is not full Word conversion
+* unsupported encryption must not appear as working protection
+
+Honest limitations are preferred over misleading success.
+
+---
+
+## Modification Rules
+
+When making changes:
+
+* modify the minimum number of files necessary
+* avoid unrelated refactors
+* preserve existing architecture when possible
+* do not rewrite working code
+
+---
+
+## Reporting Format
+
+After completing work output only:
+
 1. Files changed
-2. Checks run
+2. Exact fixes applied
 3. Remaining risks
+4. Ready for review: YES/NO
 
----
-
-## Agent: TESTER
-- Model: gemini-3.5-flash-high
-- Target_Phase: "Merge Feature - Phase 2"
-- Scope: "Automated regression testing"
-- Permissions:
-  - read_only: true
-  - execute_code: true
-
-### System Prompt
-You are the TEST AGENT for this PDF repository.
-Validate the merge feature after modifications. Do not touch production code.
-
-Check & Run:
-- Build success and clean TypeScript compilation.
-- Merge functionality (small, large, and repeated runs).
-- UI responsiveness during execution.
-- Safe failures on corrupted files or early cancellation.
-
-Output exactly this structure and nothing else:
-PASS
-or
-FAIL:
-- Exact file:
-- Exact issue:
-- Exact fix needed:
-
----
-
-## Agent: REVIEWER
-- Model: claude-4.6-opus-thinking
-- Target_Phase: "Merge Feature - Phase 2"
-- Scope: "Milestone Audit"
-- Permissions:
-  - read_only: true
-
-### System Prompt
-You are the PRINCIPAL REVIEWER AGENT. Do not write or edit code.
-Audit the merge feature implementation details.
-
-Focus on:
-- Architectural correctness and hidden race conditions.
-- Memory leaks, repeated-merge stability, and enterprise readiness.
-
-Score the build:
-- Architecture: /10
-- Performance: /10
-- Reliability: /10
-
-Provide a definitive final verdict line: **APPROVE** or **REJECT**.
-
----
-
-## Agent: PATCHER
-- Model: gemini-3.5-flash-high
-- Target_Phase: "Merge Feature - Phase 2"
-- Scope: "Surgical fixes"
-- Permissions:
-  - read_write: true
-  - execute_code: true
-
-### System Prompt
-You are the PATCHER AGENT. 
-Surgically patch ONLY the specific failures explicitly listed by the Reviewer agent.
-
-Rules:
-- Minimum diff possible.
-- No general refactoring or unrelated cleanups.
-- No full file output.
+Do not output full files unless explicitly requested.

@@ -10,12 +10,14 @@ import ShortcutHint from "../components/ShortcutHint";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import {
-  addPageNumbers,
+  formatLabel,
+  getCoordinates,
   type NumberColorKey,
   type NumberFormat,
   type NumberPosition,
 } from "../lib/pdf-page-numbers";
-import { downloadBlob, renderPdfPageToCanvas } from "../lib/pdf-utils";
+import { downloadBlob, renderPdfPageToCanvas, getPdfjs } from "../lib/pdf-utils";
+import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
 
 const TOOL = getToolDefinition("pageNumbers");
@@ -39,7 +41,6 @@ const FORMATS: { id: NumberFormat; label: string }[] = [
 
 export default function PageNumbersPage() {
   const [file, setFile] = useState<File | null>(null);
-  const [pdfBytes, setPdfBytes] = useState<ArrayBuffer | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [position, setPosition] = useState<NumberPosition>("bottom-center");
   const [format, setFormat] = useState<NumberFormat>("plain");
@@ -51,36 +52,36 @@ export default function PageNumbersPage() {
   const [useCustomRange, setUseCustomRange] = useState(false);
   const [rangeStart, setRangeStart] = useState(1);
   const [rangeEnd, setRangeEnd] = useState(1);
-  const [status, setStatus] = useState<"idle" | "loading" | "processing" | "done" | "error">("idle");
-  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
-  const [resultFilename, setResultFilename] = useState("numbered.pdf");
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const previewTaskRef = useRef(0);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const worker = useProcessorWorker();
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const loadPdf = useCallback(async (uploaded: File) => {
-    setStatus("loading");
+    worker.reset();
     const valid = await hasPdfHeader(uploaded);
     if (!valid) {
-      setStatus("error");
       toast.error("Invalid PDF.", { id: "pagenum-load" });
       return;
     }
     try {
-      const { PDFDocument } = await import("pdf-lib");
       const bytes = await uploaded.arrayBuffer();
-      const count = (await PDFDocument.load(bytes, { ignoreEncryption: true })).getPageCount();
+      const { getDocument } = await getPdfjs();
+      const pdf = await getDocument({ data: bytes.slice(0) }).promise;
+      const count = pdf.numPages;
+      const canvas = document.createElement("canvas");
+      await renderPdfPageToCanvas(bytes, 1, canvas);
+      offscreenCanvasRef.current = canvas;
+      
       setFile(uploaded);
-      setPdfBytes(bytes);
       setPageCount(count);
       setRangeEnd(count);
-      setStatus("idle");
+      await pdf.destroy();
     } catch {
-      setStatus("error");
       toast.error("Could not read PDF.", { id: "pagenum-load" });
     }
-  }, []);
+  }, [worker]);
 
   useEffect(() => {
     if (pendingFiles.length > 0 && !file && (!pendingTool || pendingTool === "pageNumbers")) {
@@ -101,60 +102,83 @@ export default function PageNumbersPage() {
     noKeyboard: true,
   });
 
-  const buildOptions = useCallback(
-    () => ({
-      pdfBytes: pdfBytes!,
-      position,
-      format,
-      startNumber,
-      fontSize,
-      colorKey,
-      marginPreset,
-      skipFirstPage,
-      useCustomRange,
-      rangeStart,
-      rangeEnd,
-    }),
-    [pdfBytes, position, format, startNumber, fontSize, colorKey, marginPreset, skipFirstPage, useCustomRange, rangeStart, rangeEnd],
-  );
+  const updatePreview = useCallback(() => {
+    if (!offscreenCanvasRef.current || !canvasRef.current) return;
+    const base = offscreenCanvasRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = base.width;
+    canvas.height = base.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    
+    ctx.drawImage(base, 0, 0);
 
-  const updatePreview = useCallback(async () => {
-    if (!pdfBytes || !canvasRef.current) return;
-    const taskId = ++previewTaskRef.current;
-    try {
-      const result = await addPageNumbers(buildOptions());
-      if (taskId !== previewTaskRef.current) return;
-      await renderPdfPageToCanvas(new Uint8Array(result).slice().buffer, 1, canvasRef.current);
-    } catch {
-      if (pdfBytes && canvasRef.current) await renderPdfPageToCanvas(pdfBytes, 1, canvasRef.current);
-    }
-  }, [pdfBytes, buildOptions]);
+    if (skipFirstPage || (useCustomRange && rangeStart > 1)) return;
+
+    const scale = 1.25; // Default scale from renderPdfPageToCanvas
+    const label = formatLabel(startNumber, pageCount, format);
+    ctx.font = `${fontSize * scale}px Helvetica, Arial, sans-serif`;
+    const textWidth = ctx.measureText(label).width;
+    const marginPt = marginPreset === "small" ? 8 : marginPreset === "medium" ? 14 : 22;
+    const marginPx = ((marginPt * 72) / 25.4) * scale;
+
+    const { x: visualX, y: visualY } = getCoordinates(position, canvas.width, canvas.height, textWidth, fontSize * scale, marginPx);
+
+    const canvasX = visualX;
+    const canvasY = canvas.height - visualY;
+
+    if (colorKey === "gray") ctx.fillStyle = "gray";
+    else if (colorKey === "black") ctx.fillStyle = "black";
+    else if (colorKey === "white") ctx.fillStyle = "white";
+    
+    ctx.fillText(label, canvasX, canvasY);
+  }, [position, format, startNumber, fontSize, colorKey, marginPreset, skipFirstPage, useCustomRange, rangeStart, pageCount, file]);
+
+  const { reset } = worker;
+  useEffect(() => {
+    reset();
+  }, [position, format, startNumber, fontSize, colorKey, marginPreset, skipFirstPage, useCustomRange, rangeStart, rangeEnd, reset]);
 
   useEffect(() => {
-    if (!pdfBytes) return;
-    const t = window.setTimeout(() => void updatePreview(), 200);
-    return () => window.clearTimeout(t);
-  }, [pdfBytes, updatePreview]);
+    updatePreview();
+  }, [updatePreview]);
 
-  const handleApply = async () => {
-    if (!pdfBytes || !file) return;
-    setStatus("processing");
-    toast.loading("Adding page numbers...", { id: "pagenum" });
-    try {
-      const result = await addPageNumbers(buildOptions());
-      const blob = new Blob([new Uint8Array(result)], { type: "application/pdf" });
-      const base = file.name.replace(/\.pdf$/i, "") || "document";
-      const filename = `numbered-${base}.pdf`;
-      setResultBlob(blob);
-      setResultFilename(filename);
-      setStatus("done");
-      toast.success("Done! Page numbers added.", { id: "pagenum" });
-      addFile({ filename, size: blob.size, timestamp: Date.now(), tool: "pageNumbers" });
-    } catch {
-      setStatus("error");
-      toast.error("Something went wrong. Please try again.", { id: "pagenum" });
+  const handleApply = () => {
+    if (!file) return;
+
+    if (useCustomRange && rangeStart > rangeEnd) {
+      toast.error("Invalid page range: start cannot be greater than end.", { id: "pagenum-val" });
+      return;
     }
+
+    const base = file.name.replace(/\.pdf$/i, "") || "document";
+    const filename = `numbered-${base}.pdf`;
+
+    worker.process(file, {
+      tool: "page-numbers",
+      options: {
+        position,
+        format,
+        startNumber,
+        fontSize,
+        colorKey,
+        marginPreset,
+        skipFirstPage,
+        useCustomRange,
+        rangeStart,
+        rangeEnd,
+      }
+    }, filename);
   };
+
+  useEffect(() => {
+    if (worker.status === "processing") toast.loading(worker.message || "Adding page numbers...", { id: "pagenum" });
+    else if (worker.status === "done" && worker.resultBlob) {
+      toast.success("Done! Page numbers added.", { id: "pagenum" });
+      addFile({ filename: worker.resultFilename!, size: worker.resultBlob.size, timestamp: Date.now(), tool: "pageNumbers" });
+    }
+    else if (worker.status === "error") toast.error(worker.error || "Something went wrong.", { id: "pagenum" });
+  }, [worker.status, worker.message, worker.error, worker.resultBlob, worker.resultFilename, addFile]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -162,17 +186,17 @@ export default function PageNumbersPage() {
       if (e.key.toLowerCase() === "u" && !file) {
         e.preventDefault();
         open();
-      } else if (e.key.toLowerCase() === "d" && status === "done" && resultBlob) {
+      } else if (e.key.toLowerCase() === "d" && worker.status === "done" && worker.resultBlob) {
         e.preventDefault();
-        downloadBlob(resultBlob, resultFilename);
+        downloadBlob(worker.resultBlob, worker.resultFilename!);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [file, status, resultBlob, resultFilename, open]);
+  }, [file, worker.status, worker.resultBlob, worker.resultFilename, open]);
 
   const hasFile = file && pageCount > 0;
-  const isDone = status === "done" && resultBlob;
+  const isDone = worker.status === "done" && worker.resultBlob;
 
   return (
     <AppShell>
@@ -328,15 +352,15 @@ export default function PageNumbersPage() {
           </>
         )}
 
-        {isDone && file && resultBlob && <SizeComparisonBadge originalSize={file.size} compressedSize={resultBlob.size} />}
+        {isDone && file && worker.resultBlob && <SizeComparisonBadge originalSize={file.size} compressedSize={worker.resultBlob.size} />}
 
         {hasFile && (
           <div className="mt-8 flex flex-col gap-3 pb-20 sm:flex-row sm:justify-end sm:pb-0">
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => (isDone && resultBlob ? downloadBlob(resultBlob, resultFilename) : void handleApply())}
-                disabled={status === "processing"}
+                onClick={() => (isDone && worker.resultBlob ? downloadBlob(worker.resultBlob, worker.resultFilename!) : void handleApply())}
+                disabled={worker.status === "processing"}
                 className="rounded-xl px-8 py-3.5 font-semibold text-white disabled:opacity-50"
                 style={{ backgroundColor: ACCENT }}
               >

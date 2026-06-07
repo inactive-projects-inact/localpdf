@@ -8,12 +8,12 @@ import ShortcutHint from "../components/ShortcutHint";
 import { downloadBlob } from "../lib/pdf-utils";
 import {
   countWords,
-  generateTextPdf,
   type TextAlignment,
   type TextFontFamily,
   type TextMarginPreset,
   type TextPageSize,
 } from "../lib/text-to-pdf";
+import { useProcessorWorker } from "../hooks/useProcessorWorker";
 
 const ACCENT = "#3B3BFF";
 
@@ -36,43 +36,31 @@ export default function TextToPdfPage() {
   const [margin, setMargin] = useState<TextMarginPreset>("medium");
   const [alignment, setAlignment] = useState<TextAlignment>("left");
   const [colorKey, setColorKey] = useState("black");
-  const [status, setStatus] = useState<"idle" | "generating" | "done" | "error">("idle");
-  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
+
+  const worker = useProcessorWorker();
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const charCount = text.length;
   const wordCount = countWords(text);
 
-  const handleGenerate = async () => {
+  const handleGenerate = () => {
     if (!text.trim()) {
       toast.error("Please enter some text first.", { id: "text2pdf" });
       return;
     }
 
-    setStatus("generating");
-    setResultBlob(null);
-    toast.loading("Generating PDF...", { id: "text2pdf" });
-
-    try {
-      const bytes = await generateTextPdf({
-        text,
-        fontFamily,
-        fontSize,
-        pageSize,
-        margin,
-        alignment,
-        colorKey,
-      });
-      const blob = new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
-      setResultBlob(blob);
-      setStatus("done");
-      toast.success("Done! Your PDF is ready.", { id: "text2pdf" });
-    } catch {
-      setStatus("error");
-      toast.error("Something went wrong. Please try again.", { id: "text2pdf" });
-    }
+    worker.process(null, {
+      tool: "text-to-pdf",
+      options: { text, fontFamily, fontSize, pageSize, margin, alignment, colorKey }
+    }, "document.pdf");
   };
+
+  useEffect(() => {
+    if (worker.status === "processing") toast.loading(worker.message || "Generating PDF...", { id: "text2pdf" });
+    else if (worker.status === "done") toast.success("Done! Your PDF is ready.", { id: "text2pdf" });
+    else if (worker.status === "error") toast.error(worker.error || "Something went wrong.", { id: "text2pdf" });
+  }, [worker.status, worker.message, worker.error]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -82,14 +70,14 @@ export default function TextToPdfPage() {
       if (e.key.toLowerCase() === "u") {
         e.preventDefault();
         textareaRef.current?.focus();
-      } else if (e.key.toLowerCase() === "d" && status === "done" && resultBlob) {
+      } else if (e.key.toLowerCase() === "d" && worker.status === "done" && worker.resultBlob) {
         e.preventDefault();
-        downloadBlob(resultBlob, "document.pdf");
+        downloadBlob(worker.resultBlob, "document.pdf");
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [status, resultBlob]);
+  }, [worker.status, worker.resultBlob]);
 
   const selectClass =
     "w-full rounded-xl border border-border bg-background px-3 py-2.5 text-sm font-medium text-foreground outline-none transition focus:border-[#3B3BFF] focus:ring-2 focus:ring-[#3B3BFF]/20";
@@ -120,8 +108,7 @@ export default function TextToPdfPage() {
             value={text}
             onChange={(e) => {
               setText(e.target.value);
-              setResultBlob(null);
-              setStatus("idle");
+              worker.reset();
             }}
             rows={12}
             placeholder="Start typing or paste your text here..."
@@ -238,12 +225,12 @@ export default function TextToPdfPage() {
         </div>
 
         <div className="mt-8 flex w-full flex-col gap-3 pb-20 sm:flex-row sm:justify-end sm:pb-0">
-          {status === "done" && resultBlob ? (
+          {worker.status === "done" && worker.resultBlob ? (
             <>
               <div className="flex w-full items-center gap-2 sm:w-auto">
                 <button
                   type="button"
-                  onClick={() => downloadBlob(resultBlob, "document.pdf")}
+                  onClick={() => downloadBlob(worker.resultBlob!, "document.pdf")}
                   className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-8 py-3.5 text-base font-semibold text-white shadow-lg transition hover:opacity-90 sm:w-auto"
                   style={{ backgroundColor: ACCENT }}
                 >
@@ -254,8 +241,7 @@ export default function TextToPdfPage() {
               <button
                 type="button"
                 onClick={() => {
-                  setResultBlob(null);
-                  setStatus("idle");
+                  worker.reset();
                 }}
                 className="inline-flex w-full items-center justify-center rounded-xl border border-border bg-card px-8 py-3.5 text-base font-semibold text-foreground transition hover:bg-background sm:w-auto"
               >
@@ -267,11 +253,11 @@ export default function TextToPdfPage() {
               <button
                 type="button"
                 onClick={() => void handleGenerate()}
-                disabled={status === "generating"}
+                disabled={worker.status === "processing"}
                 className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-8 py-3.5 text-base font-semibold text-white shadow-lg transition enabled:hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
                 style={{ backgroundColor: ACCENT }}
               >
-                {status === "generating" ? "Generating…" : "Create PDF"}
+                {worker.status === "processing" ? "Generating…" : "Create PDF"}
               </button>
               <ShortcutHint shortcut="U" label="Focus text" />
             </div>

@@ -66,6 +66,23 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function normalizeRotation(angle: number): 0 | 90 | 180 | 270 {
+  const normalized = ((angle % 360) + 360) % 360;
+  if (normalized === 90 || normalized === 180 || normalized === 270) return normalized;
+  return 0;
+}
+
+function getVisualPageSize(width: number, height: number, rotation: number): { width: number; height: number } {
+  return rotation === 90 || rotation === 270 ? { width: height, height: width } : { width, height };
+}
+
+function mapVisualPointToPdf(x: number, y: number, pageWidth: number, pageHeight: number, rotation: number): Point {
+  if (rotation === 90) return { x: pageWidth - y, y: x };
+  if (rotation === 180) return { x: pageWidth - x, y: pageHeight - y };
+  if (rotation === 270) return { x: y, y: pageHeight - x };
+  return { x, y };
+}
+
 export default function SignPdfPage() {
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
@@ -541,20 +558,31 @@ export default function SignPdfPage() {
       const originalArrayBuffer = await file.arrayBuffer();
       const pdfDoc = await PDFDocument.load(originalArrayBuffer);
       const pngImage = await pdfDoc.embedPng(signatureDataUrl);
-      const pagesToSign = placement.applyAll ? pdfDoc.getPages() : [pdfDoc.getPages()[placement.pageIndex]];
+      const allPages = pdfDoc.getPages();
+      const pagesToSign = placement.applyAll ? allPages : [allPages[placement.pageIndex]];
+      const placementRatio = {
+        x: placement.x / previewDims.w,
+        y: placement.y / previewDims.h,
+        width: placement.width / previewDims.w,
+        height: placement.height / previewDims.h,
+      };
 
       for (const page of pagesToSign) {
         const { width: pageW, height: pageH } = page.getSize();
-        const pdfX = (placement.x / previewDims.w) * pageW;
-        const sigH = (placement.height / previewDims.h) * pageH;
-        const pdfY = pageH - (placement.y / previewDims.h) * pageH - sigH;
-        const pdfW = (placement.width / previewDims.w) * pageW;
+        const pageRotation = normalizeRotation(page.getRotation().angle);
+        const visualSize = getVisualPageSize(pageW, pageH, pageRotation);
+        const visualX = placementRatio.x * visualSize.width;
+        const visualTopY = placementRatio.y * visualSize.height;
+        const pdfW = placementRatio.width * visualSize.width;
+        const sigH = placementRatio.height * visualSize.height;
+        const visualBottomY = visualSize.height - visualTopY - sigH;
+        const pdfPoint = mapVisualPointToPdf(visualX, visualBottomY, pageW, pageH, pageRotation);
         page.drawImage(pngImage, {
-          x: pdfX,
-          y: pdfY,
+          x: pdfPoint.x,
+          y: pdfPoint.y,
           width: pdfW,
           height: sigH,
-          rotate: degrees(placement.rotation),
+          rotate: degrees(placement.rotation + pageRotation),
           opacity: placement.opacity,
         });
       }
@@ -565,17 +593,17 @@ export default function SignPdfPage() {
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = `signed-${file.name}`;
+      anchor.download = `visual-stamp-${file.name}`;
       anchor.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
       setSignedSize(bytes.byteLength);
       addFile({
-        filename: `signed-${file.name}`,
+        filename: `visual-stamp-${file.name}`,
         size: bytes.byteLength,
         timestamp: Date.now(),
         tool: "signature",
       });
-      toast.success("Done! Signed PDF ready.");
+      toast.success("Done! Visual signature stamp added.");
       setStep("done");
     } catch (error) {
       console.error(error);
@@ -669,9 +697,9 @@ export default function SignPdfPage() {
                 <p className="text-sm font-bold uppercase tracking-[0.18em]" style={{ color: ACCENT_COLOR }}>
                   100% private
                 </p>
-                <h1 className="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Sign PDF</h1>
+                <h1 className="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Visual PDF Signature</h1>
                 <p className="mt-2 max-w-2xl text-muted">
-                  Draw, type, or upload your signature and place it on your PDF in the browser.
+                  Draw, type, or upload your signature and place it on your PDF as a visual image stamp.
                 </p>
               </div>
               <div className="flex gap-2 text-xs font-semibold text-muted">
@@ -765,6 +793,11 @@ export default function SignPdfPage() {
                       <p className="break-all font-semibold">{file.name}</p>
                       <p className="text-muted">{formatBytes(file.size)}</p>
                       <p className="text-muted">{numPages} page{numPages === 1 ? "" : "s"}</p>
+
+                      <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-400">
+                        <strong>Visual Stamp Only:</strong> This tool adds an image of your signature. It does <strong>not</strong> apply a cryptographic digital signature or legal certificate of authenticity.
+                      </div>
+
                       <button
                         type="button"
                         onClick={goToCreateSignature}
@@ -1103,7 +1136,7 @@ export default function SignPdfPage() {
                     aria-label="Sign and download PDF"
                     className="mt-auto inline-flex items-center justify-center gap-3 rounded-md bg-primary px-5 py-3 font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
                   >
-                    {isSigning ? "Signing..." : "Sign & Download"}
+                    {isSigning ? "Stamping..." : "Stamp & Download"}
                     <ShortcutHint shortcut="D" />
                   </button>
                 </aside>
@@ -1112,8 +1145,8 @@ export default function SignPdfPage() {
 
             {step === "done" && (
               <div className="mx-auto max-w-2xl text-center">
-                <h2 className="text-2xl font-black">Signed PDF ready</h2>
-                <p className="mt-2 text-muted">Your signed file has been downloaded and added to recent files.</p>
+                <h2 className="text-2xl font-black">Visual stamp PDF ready</h2>
+                <p className="mt-2 text-muted">Your visual signature stamp file has been downloaded and added to recent files.</p>
                 {file && signedSize !== null && (
                   <SizeComparisonBadge originalSize={file.size} compressedSize={signedSize} />
                 )}
@@ -1130,10 +1163,10 @@ export default function SignPdfPage() {
                   <button
                     type="button"
                     onClick={() => setStep("upload")}
-                    aria-label="Sign another PDF"
+                    aria-label="Stamp another PDF"
                     className="rounded-md border border-border px-5 py-3 font-bold"
                   >
-                    Sign Another PDF
+                    Stamp Another PDF
                   </button>
                 </div>
               </div>

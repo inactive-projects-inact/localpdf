@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
-import { CheckCircle, ChevronRight, Copy, Download, FileText, Loader2 } from "lucide-react";
+import { ChevronRight, Copy, Download, FileText, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
@@ -28,6 +28,7 @@ type Line = {
   x: number;
   y: number;
   height: number;
+  width: number;
 };
 
 const ACCENT_COLOR = "#3B3BFF";
@@ -82,25 +83,37 @@ async function pageToMarkdown(page: PDFPageProxy, options: Options): Promise<str
   const items = content.items.filter((item): item is PdfTextItem => "str" in item && item.str.trim().length > 0);
   const fontSizes = items.map((item) => item.height).filter((height) => height > 0);
   const medianSize = getMedian(fontSizes);
+  const viewport = page.getViewport({ scale: 1 });
   const sorted = [...items].sort((a, b) => Number(b.transform[5]) - Number(a.transform[5]) || Number(a.transform[4]) - Number(b.transform[4]));
   const lines: Line[] = [];
 
   for (const item of sorted) {
     const y = Number(item.transform[5]);
     const x = Number(item.transform[4]);
-    const existing = lines.find((line) => Math.abs(line.y - y) <= 2);
+    const width = Math.max(0, Number(item.width) || 0);
+    const existing = lines.find((line) => Math.abs(line.y - y) <= Math.max(2, medianSize * 0.35));
     if (existing) {
-      existing.text = `${existing.text} ${item.str}`.replace(/\s+/g, " ").trim();
+      const gap = x - (existing.x + existing.width);
+      const separator = gap > medianSize * 1.8 ? "\t" : " ";
+      existing.text = `${existing.text}${separator}${item.str}`.replace(/ {2,}/g, " ").trim();
       existing.height = Math.max(existing.height, item.height);
       existing.x = Math.min(existing.x, x);
+      existing.width = Math.max(existing.width, x + width - existing.x);
     } else {
-      lines.push({ text: item.str.trim(), x, y, height: item.height });
+      lines.push({ text: item.str.trim(), x, y, height: item.height, width });
     }
   }
 
+  const leftColumn = lines.filter((line) => line.x < viewport.width * 0.55);
+  const rightColumn = lines.filter((line) => line.x >= viewport.width * 0.55);
+  const orderedLines =
+    leftColumn.length > 2 && rightColumn.length > 2
+      ? [...leftColumn.sort((a, b) => b.y - a.y), ...rightColumn.sort((a, b) => b.y - a.y)]
+      : lines;
   const blocks: string[] = [];
   let paragraph: string[] = [];
   let lastIndent: number | null = null;
+  const tableRows: string[] = [];
 
   const flushParagraph = () => {
     if (paragraph.length > 0) {
@@ -109,7 +122,24 @@ async function pageToMarkdown(page: PDFPageProxy, options: Options): Promise<str
     }
   };
 
-  for (const line of lines) {
+  const flushTable = () => {
+    if (tableRows.length === 0) return;
+    if (tableRows.length < 2) {
+      blocks.push(...tableRows.map((row) => row.replace(/\t/g, " ")));
+      tableRows.length = 0;
+      return;
+    }
+    const columnCount = Math.max(...tableRows.map((row) => row.split("\t").length));
+    const rows = tableRows.map((row) => {
+      const cells = row.split("\t").map((cell) => cell.trim());
+      while (cells.length < columnCount) cells.push("");
+      return `| ${cells.join(" | ")} |`;
+    });
+    blocks.push(rows[0], `| ${Array.from({ length: columnCount }, () => "---").join(" | ")} |`, ...rows.slice(1));
+    tableRows.length = 0;
+  };
+
+  for (const line of orderedLines) {
     const text = line.text.trim();
     if (!text) continue;
     const isList = options.lists && (/^[•*–-]\s+/.test(text) || /^\d+\.\s+/.test(text));
@@ -124,11 +154,20 @@ async function pageToMarkdown(page: PDFPageProxy, options: Options): Promise<str
 
     if (headingPrefix || isList) {
       flushParagraph();
+      flushTable();
       blocks.push(isList ? normalizeListLine(text) : `${headingPrefix}${text}`);
       lastIndent = null;
       continue;
     }
 
+    if (text.includes("\t")) {
+      flushParagraph();
+      tableRows.push(text);
+      lastIndent = null;
+      continue;
+    }
+
+    flushTable();
     if (lastIndent !== null && Math.abs(line.x - lastIndent) > 8) {
       flushParagraph();
     }
@@ -137,6 +176,7 @@ async function pageToMarkdown(page: PDFPageProxy, options: Options): Promise<str
   }
 
   flushParagraph();
+  flushTable();
   return blocks.join("\n\n");
 }
 
@@ -158,6 +198,7 @@ export default function PdfToMarkdownPage() {
   const [currentPage, setCurrentPage] = useState(0);
   const [completedPages, setCompletedPages] = useState(0);
   const [markdown, setMarkdown] = useState("");
+  const runIdRef = useRef(0);
 
   const actualStart = pageScope === "all" ? 1 : clamp(startPage, 1, pageCount || 1);
   const actualEnd = pageScope === "all" ? pageCount : clamp(endPage, actualStart, pageCount || actualStart);
@@ -169,12 +210,19 @@ export default function PdfToMarkdownPage() {
   const handleDrop = useCallback(async (files: File[]) => {
     const selectedFile = files[0];
     if (!selectedFile) return;
+    runIdRef.current += 1;
+    await pdfDoc?.destroy();
+    setPdfDoc(null);
+    setMarkdown("");
+    setCompletedPages(0);
+    let proxy: PdfDocumentProxy | null = null;
+    let firstPage: PDFPageProxy | null = null;
     try {
       const pdfjs = await loadPdfJs();
       const arrayBuffer = await selectedFile.arrayBuffer();
-      const proxy = await pdfjs.getDocument({ data: arrayBuffer.slice(0) }).promise;
-      const page = await proxy.getPage(1);
-      const content = await page.getTextContent({ includeMarkedContent: true });
+      proxy = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+      firstPage = await proxy.getPage(1);
+      const content = await firstPage.getTextContent({ includeMarkedContent: true });
       const hasText = content.items.some((item) => "str" in item && item.str.trim().length > 0);
       setFile(selectedFile);
       setPdfDoc(proxy);
@@ -183,10 +231,13 @@ export default function PdfToMarkdownPage() {
       setEndPage(proxy.numPages);
       setTextBased(hasText);
     } catch (error) {
+      await proxy?.destroy();
       console.error(error);
       toast.error("Something went wrong.");
+    } finally {
+      await firstPage?.cleanup();
     }
-  }, []);
+  }, [pdfDoc]);
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
@@ -199,16 +250,32 @@ export default function PdfToMarkdownPage() {
 
   const convertMarkdown = useCallback(async () => {
     if (!pdfDoc) return;
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
     setStep("processing");
     setCompletedPages(0);
+    setMarkdown("");
     toast.info("Extracting text...");
     try {
+      if (actualEnd - actualStart > 100) {
+        throw new Error("Document too large. Extraction is limited to 100 pages at a time.");
+      }
+
       const pages: string[] = [];
       let converted = 0;
       for (let pageNum = actualStart; pageNum <= actualEnd; pageNum += 1) {
         setCurrentPage(pageNum);
-        const page = await pdfDoc.getPage(pageNum);
-        pages.push(await pageToMarkdown(page, options));
+        // Yield to browser to prevent UI freeze
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        
+        let page: PDFPageProxy | null = null;
+        try {
+          page = await pdfDoc.getPage(pageNum);
+          pages.push(await pageToMarkdown(page, options));
+        } finally {
+          await page?.cleanup();
+        }
+        if (runIdRef.current !== runId) return;
         converted += 1;
         setCompletedPages(converted);
       }
@@ -216,6 +283,7 @@ export default function PdfToMarkdownPage() {
       if (options.cleanWhitespace) {
         output = output.replace(/\n{3,}/g, "\n\n").trim();
       }
+      if (runIdRef.current !== runId) return;
       setMarkdown(output);
       setStep("result");
       if (output.trim().length < 30) {
@@ -223,8 +291,10 @@ export default function PdfToMarkdownPage() {
       }
       toast.success(`Done! ${converted} pages converted to Markdown.`);
     } catch (error) {
+      if (runIdRef.current !== runId) return;
       console.error(error);
-      toast.error("Something went wrong.");
+      const msg = error instanceof Error ? error.message : "Something went wrong.";
+      toast.error(msg);
       setStep("configure");
     }
   }, [actualEnd, actualStart, options, pdfDoc]);
@@ -243,7 +313,7 @@ export default function PdfToMarkdownPage() {
       anchor.href = url;
       anchor.download = `${filenameBase(file.name)}.${extension}`;
       anchor.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
       if (extension === "md") {
         addFile({
           filename: anchor.download,
@@ -257,6 +327,8 @@ export default function PdfToMarkdownPage() {
   );
 
   const resetAll = useCallback(() => {
+    runIdRef.current += 1;
+    void pdfDoc?.destroy();
     setStep("upload");
     setFile(null);
     setPdfDoc(null);
@@ -264,7 +336,14 @@ export default function PdfToMarkdownPage() {
     setTextBased(null);
     setMarkdown("");
     setCompletedPages(0);
-  }, []);
+  }, [pdfDoc]);
+
+  useEffect(() => {
+    return () => {
+      runIdRef.current += 1;
+      void pdfDoc?.destroy();
+    };
+  }, [pdfDoc]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -302,7 +381,7 @@ export default function PdfToMarkdownPage() {
             <div className="mb-8">
               <p className="text-sm font-bold uppercase tracking-[0.18em]" style={{ color: ACCENT_COLOR }}>Structured text</p>
               <h1 className="mt-2 text-3xl font-black tracking-tight sm:text-4xl">PDF to Markdown</h1>
-              <p className="mt-2 max-w-2xl text-muted">Extract headings, paragraphs, and lists from PDFs into editable Markdown.</p>
+              <p className="mt-2 max-w-2xl text-muted">Extract selectable PDF text into editable Markdown with approximate reading order, headings, lists, and simple tables.</p>
             </div>
 
             {step === "upload" && (
@@ -321,7 +400,7 @@ export default function PdfToMarkdownPage() {
                       <p className="break-all font-semibold">{file.name}</p>
                       <p className="text-muted">{pageCount} pages</p>
                       <p className="text-muted">{formatBytes(file.size)}</p>
-                      {textBased === true && <div className="rounded-md bg-green-500/10 p-3 text-green-700 dark:text-green-300">Text-based PDF detected. Extraction will be accurate.</div>}
+                      {textBased === true && <div className="rounded-md bg-green-500/10 p-3 text-green-700 dark:text-green-300">Selectable text detected. Extraction quality depends on the PDF&apos;s internal text order.</div>}
                       {textBased === false && <div className="rounded-md bg-amber-500/10 p-3 text-amber-700 dark:text-amber-300">Scanned PDF detected. Text extraction may be limited. Consider using OCR first.</div>}
                       <button type="button" onClick={goConfigure} aria-label="Configure Markdown extraction" className="w-full rounded-md bg-indigo-600 px-5 py-3 font-bold text-white hover:bg-indigo-700">Extract &rarr;</button>
                     </div>
@@ -347,6 +426,11 @@ export default function PdfToMarkdownPage() {
                     )}
                   </div>
                 </fieldset>
+                
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-700 dark:text-amber-400">
+                  <strong>Limited Text Extraction:</strong> This client-side tool uses selectable PDF text and layout heuristics for reading order, columns, headings, lists, and simple tables. It <strong>cannot</strong> reliably reconstruct complex tables, footnotes, rotated text, images, or true document structure.
+                </div>
+
                 <fieldset>
                   <legend className="mb-3 text-sm font-bold uppercase tracking-[0.16em] text-muted">Formatting Options</legend>
                   <div className="grid gap-3 md:grid-cols-2">

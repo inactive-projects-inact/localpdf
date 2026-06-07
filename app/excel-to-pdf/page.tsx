@@ -11,6 +11,7 @@ import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
 
 const ACCENT = "#F59E0B";
+const MAX_EXCEL_BYTES = 50 * 1024 * 1024;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -24,23 +25,10 @@ type FontSize = "small" | "medium" | "large";
 type SheetScope = "active" | "all" | "selected";
 type Step = "upload" | "configure" | "result";
 
-interface PageDims {
-  width: number;
-  height: number;
-}
-
-const PAGE_DIMS: Record<PageSize, PageDims> = {
-  A4: { width: 595, height: 842 },
-  A3: { width: 842, height: 1191 },
-  Letter: { width: 612, height: 792 },
-  Legal: { width: 612, height: 1008 },
-};
-
-const FONT_SIZES: Record<FontSize, number> = {
-  small: 8,
-  medium: 10,
-  large: 12,
-};
+type ExcelWorkerMessage =
+  | { type: "LOADED"; jobId: number; sheetNames: string[] }
+  | { type: "DONE"; jobId: number; result: ArrayBuffer }
+  | { type: "ERROR"; jobId: number; error?: string };
 
 export default function ExcelToPdfPage() {
   const [step, setStep] = useState<Step>("upload");
@@ -56,18 +44,53 @@ export default function ExcelToPdfPage() {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const runIdRef = useRef(0);
+  const fileRef = useRef<File | null>(null);
   const { addFile } = useFileHistory();
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
-      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+  const cleanupWorker = useCallback(() => {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+  }, []);
+
+  const createWorker = useCallback((jobId: number) => {
+    cleanupWorker();
+    const worker = new Worker(new URL("../lib/excelToPdf.worker.ts", import.meta.url), { type: "module" });
+    workerRef.current = worker;
+    worker.onmessage = (event: MessageEvent<ExcelWorkerMessage>) => {
+      const message = event.data;
+      if (message.jobId !== runIdRef.current) return;
+      if (message.type === "LOADED") {
+        setSheetNames(message.sheetNames);
+        setActiveSheet(message.sheetNames[0] ?? "");
+        setSelectedSheets(message.sheetNames[0] ? [message.sheetNames[0]] : []);
+        setProcessing(false);
+        const loadedFile = fileRef.current;
+        if (loadedFile) addFile({ filename: loadedFile.name, size: loadedFile.size, timestamp: Date.now(), tool: "excelToPdf" });
+        toast.success("Spreadsheet loaded.");
+      } else if (message.type === "DONE") {
+        const loadedFile = fileRef.current;
+        if (!loadedFile) return;
+        const pdfBytes = new Uint8Array(message.result);
+        const baseName = loadedFile.name.replace(/\.(xlsx|xls)$/i, "");
+        setResult({ bytes: pdfBytes, name: `converted-${baseName}.pdf` });
+        setStep("result");
+        setProcessing(false);
+        toast.success("Done! Your PDF is ready.", { id: "excel2pdf" });
+      } else {
+        setProcessing(false);
+        toast.error(message.error || "Conversion failed.", { id: "excel2pdf" });
+      }
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result]);
+    worker.onerror = (event) => {
+      if (jobId !== runIdRef.current) return;
+      setProcessing(false);
+      toast.error(`Worker error: ${event.message}`, { id: "excel2pdf" });
+      cleanupWorker();
+    };
+    return worker;
+  }, [addFile, cleanupWorker]);
 
   const handleFile = useCallback(async (f: File) => {
     const name = f.name.toLowerCase();
@@ -75,26 +98,30 @@ export default function ExcelToPdfPage() {
       toast.error("Please select a valid .xlsx or .xls file.");
       return;
     }
+    if (f.size > MAX_EXCEL_BYTES) {
+      toast.error("Spreadsheet is too large. Maximum size is 50MB.");
+      return;
+    }
+    const jobId = runIdRef.current + 1;
+    runIdRef.current = jobId;
+    fileRef.current = f;
     setFile(f);
     setResult(null);
+    setSheetNames([]);
     setStep("configure");
+    setProcessing(true);
 
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const XLSX = await import("xlsx") as any;
       const ab = await f.arrayBuffer();
-      const wb = XLSX.read(ab, { type: "array" });
-      const names: string[] = wb.SheetNames;
-      setSheetNames(names);
-      setActiveSheet(names[0] ?? "");
-      setSelectedSheets([names[0] ?? ""]);
-    } catch {
-      setSheetNames([]);
+      if (runIdRef.current !== jobId) return;
+      const worker = createWorker(jobId);
+      worker.postMessage({ type: "LOAD", jobId, fileBytes: ab }, [ab]);
+    } catch (error) {
+      if (runIdRef.current !== jobId) return;
+      setProcessing(false);
+      toast.error(error instanceof Error ? error.message : "Could not read spreadsheet.");
     }
-
-    addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "excelToPdf" });
-    toast.success(`"${f.name}" loaded`);
-  }, [addFile]);
+  }, [createWorker]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles[0]) handleFile(acceptedFiles[0]);
@@ -108,22 +135,21 @@ export default function ExcelToPdfPage() {
     },
     multiple: false,
     maxFiles: 1,
-    onDropRejected: () => toast.error("Please select a valid .xlsx or .xls file."),
+    maxSize: MAX_EXCEL_BYTES,
+    onDropRejected: () => toast.error("Please select a valid .xlsx or .xls file under 50MB."),
   });
 
   const handleConvert = useCallback(async () => {
     if (!file) return;
+    const worker = workerRef.current;
+    if (!worker) {
+      toast.error("Spreadsheet is not loaded. Choose the file again.", { id: "excel2pdf" });
+      return;
+    }
     setProcessing(true);
     setResult(null);
 
     try {
-      toast.loading("Reading spreadsheet...", { id: "excel2pdf" });
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const XLSX = await import("xlsx") as any;
-      const ab = await file.arrayBuffer();
-      const wb = XLSX.read(ab, { type: "array" });
-
       // Determine which sheets to convert
       let sheetsToConvert: string[] = [];
       if (sheetScope === "active") sheetsToConvert = [activeSheet];
@@ -132,178 +158,74 @@ export default function ExcelToPdfPage() {
 
       if (sheetsToConvert.length === 0) {
         toast.error("Please select at least one sheet.");
-        setProcessing(false);
         return;
       }
 
-      toast.loading("Rendering table...", { id: "excel2pdf" });
-
-      const { PDFDocument, StandardFonts, rgb } = await import("pdf-lib");
-      const pdfDoc = await PDFDocument.create();
-      const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-      const dims = PAGE_DIMS[pageSize];
-      const pgW = orientation === "landscape" ? dims.height : dims.width;
-      const pgH = orientation === "landscape" ? dims.width : dims.height;
-      const fSize = FONT_SIZES[fontSize];
-      const margin = 40;
-      const rowH = fSize + 8;
-      const headerH = rowH + 4;
-
-      for (const sheetName of sheetsToConvert) {
-        const ws = wb.Sheets[sheetName];
-        if (!ws) continue;
-
-        const rows: string[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" }) as string[][];
-        if (rows.length === 0) continue;
-
-        const colCount = Math.max(...rows.map(r => r.length));
-        if (colCount === 0) continue;
-
-        // Calculate column widths
-        const colWidths: number[] = Array(colCount).fill(0);
-        for (const row of rows) {
-          row.forEach((cell, i) => {
-            const text = String(cell);
-            const w = regularFont.widthOfTextAtSize(text, fSize) + 8;
-            colWidths[i] = Math.max(colWidths[i], Math.min(w, 120));
-          });
-        }
-
-        // Scale columns to fit page width
-        const totalColWidth = colWidths.reduce((a, b) => a + b, 0);
-        const availW = pgW - margin * 2;
-        const scale = totalColWidth > availW ? availW / totalColWidth : 1;
-        const scaledWidths = colWidths.map(w => w * scale);
-
-        let page = pdfDoc.addPage([pgW, pgH]);
-        let y = pgH - margin;
-
-        // Sheet title
-        if (includeSheetTitle) {
-          page.drawText(sheetName, {
-            x: margin,
-            y,
-            size: fSize + 4,
-            font: boldFont,
-            color: rgb(0.05, 0.05, 0.05),
-          });
-          y -= fSize + 12;
-        }
-
-        // Draw rows
-        rows.forEach((row, rowIdx) => {
-          const isHeader = rowIdx === 0;
-          const rowBackground = isHeader ? rgb(0.06, 0.06, 0.06) : rowIdx % 2 === 0 ? rgb(0.97, 0.97, 0.97) : rgb(1, 1, 1);
-          const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1);
-          const currentRowH = isHeader ? headerH : rowH;
-
-          // Check if we need a new page
-          if (y - currentRowH < margin) {
-            page = pdfDoc.addPage([pgW, pgH]);
-            y = pgH - margin;
-            // Repeat header row if not currently drawing it
-            if (rowIdx > 0 && rows[0]) {
-              const hRow = rows[0];
-              let hx = margin;
-              page.drawRectangle({
-                x: margin,
-                y: y - headerH,
-                width: availW,
-                height: headerH,
-                color: rgb(0.06, 0.06, 0.06),
-              });
-              hRow.forEach((cell, i) => {
-                const cw = scaledWidths[i] ?? 60;
-                page.drawText(String(cell).slice(0, 40), {
-                  x: hx + 3,
-                  y: y - headerH + 5,
-                  size: fSize,
-                  font: boldFont,
-                  color: rgb(1, 1, 1),
-                  maxWidth: cw - 6,
-                });
-                hx += cw;
-              });
-              y -= headerH;
-            }
-          }
-
-          // Draw row background
-          let x = margin;
-          page.drawRectangle({
-            x: margin,
-            y: y - currentRowH,
-            width: availW,
-            height: currentRowH,
-            color: rowBackground,
-          });
-
-          // Draw cell borders and text
-          row.forEach((cell, i) => {
-            const cw = scaledWidths[i] ?? 60;
-            const text = String(cell ?? "").slice(0, 60);
-            // Border
-            page.drawRectangle({
-              x,
-              y: y - currentRowH,
-              width: cw,
-              height: currentRowH,
-              borderColor: rgb(0.9, 0.91, 0.92),
-              borderWidth: 0.5,
-            });
-            // Text
-            if (text) {
-              page.drawText(text, {
-                x: x + 3,
-                y: y - currentRowH + 5,
-                size: fSize,
-                font: isHeader ? boldFont : regularFont,
-                color: textColor,
-                maxWidth: cw - 6,
-              });
-            }
-            x += cw;
-          });
-
-          y -= currentRowH;
-        });
-      }
-
-      toast.loading("Building PDF...", { id: "excel2pdf" });
-
-      const pdfBytes = await pdfDoc.save();
-      const baseName = file.name.replace(/\.(xlsx|xls)$/i, "");
-      setResult({ bytes: pdfBytes, name: `converted-${baseName}.pdf` });
-      setStep("result");
-      toast.success("Done! Your PDF is ready.", { id: "excel2pdf" });
+      const jobId = runIdRef.current;
+      toast.loading("Building PDF in worker...", { id: "excel2pdf" });
+      worker.postMessage({
+        type: "CONVERT",
+        jobId,
+        sheetsToConvert,
+        orientation,
+        pageSize,
+        fontSize,
+        includeSheetTitle
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Conversion failed.";
       toast.error(msg, { id: "excel2pdf" });
-    } finally {
       setProcessing(false);
     }
   }, [file, sheetScope, activeSheet, sheetNames, selectedSheets, orientation, pageSize, fontSize, includeSheetTitle]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
-    const blob = new Blob([result.bytes.buffer as ArrayBuffer], { type: "application/pdf" });
+    const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], { type: "application/pdf" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = result.name;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
     toast.success("Download started!");
   }, [result]);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
+      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleDownload, result]);
+
   const reset = useCallback(() => {
+    runIdRef.current += 1;
+    cleanupWorker();
+    fileRef.current = null;
     setFile(null);
     setResult(null);
     setSheetNames([]);
+    setProcessing(false);
     setStep("upload");
-  }, []);
+  }, [cleanupWorker]);
+
+  const cancelProcessing = useCallback(() => {
+    runIdRef.current += 1;
+    cleanupWorker();
+    setProcessing(false);
+    toast.info("Conversion cancelled.", { id: "excel2pdf" });
+  }, [cleanupWorker]);
+
+  useEffect(() => {
+    return () => {
+      runIdRef.current += 1;
+      cleanupWorker();
+    };
+  }, [cleanupWorker]);
 
   const toggleSheet = (name: string) => {
     setSelectedSheets(prev =>
@@ -336,7 +258,7 @@ export default function ExcelToPdfPage() {
           </div>
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Excel to PDF</h1>
-            <p className="mt-1 text-sm text-muted">Convert spreadsheets into clean, formatted PDFs with styled tables.</p>
+            <p className="mt-1 text-sm text-muted">Extract spreadsheet data into basic PDF tables. Complex formatting is not preserved.</p>
           </div>
         </div>
 
@@ -437,8 +359,13 @@ export default function ExcelToPdfPage() {
               </div>
             )}
 
-            {/* PDF Options */}
             <div className="rounded-2xl border border-border bg-card p-5 space-y-4">
+              <div className="flex items-start gap-3 rounded-xl border p-4 mb-4" style={{ borderColor: `${ACCENT}30`, background: `${ACCENT}08` }}>
+                <Sheet className="h-5 w-5 mt-0.5 shrink-0" style={{ color: ACCENT }} />
+                <p className="text-sm text-muted">
+                  <strong>Basic Extraction Only:</strong> This tool extracts raw data and creates a basic grid. Complex styling, colors, and merged cells from the original Excel file are not preserved.
+                </p>
+              </div>
               <p className="text-sm font-semibold text-foreground">PDF Options</p>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <label className="grid gap-1.5">
@@ -507,6 +434,15 @@ export default function ExcelToPdfPage() {
                 </>
               )}
             </button>
+            {processing && (
+              <button
+                type="button"
+                onClick={cancelProcessing}
+                className="w-full rounded-2xl border border-border bg-card py-3 text-sm font-semibold text-foreground transition hover:bg-background"
+              >
+                Cancel
+              </button>
+            )}
           </div>
         )}
 

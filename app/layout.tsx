@@ -4,6 +4,7 @@ import ThemeProvider from "./components/ThemeProvider";
 import FileHistoryProvider from "./components/FileHistoryProvider";
 import ToastManager from "./components/ToastManager";
 import CookieConsent from "./components/CookieConsent";
+import AdsterraSocialBar from "./components/AdsterraSocialBar";
 
 export const metadata: Metadata = {
   title: {
@@ -93,6 +94,7 @@ export default function RootLayout({
           </FileHistoryProvider>
         </ThemeProvider>
         <CookieConsent />
+        <AdsterraSocialBar />
       </body>
     </html>
   );

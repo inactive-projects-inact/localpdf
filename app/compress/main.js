@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
@@ -10,6 +10,7 @@ import { PRESETS, compressPdf, isValidPdfFile } from "../lib/pdfCompressor";
 import { getToolDefinition } from "../lib/tool-registry";
 
 const TOOL = getToolDefinition("compress");
+const MAX_CLIENT_FILE_BYTES = TOOL.input.maxSizeBytes;
 
 export default function CompressMain() {
   const [file, setFile] = useState(null);
@@ -18,6 +19,8 @@ export default function CompressMain() {
   const [errorMessage, setErrorMessage] = useState(null);
   const [progress, setProgress] = useState({ stage: "idle", current: 0, total: 0 });
   const [result, setResult] = useState(null);
+  const abortRef = useRef(null);
+  const runIdRef = useRef(0);
 
   const { pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
@@ -25,6 +28,8 @@ export default function CompressMain() {
   const progressPercent = progress.total ? Math.round((progress.current / progress.total) * 100) : 0;
 
   const resetAll = useCallback(() => {
+    abortRef.current?.abort();
+    runIdRef.current += 1;
     setFile(null);
     setStatus("idle");
     setErrorMessage(null);
@@ -37,6 +42,10 @@ export default function CompressMain() {
     if (!incomingFile) return;
     if (!isValidPdfFile(incomingFile)) {
       toast.error("Please select a valid PDF.");
+      return;
+    }
+    if (incomingFile.size > MAX_CLIENT_FILE_BYTES) {
+      toast.error("File exceeds the 100 MB client-side processing limit.");
       return;
     }
     setFile(incomingFile);
@@ -78,6 +87,11 @@ export default function CompressMain() {
   const handleCompress = useCallback(async () => {
     if (!file) return;
 
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setStatus("compressing");
     setErrorMessage(null);
     setResult(null);
@@ -87,19 +101,35 @@ export default function CompressMain() {
 
     try {
       const compressed = await compressPdf(file, presetKey, (stage, current, total) => {
+        if (runIdRef.current !== runId) return;
         setProgress({ stage, current, total });
-      });
+      }, controller.signal);
 
+      if (runIdRef.current !== runId) return;
       setResult(compressed);
       setStatus("done");
       toast.success("Download started.", { id: "compress" });
     } catch (err) {
+      if (runIdRef.current !== runId) return;
       const message = err instanceof Error ? err.message : "Compression failed.";
       setErrorMessage(message);
       setStatus(err?.name === "AbortError" ? "idle" : "error");
       toast.error(message, { id: "compress" });
+    } finally {
+      if (runIdRef.current === runId) {
+        abortRef.current = null;
+      }
     }
   }, [file, presetKey]);
+
+  const handleCancel = useCallback(() => {
+    runIdRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setStatus("idle");
+    setProgress({ stage: "idle", current: 0, total: 0 });
+    toast.info("Compression cancelled.", { id: "compress" });
+  }, []);
 
   const fileName = file?.name ?? "No file selected";
   const hasFile = file !== null;
@@ -110,7 +140,7 @@ export default function CompressMain() {
   return (
     <AppShell>
       <main className="mx-auto w-full max-w-4xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
-        <div className="mb-8">
+        <div className="mb-6">
           <div className="flex items-center gap-3 mb-2">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-compress/10 text-compress">
               <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -120,8 +150,15 @@ export default function CompressMain() {
             <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Compress PDF</h1>
           </div>
           <p className="text-muted">
-            Re-encode PDF pages in the browser with preset-based compression, object stream serialization, and worker-backed processing.
+            Reduce file size locally. Warning: Pages containing images will be rasterized.
           </p>
+        </div>
+
+        <div className="mb-6 flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+          <svg className="mt-0.5 h-5 w-5 shrink-0 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+          <div className="text-sm text-red-700 dark:text-red-400">
+            <strong>Destructive Compression:</strong> The client-side engine cannot extract and compress individual images safely. Any page containing an image will be entirely converted into a flat JPEG, permanently destroying its selectable text and vector quality. Pure text pages will remain intact.
+          </div>
         </div>
 
         <div className="rounded-3xl border border-border bg-card p-5 shadow-sm sm:p-6">
@@ -181,6 +218,13 @@ export default function CompressMain() {
                 {progress.stage}... {progress.current}/{progress.total || "?"}
               </p>
             </div>
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="mt-4 rounded-xl border border-border bg-card px-4 py-2 text-sm font-semibold text-foreground transition hover:bg-background"
+            >
+              Cancel
+            </button>
             <div className="mt-4 h-2 overflow-hidden rounded-full bg-border">
               <div
                 className="h-full rounded-full bg-compress transition-all duration-300"

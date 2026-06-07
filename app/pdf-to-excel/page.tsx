@@ -9,8 +9,10 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import type { PDFDocumentProxy, TextItem as PdfTextItem } from "pdfjs-dist/types/src/display/api";
 
 const ACCENT = "#10B981";
+const MAX_PDF_BYTES = 50 * 1024 * 1024;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -20,6 +22,49 @@ function formatBytes(bytes: number): string {
 
 type ExtractionScope = "all" | "single" | "range";
 type Step = "upload" | "configure" | "result";
+type PageRows = { pageNumber: number; rows: string[][] };
+type ExcelWorkerMessage =
+  | { type: "DONE"; jobId: number; result: ArrayBuffer }
+  | { type: "ERROR"; jobId: number; error?: string };
+
+function isValidTextItem(item: unknown): item is PdfTextItem {
+  const candidate = item as Partial<PdfTextItem>;
+  return (
+    typeof candidate.str === "string" &&
+    Array.isArray(candidate.transform) &&
+    candidate.transform.length >= 6 &&
+    candidate.transform.every((value) => typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+function rowsFromTextItems(items: unknown[]): string[][] {
+  const rowMap = new Map<number, Array<{ text: string; x: number }>>();
+  for (const item of items) {
+    if (!isValidTextItem(item)) continue;
+    const text = item.str.trim();
+    if (!text) continue;
+    const rawY = Math.round(item.transform[5]);
+    let matchedY = rawY;
+    for (const existingY of rowMap.keys()) {
+      if (Math.abs(existingY - rawY) <= 5) {
+        matchedY = existingY;
+        break;
+      }
+    }
+    const row = rowMap.get(matchedY) ?? [];
+    row.push({ text, x: item.transform[4] });
+    rowMap.set(matchedY, row);
+  }
+
+  return Array.from(rowMap.keys())
+    .sort((a, b) => b - a)
+    .map((y) => (rowMap.get(y) ?? []).sort((a, b) => a.x - b.x).map((cell) => cell.text))
+    .filter((row) => row.length > 0);
+}
+
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+}
 
 export default function PdfToExcelPage() {
   const [step, setStep] = useState<Step>("upload");
@@ -32,41 +77,67 @@ export default function PdfToExcelPage() {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
+  const runIdRef = useRef(0);
+  const workerRef = useRef<Worker | null>(null);
+  const pdfProxyRef = useRef<PDFDocumentProxy | null>(null);
+  const cancelRef = useRef(false);
   const { addFile } = useFileHistory();
 
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
-      if ((e.key === "d" || e.key === "D") && result) handleDownload();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result]);
+  const cleanupWorker = useCallback(() => {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+  }, []);
+
+  const cleanupPdfProxy = useCallback(() => {
+    const proxy = pdfProxyRef.current;
+    pdfProxyRef.current = null;
+    void proxy?.cleanup?.();
+    void proxy?.destroy?.();
+  }, []);
 
   const handleFile = useCallback(async (f: File) => {
     if (!f.name.toLowerCase().endsWith(".pdf") && f.type !== "application/pdf") {
       toast.error("Please select a valid PDF file.");
       return;
     }
-    setFile(f);
-    setResult(null);
-    setStep("configure");
+    if (f.size > MAX_PDF_BYTES) {
+      toast.error("PDF is too large. Maximum size is 50MB.");
+      return;
+    }
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
+    cleanupWorker();
+    cleanupPdfProxy();
+    let doc: PDFDocumentProxy | null = null;
     try {
       const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
       GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
       const ab = await f.arrayBuffer();
-      const doc = await getDocument({ data: ab }).promise;
+      doc = await getDocument({ data: ab }).promise;
+      if (doc.numPages < 1) throw new Error("Could not read any pages from this PDF.");
+      if (runIdRef.current !== runId) {
+        return;
+      }
+      setFile(f);
+      setResult(null);
       setPageCount(doc.numPages);
       setRangeEnd(doc.numPages);
-      await doc.destroy();
-    } catch {
+      setSinglePage(1);
+      setRangeStart(1);
+      setStep("configure");
+      addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "pdfToExcel" });
+      toast.success(`"${f.name}" loaded`);
+    } catch (error) {
+      if (runIdRef.current !== runId) return;
+      setFile(null);
       setPageCount(0);
+      setStep("upload");
+      toast.error(error instanceof Error ? error.message : "Could not inspect this PDF.");
+    } finally {
+      await doc?.cleanup?.();
+      await doc?.destroy?.();
     }
-    addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "pdfToExcel" });
-    toast.success(`"${f.name}" loaded`);
-  }, [addFile]);
+  }, [addFile, cleanupPdfProxy, cleanupWorker]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles[0]) handleFile(acceptedFiles[0]);
@@ -77,22 +148,29 @@ export default function PdfToExcelPage() {
     accept: { "application/pdf": [".pdf"] },
     multiple: false,
     maxFiles: 1,
-    onDropRejected: () => toast.error("Please select a valid PDF file."),
+    maxSize: MAX_PDF_BYTES,
+    onDropRejected: () => toast.error("Please select a valid PDF file under 50MB."),
   });
 
   const handleExtract = useCallback(async () => {
     if (!file) return;
+    if (pageCount < 1) {
+      toast.error("Could not determine a valid page count. Choose the PDF again.", { id: "pdf2excel" });
+      return;
+    }
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
+    cancelRef.current = false;
     setProcessing(true);
     setResult(null);
+    cleanupWorker();
+    cleanupPdfProxy();
 
     try {
       toast.loading("Analyzing PDF structure...", { id: "pdf2excel" });
 
-      const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-      GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
       const ab = await file.arrayBuffer();
-      const pdfDoc = await getDocument({ data: ab }).promise;
-      const totalPages = pdfDoc.numPages;
+      const totalPages = pageCount;
 
       // Determine which pages to extract
       let pagesToExtract: number[] = [];
@@ -106,82 +184,76 @@ export default function PdfToExcelPage() {
         const end = Math.max(start, Math.min(rangeEnd, totalPages));
         pagesToExtract = Array.from({ length: end - start + 1 }, (_, i) => i + start);
       }
+      if (pagesToExtract.length === 0) throw new Error("No pages selected for extraction.");
 
-      toast.loading("Extracting table data...", { id: "pdf2excel" });
+      const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
+      GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+      const pdfDoc = await getDocument({ data: ab }).promise;
+      pdfProxyRef.current = pdfDoc;
+      if (pdfDoc.numPages < 1) throw new Error("Could not read any pages from this PDF.");
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const XLSX = await import("xlsx") as any;
-      const workbook = XLSX.utils.book_new();
-
-      for (const pageNum of pagesToExtract) {
-        const page = await pdfDoc.getPage(pageNum);
-        const textContent = await page.getTextContent();
-
-        interface PdfTextItem { str: string; transform: number[] }
-        const items = textContent.items
-          .filter(item => "str" in item && typeof (item as { str?: string }).str === "string")
-          .map(item => item as unknown as PdfTextItem)
-          .filter(item => item.str.trim() !== "");
-
-        if (items.length === 0) continue;
-
-        // Group into rows by Y position (within 5px tolerance)
-        const rowMap = new Map<number, Array<{ text: string; x: number }>>();
-        for (const item of items) {
-          const rawY = Math.round(item.transform[5]);
-          // Find closest existing Y
-          let matchedY = rawY;
-          for (const existingY of rowMap.keys()) {
-            if (Math.abs(existingY - rawY) <= 5) {
-              matchedY = existingY;
-              break;
-            }
-          }
-          if (!rowMap.has(matchedY)) rowMap.set(matchedY, []);
-          rowMap.get(matchedY)!.push({ text: item.str.trim(), x: item.transform[4] });
+      const extractedPages: PageRows[] = [];
+      for (const pageNumber of pagesToExtract) {
+        if (runIdRef.current !== runId || cancelRef.current) throw new DOMException("Extraction cancelled.", "AbortError");
+        const page = await pdfDoc.getPage(pageNumber);
+        try {
+          const textContent = await page.getTextContent();
+          const rows = rowsFromTextItems(textContent.items);
+          if (rows.length > 0) extractedPages.push({ pageNumber, rows });
+        } finally {
+          page.cleanup?.();
         }
-
-        // Sort rows by Y descending (PDF coords), then sort each row by X
-        const sortedYs = Array.from(rowMap.keys()).sort((a, b) => b - a);
-        const rows: string[][] = sortedYs.map(y => {
-          const cells = rowMap.get(y)!.sort((a, b) => a.x - b.x);
-          return cells.map(c => c.text);
-        });
-
-        const ws = XLSX.utils.aoa_to_sheet(rows);
-
-        // Auto-fit columns
-        const colWidths: number[] = [];
-        for (const row of rows) {
-          row.forEach((cell, i) => {
-            colWidths[i] = Math.max(colWidths[i] ?? 8, cell.length + 2);
-          });
-        }
-        ws["!cols"] = colWidths.map(w => ({ wch: Math.min(w, 40) }));
-
-        XLSX.utils.book_append_sheet(workbook, ws, `Page ${pageNum}`);
+        await yieldToBrowser();
       }
+      if (extractedPages.length === 0) throw new Error("No extractable text rows were found in the selected pages.");
 
-      await pdfDoc.destroy();
-
-      toast.loading("Building spreadsheet...", { id: "pdf2excel" });
-
-      const xlsxBytes: Uint8Array = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
-      const baseName = file.name.replace(/\.pdf$/i, "");
-      setResult({ bytes: xlsxBytes, name: `extracted-${baseName}.xlsx` });
-      setStep("result");
-      toast.success("Done! Your Excel file is ready.", { id: "pdf2excel" });
+      const worker = new Worker(new URL("../lib/pdfToExcel.worker.ts", import.meta.url), { type: "module" });
+      workerRef.current = worker;
+      worker.onmessage = (e: MessageEvent<ExcelWorkerMessage>) => {
+        if (e.data.jobId !== runIdRef.current) return;
+        if (e.data.type === "DONE") {
+          const xlsxBytes = new Uint8Array(e.data.result);
+          const baseName = file.name.replace(/\.pdf$/i, "");
+          setResult({ bytes: xlsxBytes, name: `extracted-${baseName}.xlsx` });
+          setStep("result");
+          toast.success("Done! Your Excel file is ready.", { id: "pdf2excel" });
+          setProcessing(false);
+          cleanupWorker();
+          cleanupPdfProxy();
+        } else {
+          toast.error(e.data.error || "Extraction failed.", { id: "pdf2excel" });
+          setProcessing(false);
+          cleanupWorker();
+          cleanupPdfProxy();
+        }
+      };
+      worker.onerror = (err) => {
+        if (runIdRef.current !== runId) return;
+        toast.error("Worker error: " + err.message, { id: "pdf2excel" });
+        setProcessing(false);
+        cleanupWorker();
+        cleanupPdfProxy();
+      };
+      worker.postMessage({
+        type: "BUILD",
+        jobId: runId,
+        pages: extractedPages,
+      });
     } catch (err) {
+      if (runIdRef.current !== runId) return;
       const msg = err instanceof Error ? err.message : "Extraction failed.";
-      toast.error(msg, { id: "pdf2excel" });
-    } finally {
+      if (err instanceof DOMException && err.name === "AbortError") toast.info("Extraction cancelled.", { id: "pdf2excel" });
+      else toast.error(msg, { id: "pdf2excel" });
       setProcessing(false);
+      cleanupWorker();
+      cleanupPdfProxy();
     }
-  }, [file, scope, singlePage, rangeStart, rangeEnd]);
+  }, [cleanupPdfProxy, cleanupWorker, file, pageCount, rangeEnd, rangeStart, scope, singlePage]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
-    const blob = new Blob([result.bytes.buffer as ArrayBuffer], {
+    const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     });
     const url = URL.createObjectURL(blob);
@@ -189,17 +261,50 @@ export default function PdfToExcelPage() {
     a.href = url;
     a.download = result.name;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
     toast.success("Download started!");
   }, [result]);
 
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
+      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleDownload, result]);
+
   const reset = useCallback(() => {
+    runIdRef.current += 1;
+    cancelRef.current = true;
+    cleanupWorker();
+    cleanupPdfProxy();
     setFile(null);
     setResult(null);
     setPageCount(0);
     setScope("all");
+    setProcessing(false);
     setStep("upload");
-  }, []);
+  }, [cleanupPdfProxy, cleanupWorker]);
+
+  const cancelProcessing = useCallback(() => {
+    runIdRef.current += 1;
+    cancelRef.current = true;
+    cleanupWorker();
+    cleanupPdfProxy();
+    setProcessing(false);
+    toast.info("Extraction cancelled.", { id: "pdf2excel" });
+  }, [cleanupPdfProxy, cleanupWorker]);
+
+  useEffect(() => {
+    return () => {
+      runIdRef.current += 1;
+      cancelRef.current = true;
+      cleanupWorker();
+      cleanupPdfProxy();
+    };
+  }, [cleanupPdfProxy, cleanupWorker]);
 
   return (
     <AppShell>
@@ -226,7 +331,7 @@ export default function PdfToExcelPage() {
           </div>
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">PDF to Excel</h1>
-            <p className="mt-1 text-sm text-muted">Extract tables and structured data from PDF into an .xlsx spreadsheet.</p>
+            <p className="mt-1 text-sm text-muted">Extract raw text from PDF into spreadsheet rows. Not a true table reconstruction.</p>
           </div>
         </div>
 
@@ -279,11 +384,10 @@ export default function PdfToExcelPage() {
               </button>
             </div>
 
-            {/* Info banner */}
             <div className="flex items-start gap-3 rounded-xl border p-4" style={{ borderColor: `${ACCENT}30`, background: `${ACCENT}08` }}>
               <Info className="h-4 w-4 mt-0.5 shrink-0" style={{ color: ACCENT }} />
               <p className="text-sm text-muted">
-                Best results with PDF files that contain clear tables or structured data. Scanned PDFs may produce less accurate results.
+                <strong>Limited Extraction:</strong> This tool groups text by vertical position to create rows. It does not perform true table reconstruction and cannot accurately handle merged cells or complex layouts.
               </p>
             </div>
 
@@ -363,6 +467,15 @@ export default function PdfToExcelPage() {
                 </>
               )}
             </button>
+            {processing && (
+              <button
+                type="button"
+                onClick={cancelProcessing}
+                className="w-full rounded-2xl border border-border bg-card py-3 text-sm font-semibold text-foreground transition hover:bg-background"
+              >
+                Cancel
+              </button>
+            )}
           </div>
         )}
 

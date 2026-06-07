@@ -10,7 +10,6 @@ import {
   Clock,
   Image as ImageIcon,
   Loader2,
-  Type,
 } from "lucide-react";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
@@ -18,16 +17,12 @@ import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import type { FileHistoryItem } from "../components/FileHistoryProvider";
-import type { TextItem as PdfTextItem } from "pdfjs-dist/types/src/display/api";
 
 type PdfJs = typeof import("pdfjs-dist");
-type PdfDocumentProxy = import("pdfjs-dist").PDFDocumentProxy;
 type PptxConstructor = typeof import("pptxgenjs").default;
 type PptxPresentation = InstanceType<PptxConstructor>;
 
 type Step = "upload" | "configure" | "process" | "result";
-type Mode = "image" | "text";
-type Theme = "light" | "dark" | "branded";
 type PageScope = "all" | "custom";
 type PageStatus = "waiting" | "processing" | "done" | "failed";
 
@@ -37,6 +32,13 @@ type PageStatusEntry = {
 };
 
 const ACCENT_COLOR = "#F59E0B";
+const MAX_PDF_BYTES = 50 * 1024 * 1024;
+
+type PptxWorkerMessage =
+  | { type: "START"; jobId: number; pageNumber: number }
+  | { type: "PAGE"; jobId: number; pageNumber: number; dataUrl: string; size: number }
+  | { type: "DONE"; jobId: number }
+  | { type: "ERROR"; jobId: number; error?: string };
 
 async function loadPdfJs(): Promise<PdfJs> {
   const pdfjs = await import("pdfjs-dist");
@@ -56,12 +58,6 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function median(values: number[]): number {
-  if (values.length === 0) return 12;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)] || 12;
-}
-
 function secondsLabel(seconds: number | null): string {
   if (seconds === null) return "Calculating time...";
   if (seconds < 60) return `Estimated time: ~${seconds}s remaining`;
@@ -72,14 +68,11 @@ export default function PdfToPptxPage() {
   const { addFile } = useFileHistory();
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
-  const [pdfProxy, setPdfProxy] = useState<PdfDocumentProxy | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [firstPageDims, setFirstPageDims] = useState({ w: 0, h: 0 });
-  const [mode, setMode] = useState<Mode>("image");
   const [pageScope, setPageScope] = useState<PageScope>("all");
   const [startPage, setStartPage] = useState(1);
   const [endPage, setEndPage] = useState(1);
-  const [theme, setTheme] = useState<Theme>("light");
   const [currentPage, setCurrentPage] = useState(0);
   const [pageStatuses, setPageStatuses] = useState<Record<number, PageStatusEntry>>({});
   const [estimatedSeconds, setEstimatedSeconds] = useState<number | null>(null);
@@ -89,7 +82,16 @@ export default function PdfToPptxPage() {
   const [resultPres, setResultPres] = useState<PptxPresentation | null>(null);
   const [cancelled, setCancelled] = useState(false);
   const cancelRef = useRef(false);
+  const runIdRef = useRef(0);
+  const workerRef = useRef<Worker | null>(null);
+  const activePresRef = useRef<PptxPresentation | null>(null);
+  const createdSlidesRef = useRef(0);
   const pageDurationsRef = useRef<number[]>([]);
+
+  const cleanupWorker = useCallback(() => {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+  }, []);
 
   const actualStart = pageScope === "all" ? 1 : clamp(startPage, 1, pageCount || 1);
   const actualEnd = pageScope === "all" ? pageCount : clamp(endPage, actualStart, pageCount || actualStart);
@@ -99,8 +101,8 @@ export default function PdfToPptxPage() {
   const estimatedPptxSize = useMemo(() => {
     const captured = Object.values(pageStatuses).reduce((total, entry) => total + (entry.size ?? 0), 0);
     if (captured > 0) return captured;
-    return mode === "image" ? originalSize * 1.5 : originalSize * 0.25;
-  }, [mode, originalSize, pageStatuses]);
+    return originalSize * 1.5;
+  }, [originalSize, pageStatuses]);
 
   const handleDownload = useCallback(async () => {
     if (!resultPres || !file) return;
@@ -123,38 +125,61 @@ export default function PdfToPptxPage() {
   const handleDrop = useCallback(async (acceptedFiles: File[]) => {
     const selectedFile = acceptedFiles[0];
     if (!selectedFile) return;
+    if (selectedFile.size > MAX_PDF_BYTES) {
+      toast.error("PDF is too large. Maximum size is 50MB.");
+      return;
+    }
 
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
+    cleanupWorker();
+    let proxy: import("pdfjs-dist").PDFDocumentProxy | null = null;
+    let firstPage: { getViewport: (options: { scale: number }) => { width: number; height: number }; cleanup?: () => void } | null = null;
     try {
       const pdfjs = await loadPdfJs();
       const arrayBuffer = await selectedFile.arrayBuffer();
-      const proxy = await pdfjs.getDocument({ data: arrayBuffer.slice(0) }).promise;
-      const firstPage = await proxy.getPage(1);
+      if (runIdRef.current !== runId) return;
+      proxy = await pdfjs.getDocument({ data: arrayBuffer.slice(0) }).promise;
+      if (proxy.numPages < 1) throw new Error("Could not read any pages from this PDF.");
+      firstPage = await proxy.getPage(1);
       const viewport = firstPage.getViewport({ scale: 1 });
+      if (runIdRef.current !== runId) return;
       setFile(selectedFile);
-      setPdfProxy(proxy);
       setPageCount(proxy.numPages);
+      setStartPage(1);
       setEndPage(proxy.numPages);
       setFirstPageDims({ w: viewport.width, h: viewport.height });
+      setResultPres(null);
     } catch (error) {
       console.error(error);
-      toast.error("Something went wrong.");
+      toast.error(error instanceof Error ? error.message : "Something went wrong.");
+    } finally {
+      firstPage?.cleanup?.();
+      await proxy?.cleanup?.();
+      await proxy?.destroy?.();
     }
-  }, []);
+  }, [cleanupWorker]);
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
     accept: { "application/pdf": [".pdf"] },
     multiple: false,
     noKeyboard: true,
+    maxSize: MAX_PDF_BYTES,
+    onDropRejected: () => toast.error("Please choose a valid PDF file under 50MB."),
   });
 
   const startConversion = useCallback(async () => {
-    if (!pdfProxy || !file || firstPageDims.h === 0) return;
+    if (!file || firstPageDims.h === 0 || totalToProcess < 1) return;
 
+    const runId = runIdRef.current + 1;
+    runIdRef.current = runId;
+    cleanupWorker();
     setStep("process");
     setCancelled(false);
     cancelRef.current = false;
     pageDurationsRef.current = [];
+    createdSlidesRef.current = 0;
     setProcessedCount(0);
     setCreatedSlides(0);
     setFailedPagesCount(0);
@@ -170,6 +195,7 @@ export default function PdfToPptxPage() {
     try {
       const PptxGenJS = (await import("pptxgenjs")).default;
       const pres = new PptxGenJS();
+      activePresRef.current = pres;
       const aspectRatio = firstPageDims.w / firstPageDims.h;
       const slideW = 10;
       const slideH = slideW / aspectRatio;
@@ -178,131 +204,102 @@ export default function PdfToPptxPage() {
 
       let localProcessed = 0;
       let localCreated = 0;
-      let localFailed = 0;
+      const pageStartTimes = new Map<number, number>();
+      const arrayBuffer = await file.arrayBuffer();
+      if (runIdRef.current !== runId || cancelRef.current) return;
 
-      for (let i = actualStart; i <= actualEnd; i++) {
-        setCurrentPage(i);
-        setPageStatuses((prev) => ({ ...prev, [i]: { status: "processing" } }));
-        const pageStartMs = performance.now();
-        try {
-          const page = await pdfProxy.getPage(i);
-          const slide = pres.addSlide();
-          if (mode === "image") {
-            const viewport = page.getViewport({ scale: 2.0 });
-            const canvas = document.createElement("canvas");
-            const ctx = canvas.getContext("2d");
-            if (!ctx) {
-              throw new Error("Could not create canvas context.");
-            }
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            await page.render({ canvasContext: ctx, viewport }).promise;
-            const base64 = canvas.toDataURL("image/jpeg", 0.85);
-            const estimatedSize = Math.round(base64.length * 0.75);
-            slide.addImage({ data: base64, x: 0, y: 0, w: slideW, h: slideH });
-            canvas.width = 0;
-            canvas.height = 0;
-            setPageStatuses((prev) => ({ ...prev, [i]: { status: "done", size: estimatedSize } }));
-          } else {
-            if (theme === "dark") {
-              slide.background = { color: "0F0F0F" };
-            } else if (theme === "branded") {
-              slide.addShape(pres.ShapeType.rect, {
-                x: 0,
-                y: 0,
-                w: slideW,
-                h: 0.5,
-                fill: { color: "3B3BFF" },
-                line: { color: "3B3BFF" },
-              });
-            } else {
-              slide.background = { color: "FFFFFF" };
-            }
-
-            const textContent = await page.getTextContent();
-            const viewport = page.getViewport({ scale: 1.0 });
-            const textItems = textContent.items.filter((item): item is PdfTextItem => "str" in item);
-            const medianFontSize = median(textItems.map((item) => item.height || 0).filter((height) => height > 0));
-            let textBytes = 0;
-
-            for (const item of textItems) {
-              if (!item.str.trim()) continue;
-              textBytes += item.str.length;
-              const isHeading = item.height > medianFontSize * 1.4;
-              const slideX = (Number(item.transform[4]) / viewport.width) * slideW;
-              const slideY = slideH - (Number(item.transform[5]) / viewport.height) * slideH;
-              const textColor = theme === "dark" ? "FFFFFF" : "0F0F0F";
-              const yOffset = isHeading ? 0.28 : 0.18;
-              slide.addText(item.str, {
-                x: slideX,
-                y: Math.max(0, slideY - yOffset),
-                w: Math.max(0.4, (item.width / viewport.width) * slideW + 0.2),
-                h: Math.max(0.2, (item.height / viewport.height) * slideH + 0.1),
-                fontSize: isHeading ? Math.max(14, item.height * 0.82) : Math.max(8, item.height * 0.72),
-                bold: isHeading,
-                color: textColor,
-                margin: 0,
-                breakLine: false,
-                fit: "shrink",
-              });
-            }
-            setPageStatuses((prev) => ({ ...prev, [i]: { status: "done", size: Math.max(1024, textBytes * 8) } }));
-          }
-          localCreated += 1;
-          setCreatedSlides(localCreated);
-        } catch (error) {
-          console.error(`Page ${i} failed`, error);
-          localFailed += 1;
-          setFailedPagesCount(localFailed);
-          setPageStatuses((prev) => ({ ...prev, [i]: { status: "failed" } }));
+      const worker = new Worker(new URL("../lib/pdfToPptx.worker.ts", import.meta.url), { type: "module" });
+      workerRef.current = worker;
+      worker.onmessage = (event: MessageEvent<PptxWorkerMessage>) => {
+        const message = event.data;
+        if (message.jobId !== runIdRef.current) return;
+        if (message.type === "START") {
+          pageStartTimes.set(message.pageNumber, performance.now());
+          setCurrentPage(message.pageNumber);
+          setPageStatuses((prev) => ({ ...prev, [message.pageNumber]: { status: "processing" } }));
+          return;
         }
-
-        localProcessed += 1;
-        setProcessedCount(localProcessed);
-        const pageMs = performance.now() - pageStartMs;
-        pageDurationsRef.current = [...pageDurationsRef.current.slice(-4), pageMs];
-        const averageMs =
-          pageDurationsRef.current.reduce((total, duration) => total + duration, 0) / pageDurationsRef.current.length;
-        const remainingPages = totalToProcess - localProcessed;
-        setEstimatedSeconds(Math.max(0, Math.round((averageMs * remainingPages) / 1000)));
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        if (cancelRef.current) break;
-      }
-
-      setResultPres(pres);
-      setStep("result");
-      if (cancelRef.current) {
-        setCancelled(true);
-        toast.info("Conversion stopped — partial file ready.");
-      } else {
-        toast.success(`Done! ${localCreated} slides created.`);
-      }
+        if (message.type === "PAGE") {
+          const slide = pres.addSlide();
+          slide.addImage({ data: message.dataUrl, x: 0, y: 0, w: slideW, h: slideH });
+          localCreated += 1;
+          localProcessed += 1;
+          createdSlidesRef.current = localCreated;
+          setCreatedSlides(localCreated);
+          setProcessedCount(localProcessed);
+          setPageStatuses((prev) => ({ ...prev, [message.pageNumber]: { status: "done", size: message.size } }));
+          const startedAt = pageStartTimes.get(message.pageNumber);
+          if (startedAt) {
+            pageDurationsRef.current = [...pageDurationsRef.current.slice(-4), performance.now() - startedAt];
+            const averageMs = pageDurationsRef.current.reduce((total, duration) => total + duration, 0) / pageDurationsRef.current.length;
+            const remainingPages = totalToProcess - localProcessed;
+            setEstimatedSeconds(Math.max(0, Math.round((averageMs * remainingPages) / 1000)));
+          }
+          return;
+        }
+        cleanupWorker();
+        activePresRef.current = null;
+        if (message.type === "DONE") {
+          if (localCreated === 0) {
+            toast.error("No slides were created.");
+            setStep("configure");
+            return;
+          }
+          setResultPres(pres);
+          setStep("result");
+          toast.success(`Done! ${localCreated} slides created.`);
+        } else {
+          toast.error(message.error || "PowerPoint conversion failed.");
+          setStep("configure");
+        }
+      };
+      worker.onerror = (event) => {
+        if (runIdRef.current !== runId) return;
+        cleanupWorker();
+        activePresRef.current = null;
+        toast.error(`Worker error: ${event.message}`);
+        setStep("configure");
+      };
+      worker.postMessage({ type: "RENDER", jobId: runId, fileBytes: arrayBuffer, startPage: actualStart, endPage: actualEnd, scale: 2, quality: 0.85 }, [arrayBuffer]);
     } catch (error) {
       console.error(error);
       toast.error("Something went wrong.");
       setStep("configure");
     }
-  }, [actualEnd, actualStart, file, firstPageDims.h, firstPageDims.w, mode, pdfProxy, theme, totalToProcess]);
+  }, [actualEnd, actualStart, cleanupWorker, file, firstPageDims.h, firstPageDims.w, totalToProcess]);
 
   const cancelConversion = useCallback(() => {
+    runIdRef.current += 1;
     cancelRef.current = true;
-  }, []);
-
+    cleanupWorker();
+    const partial = activePresRef.current;
+    activePresRef.current = null;
+    if (partial && createdSlidesRef.current > 0) {
+      setResultPres(partial);
+      setCancelled(true);
+      setStep("result");
+      toast.info("Conversion stopped - partial file ready.");
+    } else {
+      setStep("configure");
+      toast.info("Conversion cancelled.");
+    }
+  }, [cleanupWorker]);
   const goToConfigure = useCallback(() => {
     setStep("configure");
   }, []);
 
   const goToUpload = useCallback(() => {
+    runIdRef.current += 1;
+    cancelRef.current = true;
+    cleanupWorker();
+    activePresRef.current = null;
+    createdSlidesRef.current = 0;
+    setFile(null);
+    setResultPres(null);
+    setPageCount(0);
+    setFirstPageDims({ w: 0, h: 0 });
     setStep("upload");
-  }, []);
-
-  const selectImageMode = useCallback(() => {
-    setMode("image");
-  }, []);
-
-  const selectTextMode = useCallback(() => {
-    setMode("text");
-  }, []);
+  }, [cleanupWorker]);
 
   const selectAllPages = useCallback(() => {
     setPageScope("all");
@@ -330,8 +327,13 @@ export default function PdfToPptxPage() {
 
   useEffect(() => {
     void loadPdfJs();
-    return () => {};
-  }, []);
+    return () => {
+      runIdRef.current += 1;
+      cancelRef.current = true;
+      cleanupWorker();
+      activePresRef.current = null;
+    };
+  }, [cleanupWorker]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -470,39 +472,12 @@ export default function PdfToPptxPage() {
                 )}
 
                 <div>
-                  <h3 className="mb-3 text-sm font-bold uppercase tracking-[0.16em] text-muted">Conversion Mode</h3>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <button
-                      type="button"
-                      onClick={selectImageMode}
-                      aria-label="Select High Fidelity mode"
-                      className={`rounded-lg border-2 p-5 text-left transition ${
-                        mode === "image" ? "border-amber-500 bg-amber-500/10" : "border-border bg-background hover:border-amber-500/60"
-                      }`}
-                    >
-                      <ImageIcon aria-hidden="true" className="mb-4 h-8 w-8 text-amber-500" />
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h4 className="text-lg font-bold">High Fidelity</h4>
-                        <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-black uppercase text-white">
-                          Recommended
-                        </span>
-                      </div>
-                      <p className="mt-2 text-sm text-muted">Each page becomes a slide image. Perfect visual match. Text is not editable.</p>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={selectTextMode}
-                      aria-label="Select Editable Text mode"
-                      className={`rounded-lg border-2 p-5 text-left transition ${
-                        mode === "text" ? "border-amber-500 bg-amber-500/10" : "border-border bg-background hover:border-amber-500/60"
-                      }`}
-                    >
-                      <Type aria-hidden="true" className="mb-4 h-8 w-8 text-amber-500" />
-                      <h4 className="text-lg font-bold">Editable Text</h4>
-                      <p className="mt-2 text-sm text-muted">
-                        Extracts text as editable boxes. Best for simple text documents. Layout is approximate.
-                      </p>
-                    </button>
+                  <h3 className="mb-3 text-sm font-bold uppercase tracking-[0.16em] text-muted">Conversion Fidelity</h3>
+                  <div className="flex items-start gap-3 rounded-xl border p-4" style={{ borderColor: `${ACCENT_COLOR}30`, background: `${ACCENT_COLOR}08` }}>
+                    <ImageIcon aria-hidden="true" className="h-5 w-5 mt-0.5 shrink-0" style={{ color: ACCENT_COLOR }} />
+                    <p className="text-sm text-muted">
+                      <strong>Image-based slides:</strong> Pages are rasterized into slide images for visual preservation. Text, tables, and shapes are not editable, and very large or complex pages may be limited by browser canvas support.
+                    </p>
                   </div>
                 </div>
 
@@ -555,26 +530,6 @@ export default function PdfToPptxPage() {
                       )}
                     </div>
                   </fieldset>
-
-                  {mode === "text" && (
-                    <fieldset>
-                      <legend className="mb-3 text-sm font-bold uppercase tracking-[0.16em] text-muted">Slide Theme</legend>
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        {(["light", "dark", "branded"] as Theme[]).map((item) => (
-                          <label key={item} className="rounded-md border border-border bg-background px-3 py-2 text-sm font-semibold capitalize">
-                            <input
-                              type="radio"
-                              checked={theme === item}
-                              onChange={() => setTheme(item)}
-                              aria-label={`Use ${item} slide theme`}
-                              className="mr-2 accent-amber-500"
-                            />
-                            {item}
-                          </label>
-                        ))}
-                      </div>
-                    </fieldset>
-                  )}
                 </div>
 
                 <button

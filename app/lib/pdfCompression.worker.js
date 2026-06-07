@@ -19,14 +19,12 @@ const IMAGE_OPS = new Set(
 
 const CHUNK_SIZE = 5;
 
-let aborted = false;
-
 function postProgress(stage, current, total) {
   self.postMessage({ type: "progress", stage, current, total });
 }
 
-function assertNotAborted() {
-  if (aborted) {
+function assertNotAborted(abortSignal) {
+  if (abortSignal.aborted) {
     throw new DOMException("Compression cancelled by user.", "AbortError");
   }
 }
@@ -68,7 +66,7 @@ function formatKeywords(keywords) {
     .filter(Boolean);
 }
 
-async function getOperatorPlan(pdfjsDoc, totalPages) {
+async function getOperatorPlan(pdfjsDoc, totalPages, abortSignal) {
   const plans = [];
   let unsupportedImages = 0;
   let imagePageCount = 0;
@@ -76,10 +74,11 @@ async function getOperatorPlan(pdfjsDoc, totalPages) {
   postProgress("extracting", 0, totalPages);
 
   for (let i = 0; i < totalPages; i++) {
-    assertNotAborted();
+    assertNotAborted(abortSignal);
 
+    let page = null;
     try {
-      const page = await pdfjsDoc.getPage(i + 1);
+      page = await pdfjsDoc.getPage(i + 1);
       const opList = await page.getOperatorList();
       const hasImages = opList.fnArray.some((fn) => IMAGE_OPS.has(fn));
 
@@ -88,6 +87,10 @@ async function getOperatorPlan(pdfjsDoc, totalPages) {
     } catch {
       unsupportedImages += 1;
       plans.push({ hasImages: false, unsupported: true });
+    } finally {
+      try {
+        await page?.cleanup?.();
+      } catch {}
     }
 
     postProgress("extracting", i + 1, totalPages);
@@ -168,10 +171,14 @@ async function renderPageToCompressedJpeg(page, preset) {
   }
 }
 
+let currentAbortController = null;
+
 self.addEventListener("message", async (event) => {
   const message = event.data || {};
   if (message.type === "abort") {
-    aborted = true;
+    if (currentAbortController) {
+      currentAbortController.abort();
+    }
     return;
   }
 
@@ -179,16 +186,27 @@ self.addEventListener("message", async (event) => {
     return;
   }
 
-  aborted = false;
+  if (currentAbortController) {
+    currentAbortController.abort();
+  }
+  const abortController = new AbortController();
+  currentAbortController = abortController;
+  const abortSignal = abortController.signal;
 
   const { file, preset } = message;
   const originalBytes = file.size;
   const warnings = [];
   const startedAt = performance.now();
+  let pdfjsDoc = null;
+  let processedHashes = new Set();
 
   try {
-    assertNotAborted();
+    assertNotAborted(abortSignal);
     postProgress("loading", 0, 1);
+
+    if (originalBytes > 100 * 1024 * 1024) {
+      throw new Error("File exceeds the 100 MB client-side processing limit. Use a desktop tool for files this large.");
+    }
 
     const pdfBytes = await file.arrayBuffer();
     let sourceDoc;
@@ -197,13 +215,13 @@ self.addEventListener("message", async (event) => {
       sourceDoc = await PDFDocument.load(pdfBytes, { ignoreEncryption: false });
     } catch (err) {
       const messageText = err instanceof Error ? err.message : String(err);
-      if (messageText.toLowerCase().includes("encrypt")) {
+      if (messageText.toLowerCase().includes("encrypt") || messageText.toLowerCase().includes("password")) {
         throw new Error("This PDF is password-protected and cannot be compressed.");
       }
       throw new Error("Could not parse this PDF. The file may be corrupt or malformed.");
     }
 
-    const pdfjsDoc = await pdfjsLib.getDocument({
+    pdfjsDoc = await pdfjsLib.getDocument({
       data: new Uint8Array(pdfBytes),
       isOffscreenCanvasSupported: true,
       disableFontFace: true,
@@ -212,14 +230,10 @@ self.addEventListener("message", async (event) => {
     }).promise;
 
     const totalPages = pdfjsDoc.numPages;
-    const { plans, imagePageCount, unsupportedImages } = await getOperatorPlan(pdfjsDoc, totalPages);
+    const { plans, imagePageCount, unsupportedImages } = await getOperatorPlan(pdfjsDoc, totalPages, abortSignal);
 
     if (unsupportedImages > 0) {
       warnings.push(`${unsupportedImages} page${unsupportedImages === 1 ? "" : "s"} contained unsupported image streams and were copied without image recompression.`);
-    }
-
-    if (originalBytes > 100 * 1024 * 1024) {
-      throw new Error("File exceeds the 100 MB client-side processing limit. Use a desktop tool for files this large.");
     }
 
     if (originalBytes < 10 * 1024) {
@@ -257,16 +271,15 @@ self.addEventListener("message", async (event) => {
     const outDoc = await PDFDocument.create();
     preserveMetadata(sourceDoc, outDoc);
 
-    const processedHashes = new Map();
     let imagesProcessed = 0;
     let duplicateImages = 0;
 
     for (let start = 0; start < totalPages; start += CHUNK_SIZE) {
-      assertNotAborted();
+      assertNotAborted(abortSignal);
 
       const end = Math.min(start + CHUNK_SIZE, totalPages);
       for (let index = start; index < end; index++) {
-        assertNotAborted();
+        assertNotAborted(abortSignal);
         const pageNumber = index + 1;
         const plan = plans[index];
         const page = await pdfjsDoc.getPage(pageNumber);
@@ -284,17 +297,13 @@ self.addEventListener("message", async (event) => {
 
         const raster = await renderPageToCompressedJpeg(page, preset);
         const hash = await sha256(raster.compressedBytes);
-        const cached = processedHashes.get(hash);
-
-        let pageImageBytes = raster.compressedBytes;
-        if (cached) {
+        if (processedHashes.has(hash)) {
           duplicateImages += 1;
-          pageImageBytes = cached;
         } else {
-          processedHashes.set(hash, raster.compressedBytes);
+          processedHashes.add(hash);
         }
 
-        const embedded = await outDoc.embedJpg(pageImageBytes);
+        const embedded = await outDoc.embedJpg(raster.compressedBytes);
         const pdfPage = outDoc.addPage([raster.width, raster.height]);
         pdfPage.drawImage(embedded, {
           x: 0,
@@ -349,5 +358,9 @@ self.addEventListener("message", async (event) => {
     try {
       await pdfjsDoc?.destroy?.();
     } catch {}
+    processedHashes.clear();
+    if (currentAbortController === abortController) {
+      currentAbortController = null;
+    }
   }
 });

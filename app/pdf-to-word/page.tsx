@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import Link from "next/link";
-import { ChevronRight, FileText, Upload, Download, Info, Home } from "lucide-react";
+import { ChevronRight, FileText, Upload, Download, Home, AlertTriangle } from "lucide-react";
 import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
@@ -97,7 +97,14 @@ export default function PdfToWordPage() {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const docChildren: any[] = [];
 
+      if (pdfDoc.numPages > 100) {
+        throw new Error("Document too large. Client-side text extraction is limited to 100 pages.");
+      }
+
       for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+        // Yield to keep UI responsive
+        await new Promise(resolve => setTimeout(resolve, 0));
+
         const page = await pdfDoc.getPage(pageNum);
         const textContent = await page.getTextContent();
 
@@ -136,16 +143,9 @@ export default function PdfToWordPage() {
           const text = line.text.trim();
           if (!text) continue;
 
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let heading: any = undefined;
-          if (line.maxHeight >= 20) heading = HeadingLevel.HEADING_1;
-          else if (line.maxHeight >= 16) heading = HeadingLevel.HEADING_2;
-          else if (line.maxHeight >= 14) heading = HeadingLevel.HEADING_3;
-
           docChildren.push(
             new Paragraph({
-              heading,
-              children: [new TextRun({ text, bold: !!heading })],
+              children: [new TextRun({ text })],
             })
           );
         }
@@ -159,6 +159,9 @@ export default function PdfToWordPage() {
       await pdfDoc.destroy();
 
       const doc = new Document({ sections: [{ children: docChildren }] });
+      toast.loading("Generating .docx file...", { id: "pdf2word" });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      
       const blob = await Packer.toBlob(doc);
       const bytes = new Uint8Array(await blob.arrayBuffer());
       const baseName = file.name.replace(/\.pdf$/i, "");
@@ -175,7 +178,8 @@ export default function PdfToWordPage() {
 
   const handleDownload = useCallback(() => {
     if (!result) return;
-    const blob = new Blob([result.bytes.buffer as ArrayBuffer], {
+    const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], {
       type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     });
     const url = URL.createObjectURL(blob);
@@ -218,8 +222,8 @@ export default function PdfToWordPage() {
             <FileText className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">PDF to Word</h1>
-            <p className="mt-1 text-sm text-muted">Extract text and structure from any PDF into an editable .docx file.</p>
+            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">PDF to Word (Text Extraction)</h1>
+            <p className="mt-1 text-sm text-muted">Extract basic text into a .docx file. Best for simple text documents.</p>
           </div>
         </div>
 
@@ -274,11 +278,12 @@ export default function PdfToWordPage() {
             </div>
 
             {/* Info banner */}
-            <div className="flex items-start gap-3 rounded-xl border p-4" style={{ borderColor: `${ACCENT}30`, background: `${ACCENT}08` }}>
-              <Info className="h-4 w-4 mt-0.5 shrink-0" style={{ color: ACCENT }} />
-              <p className="text-sm text-muted">
-                Conversion preserves text content. Complex layouts, columns, tables, and images may vary.
-              </p>
+            <div className="flex items-start gap-3 rounded-xl border p-4 border-red-500/30 bg-red-500/10">
+              <AlertTriangle className="h-5 w-5 mt-0.5 shrink-0 text-red-500" />
+              <div className="text-sm text-red-700 dark:text-red-400">
+                <strong>Raw Text Extraction Only:</strong> This client-side tool cannot safely reconstruct complex Word layouts. 
+                It simply extracts text and approximates paragraphs. Images, tables, and columns will be lost or jumbled.
+              </div>
             </div>
 
             {/* Convert button */}

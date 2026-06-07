@@ -39,6 +39,7 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { formatBytes } from "../lib/format-bytes";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
 
@@ -256,6 +257,9 @@ export default function OrganizePage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [outputSize, setOutputSize] = useState<number | null>(null);
   const [isLoadingPdf, setIsLoadingPdf] = useState(false);
+  
+  const worker = useProcessorWorker();
+  const lastHandledBlobRef = useRef<Blob | null>(null);
 
   const pdfBytesRef = useRef<Uint8Array | null>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
@@ -545,37 +549,33 @@ export default function OrganizePage() {
     });
   }, [clearSelection]);
 
-  const downloadPdf = useCallback(async () => {
-    if (!file || !pdfBytesRef.current) return;
-    const toastId = toast.loading("Organizing and building PDF...");
-    try {
-      const { PDFDocument, degrees } = await import("pdf-lib");
-      const originalDoc = await PDFDocument.load(pdfBytesRef.current.slice(0), { ignoreEncryption: true });
-      const newDoc = await PDFDocument.create();
-      for (const entry of pages) {
-        if (entry.isBlank || entry.originalIndex === null) {
-          newDoc.addPage([595, 842]);
-          continue;
-        }
-        const [copiedPage] = await newDoc.copyPages(originalDoc, [entry.originalIndex]);
-        copiedPage.setRotation(degrees(entry.rotation));
-        newDoc.addPage(copiedPage);
-      }
-      const bytes = await newDoc.save();
-      const blob = bytesToBlob(bytes);
-      const url = URL.createObjectURL(blob);
+  const downloadPdf = useCallback(() => {
+    if (!file) return;
+    const filename = pageDownloadName(file);
+    worker.process(file, {
+      tool: "organize",
+      options: { pages: pages.map(p => ({ originalIndex: p.originalIndex, rotation: p.rotation })) }
+    }, filename);
+  }, [file, pages, worker]);
+
+  useEffect(() => {
+    if (worker.status === "done" && worker.resultBlob && worker.resultFilename) {
+      if (lastHandledBlobRef.current === worker.resultBlob) return;
+      lastHandledBlobRef.current = worker.resultBlob;
+
+      toast.success("Done! Your organized PDF is ready.", { id: "organize" });
+      const url = URL.createObjectURL(worker.resultBlob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = pageDownloadName(file);
+      anchor.download = worker.resultFilename;
       anchor.click();
       URL.revokeObjectURL(url);
-      setOutputSize(bytes.byteLength);
-      addFile({ filename: pageDownloadName(file), size: bytes.byteLength, timestamp: Date.now(), tool: "organize" });
-      toast.success("Done! Your organized PDF is ready.", { id: toastId });
-    } catch {
-      toast.error("Could not build the organized PDF.", { id: toastId });
+      setOutputSize(worker.resultBlob.size);
+      addFile({ filename: worker.resultFilename, size: worker.resultBlob.size, timestamp: Date.now(), tool: "organize" });
+    } else if (worker.status === "error") {
+      toast.error(worker.error || "Could not build the organized PDF.", { id: "organize" });
     }
-  }, [addFile, file, pages]);
+  }, [worker.status, worker.resultBlob, worker.resultFilename, worker.error, addFile]);
 
   const onDragStart = useCallback((event: DragStartEvent) => {
     setActiveId(String(event.active.id));
@@ -716,8 +716,8 @@ export default function OrganizePage() {
                       {item}
                     </button>
                   ))}
-                  <button type="button" onClick={() => void downloadPdf()} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white">
-                    <Download className="h-4 w-4" /> <span>Download PDF</span>
+                  <button type="button" onClick={downloadPdf} disabled={worker.status === "processing"} className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-blue-500 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+                    <Download className="h-4 w-4" /> <span>{worker.status === "processing" ? `${worker.progress}%` : "Download PDF"}</span>
                   </button>
                   <ShortcutHint shortcut="D" label="Press" />
                 </div>

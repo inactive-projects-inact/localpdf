@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
 import Link from "next/link";
-import { ChevronRight, Unlock, Upload, Download, Eye, EyeOff, Home, AlertTriangle, Info } from "lucide-react";
+import { ChevronRight, Unlock, Upload, Download, Home, AlertTriangle } from "lucide-react";
 import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
@@ -18,30 +18,28 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-type EncryptionStatus = "unknown" | "encrypted" | "not-encrypted";
+type EncryptionStatus = "unknown" | "encrypted" | "not-encrypted" | "unsupported-encryption" | "corrupted";
 type Step = "upload" | "configure" | "result";
+
+function classifyPdfOpenError(error: unknown): EncryptionStatus {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (message.includes("aes") || message.includes("unsupported encryption") || message.includes("unsupported security")) {
+    return "unsupported-encryption";
+  }
+  if (message.includes("encrypt") || message.includes("password") || message.includes("decrypt") || message.includes("security")) {
+    return "encrypted";
+  }
+  return "corrupted";
+}
 
 export default function UnlockPage() {
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
   const [encryptionStatus, setEncryptionStatus] = useState<EncryptionStatus>("unknown");
-  const [password, setPassword] = useState("");
-  const [showPw, setShowPw] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
   const { addFile } = useFileHistory();
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
-      if ((e.key === "d" || e.key === "D") && result) handleDownload();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result]);
 
   const handleFile = useCallback(async (f: File) => {
     if (!f.name.toLowerCase().endsWith(".pdf") && f.type !== "application/pdf") {
@@ -50,24 +48,29 @@ export default function UnlockPage() {
     }
     setFile(f);
     setResult(null);
-    setPassword("");
     setEncryptionStatus("unknown");
     setStep("configure");
 
-    // Detect if encrypted
+    // Detect only. This tool does not decrypt and must not rewrite protected PDFs.
     try {
-      const { PDFDocument } = await import("pdf-lib");
+      const pdfjs = await import("pdfjs-dist");
+      if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+        pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+      }
       const ab = await f.arrayBuffer();
+      const loadingTask = pdfjs.getDocument({ data: new Uint8Array(ab) });
+      let proxy: import("pdfjs-dist").PDFDocumentProxy | null = null;
       try {
-        await PDFDocument.load(ab);
+        proxy = await loadingTask.promise;
         setEncryptionStatus("not-encrypted");
       } catch (e) {
-        const msg = e instanceof Error ? e.message.toLowerCase() : "";
-        if (msg.includes("encrypt") || msg.includes("password") || msg.includes("decrypt")) {
-          setEncryptionStatus("encrypted");
-        } else {
-          setEncryptionStatus("encrypted"); // treat parse errors as possibly encrypted
+        setEncryptionStatus(classifyPdfOpenError(e));
+      } finally {
+        if (proxy) {
+          await proxy.cleanup();
+          await proxy.destroy();
         }
+        await loadingTask.destroy();
       }
     } catch {
       setEncryptionStatus("unknown");
@@ -95,60 +98,61 @@ export default function UnlockPage() {
     setResult(null);
 
     try {
-      toast.loading("Verifying password...", { id: "unlock" });
-
-      const { PDFDocument } = await import("pdf-lib");
-      const ab = await file.arrayBuffer();
-
-      let pdfDoc: Awaited<ReturnType<typeof PDFDocument.load>>;
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        pdfDoc = await PDFDocument.load(ab, {
-          password: password || undefined,
-          ignoreEncryption: false,
-        } as any);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message.toLowerCase() : "";
-        if (msg.includes("password") || msg.includes("encrypt") || msg.includes("decrypt") || msg.includes("incorrect")) {
-          toast.error("Incorrect password. Please try again.", { id: "unlock" });
-          setProcessing(false);
-          return;
-        }
-        throw e;
+      if (encryptionStatus === "encrypted" || encryptionStatus === "unsupported-encryption") {
+        toast.error("True PDF decryption is not supported by the current browser engine. No unlocked file was created.", { id: "unlock" });
+        return;
       }
 
-      toast.loading("Removing protection...", { id: "unlock" });
+      if (encryptionStatus === "corrupted") {
+        toast.error("File is corrupted or unsupported. No output was created.", { id: "unlock" });
+        return;
+      }
 
-      // Re-save without encryption
-      const pdfBytes = await pdfDoc.save();
+      if (encryptionStatus !== "not-encrypted") {
+        toast.error("Could not verify that this PDF is unencrypted. No output was created.", { id: "unlock" });
+        return;
+      }
+
+      toast.loading("Preparing unchanged download...", { id: "unlock" });
+      const pdfBytes = new Uint8Array(await file.arrayBuffer());
       const baseName = file.name.replace(/\.pdf$/i, "");
-      setResult({ bytes: pdfBytes, name: `unlocked-${baseName}.pdf` });
+      setResult({ bytes: pdfBytes, name: `unchanged-${baseName}.pdf` });
       setStep("result");
-      toast.success("Done! PDF is now unlocked.", { id: "unlock" });
+      toast.success("This PDF was not encrypted; original file prepared unchanged.", { id: "unlock" });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Decryption failed.";
+      const msg = err instanceof Error ? err.message : "Operation failed.";
       toast.error(msg, { id: "unlock" });
     } finally {
       setProcessing(false);
     }
-  }, [file, password]);
+  }, [encryptionStatus, file]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
-    const blob = new Blob([result.bytes.buffer as ArrayBuffer], { type: "application/pdf" });
+    const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], { type: "application/pdf" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = result.name;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
     toast.success("Download started!");
   }, [result]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
+      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleDownload, result]);
 
   const reset = useCallback(() => {
     setFile(null);
     setResult(null);
-    setPassword("");
     setEncryptionStatus("unknown");
     setStep("upload");
   }, []);
@@ -178,7 +182,7 @@ export default function UnlockPage() {
           </div>
           <div>
             <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Unlock PDF</h1>
-            <p className="mt-1 text-sm text-muted">Remove password protection from PDFs you own.</p>
+            <p className="mt-1 text-sm text-muted">Check whether a PDF can be unlocked by this browser-only engine.</p>
           </div>
         </div>
 
@@ -186,7 +190,7 @@ export default function UnlockPage() {
         <div className="mb-6 flex items-start gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4">
           <AlertTriangle className="h-5 w-5 shrink-0 text-amber-400 mt-0.5" />
           <p className="text-sm text-amber-300">
-            Only remove protection from PDFs you own or have explicit permission to unlock. Unlocking password-protected files you do not own may be illegal in your jurisdiction.
+            Only attempt to inspect PDFs you own or have explicit permission to process. This browser tool does not bypass encryption or remove owner permissions.
           </p>
         </div>
 
@@ -217,7 +221,7 @@ export default function UnlockPage() {
               <span className="text-sm font-semibold text-foreground">Choose PDF</span>
               <ShortcutHint shortcut="U" />
             </div>
-            <p className="text-xs text-muted">100% private · decryption happens locally</p>
+            <p className="text-xs text-muted">100% private · files stay local</p>
           </div>
         )}
 
@@ -239,38 +243,51 @@ export default function UnlockPage() {
 
             {/* Not encrypted notice */}
             {encryptionStatus === "not-encrypted" && (
-              <div className="flex items-start gap-3 rounded-xl border p-4" style={{ borderColor: `${ACCENT}30`, background: `${ACCENT}08` }}>
-                <Info className="h-4 w-4 mt-0.5 shrink-0" style={{ color: ACCENT }} />
-                <p className="text-sm text-muted">
-                  This PDF does not appear to be password protected. You can still process and re-download it.
+              <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                <p className="text-sm text-amber-700 dark:text-amber-400">
+                  This PDF does not require an open password. This tool will only offer the original file unchanged; it will not strip owner permissions.
                 </p>
               </div>
             )}
 
-            {/* Password input — shown when encrypted or unknown */}
-            {(encryptionStatus === "encrypted" || encryptionStatus === "unknown") && (
-              <div className="rounded-2xl border border-border bg-card p-5 space-y-3">
-                <p className="text-sm font-semibold text-foreground">Enter PDF Password</p>
-                <div className="relative">
-                  <input
-                    type={showPw ? "text" : "password"}
-                    value={password}
-                    onChange={e => setPassword(e.target.value)}
-                    placeholder="Enter the PDF password"
-                    onKeyDown={e => e.key === "Enter" && handleUnlock()}
-                    className="w-full rounded-xl border border-border bg-background px-4 py-3 pr-12 text-sm text-foreground placeholder:text-muted"
-                  />
-                  <button type="button" onClick={() => setShowPw(v => !v)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-foreground">
-                    {showPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
+            {encryptionStatus === "encrypted" && (
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <p className="text-sm text-red-700 dark:text-red-300">
+                  This PDF is encrypted. True password decryption is not supported by the current client-side engine, so no unlocked PDF will be created.
+                </p>
+              </div>
+            )}
+
+            {encryptionStatus === "unsupported-encryption" && (
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <p className="text-sm text-red-700 dark:text-red-300">
+                  This PDF uses unsupported encryption, such as an AES/security handler this browser engine cannot decrypt. No unlocked PDF will be created.
+                </p>
+              </div>
+            )}
+
+            {/* Corrupted notice */}
+            {encryptionStatus === "corrupted" && (
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <p className="text-sm text-red-700 dark:text-red-300">
+                  This PDF appears to be corrupted, malformed, or uses an unsupported format. It cannot be unlocked by the client-side engine.
+                </p>
               </div>
             )}
 
             <button
               onClick={handleUnlock}
-              disabled={processing || (encryptionStatus === "encrypted" && !password)}
+              disabled={
+                processing ||
+                encryptionStatus === "unknown" ||
+                encryptionStatus === "corrupted" ||
+                encryptionStatus === "encrypted" ||
+                encryptionStatus === "unsupported-encryption"
+              }
               className="flex w-full items-center justify-center gap-2.5 rounded-2xl py-4 text-base font-bold text-white shadow-lg transition-all hover:opacity-90 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
               style={{ background: ACCENT }}
             >
@@ -282,7 +299,7 @@ export default function UnlockPage() {
               ) : (
                 <>
                   <Unlock className="h-5 w-5" />
-                  {encryptionStatus === "not-encrypted" ? "Re-download PDF" : "Remove Protection"}
+                  {encryptionStatus === "not-encrypted" ? "Download Original Unchanged" : "Unlock Unsupported"}
                 </>
               )}
             </button>
@@ -297,7 +314,7 @@ export default function UnlockPage() {
                 <Unlock className="h-6 w-6" />
               </div>
               <div className="flex-1 min-w-0">
-                <p className="font-semibold text-foreground">Your PDF is now unlocked!</p>
+                <p className="font-semibold text-foreground">Original PDF ready unchanged</p>
                 <p className="mt-0.5 text-sm text-muted truncate">{result.name}</p>
               </div>
             </div>
@@ -311,7 +328,7 @@ export default function UnlockPage() {
               style={{ background: ACCENT }}
             >
               <Download className="h-5 w-5" />
-              Download Unlocked PDF
+              Download Original PDF
               <ShortcutHint shortcut="D" />
             </button>
 
@@ -319,7 +336,7 @@ export default function UnlockPage() {
               onClick={reset}
               className="w-full rounded-2xl border border-border bg-card py-3 text-sm font-semibold text-foreground transition hover:bg-background"
             >
-              Unlock another PDF
+              Check another PDF
             </button>
           </div>
         )}

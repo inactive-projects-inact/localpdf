@@ -7,11 +7,12 @@ import AppShell from "../components/AppShell";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import ShortcutHint from "../components/ShortcutHint";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { formatBytes } from "../lib/format-bytes";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
+import { getPdfjs } from "../lib/pdf-utils";
 
 type SplitMode = "range" | "all";
-type SplitStatus = "idle" | "loading" | "splitting" | "done" | "error";
 
 const TOOL = getToolDefinition("split");
 
@@ -26,27 +27,22 @@ function downloadBlob(blob: Blob, filename: string) {
 
 export default function SplitPage() {
   const [file, setFile] = useState<File | null>(null);
-  const [pdfBytes, setPdfBytes] = useState<ArrayBuffer | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [mode, setMode] = useState<SplitMode>("range");
   const [startPage, setStartPage] = useState(1);
   const [endPage, setEndPage] = useState(1);
-  const [status, setStatus] = useState<SplitStatus>("idle");
-  const [progress, setProgress] = useState(0);
-  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
-  const [resultFilename, setResultFilename] = useState("split.pdf");
-
+  const [isLoading, setIsLoading] = useState(false);
+  
+  const worker = useProcessorWorker();
+  
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
   const resetResult = useCallback(() => {
-    setResultBlob(null);
-    setStatus("idle");
-    setProgress(0);
-  }, []);
+    worker.reset();
+  }, [worker]);
 
   const resetAll = useCallback(() => {
     setFile(null);
-    setPdfBytes(null);
     setPageCount(0);
     setStartPage(1);
     setEndPage(1);
@@ -56,31 +52,30 @@ export default function SplitPage() {
 
   const loadPdf = useCallback(
     async (uploaded: File) => {
-      setStatus("loading");
       resetResult();
 
       const valid = await hasPdfHeader(uploaded);
       if (!valid) {
-        setStatus("error");
         toast.error("This file is not a valid PDF.", { id: "split-load" });
         return;
       }
 
+      setIsLoading(true);
       try {
-        const { PDFDocument } = await import("pdf-lib");
         const bytes = await uploaded.arrayBuffer();
-        const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
-        const count = pdf.getPageCount();
+        const { getDocument } = await getPdfjs();
+        const pdf = await getDocument({ data: bytes.slice(0) }).promise;
+        const count = pdf.numPages;
+        await pdf.destroy();
 
         setFile(uploaded);
-        setPdfBytes(bytes);
         setPageCount(count);
         setStartPage(1);
         setEndPage(count);
-        setStatus("idle");
       } catch {
-        setStatus("error");
         toast.error("Could not read this PDF. It may be corrupted or password-protected.", { id: "split-load" });
+      } finally {
+        setIsLoading(false);
       }
     },
     [resetResult],
@@ -131,89 +126,30 @@ export default function SplitPage() {
     return null;
   };
 
-  const handleSplitRange = async () => {
-    if (!pdfBytes || !file) return;
+  const handleSplitRange = () => {
+    if (!file) return;
     const validation = validateRange();
     if (validation) { toast.error(validation, { id: "split" }); return; }
-
-    const { PDFDocument } = await import("pdf-lib");
-
-    setStatus("splitting");
-    setProgress(10);
-    setResultBlob(null);
-    toast.loading("Extracting pages...", { id: "split" });
-
-    try {
-      const source = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
-      setProgress(40);
-
-      const indices: number[] = [];
-      for (let i = startPage - 1; i <= endPage - 1; i++) indices.push(i);
-
-      const newPdf = await PDFDocument.create();
-      const pages = await newPdf.copyPages(source, indices);
-      pages.forEach((page) => newPdf.addPage(page));
-
-      setProgress(80);
-      const result = await newPdf.save();
-      const blob = new Blob([new Uint8Array(result)], { type: "application/pdf" });
-      const baseName = file.name.replace(/\.pdf$/i, "") || "document";
-      const filename = `${baseName}-pages-${startPage}-${endPage}.pdf`;
-
-      setResultBlob(blob);
-      setResultFilename(filename);
-      setProgress(100);
-      setStatus("done");
-      toast.success("Pages extracted successfully!", { id: "split" });
-
-      addFile({ filename, size: blob.size, timestamp: Date.now(), tool: "split" });
-    } catch {
-      setStatus("error");
-      toast.error("Failed to extract pages. Please try another PDF.", { id: "split" });
-    }
+    
+    const baseName = file.name.replace(/\.pdf$/i, "") || "document";
+    const filename = `${baseName}-pages-${startPage}-${endPage}.pdf`;
+    
+    worker.process(file, {
+      tool: "split",
+      options: { mode: "range", startPage, endPage, filename }
+    }, filename);
   };
 
-  const handleSplitAll = async () => {
-    if (!pdfBytes || !file) return;
+  const handleSplitAll = () => {
+    if (!file) return;
+    
+    const baseName = file.name.replace(/\.pdf$/i, "") || "document";
+    const filename = `${baseName}-pages.zip`;
 
-    const { PDFDocument } = await import("pdf-lib");
-    const { default: JSZip } = await import("jszip");
-
-    setStatus("splitting");
-    setProgress(0);
-    setResultBlob(null);
-    toast.loading("Splitting all pages...", { id: "split" });
-
-    try {
-      const source = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
-      const total = source.getPageCount();
-      const zip = new JSZip();
-      const baseName = file.name.replace(/\.pdf$/i, "") || "document";
-
-      for (let i = 0; i < total; i++) {
-        const newPdf = await PDFDocument.create();
-        const [page] = await newPdf.copyPages(source, [i]);
-        newPdf.addPage(page);
-        const pageBytes = await newPdf.save();
-        zip.file(`${baseName}-page-${i + 1}.pdf`, pageBytes);
-        setProgress(Math.round(((i + 1) / total) * 100));
-      }
-
-      const zipBlob = await zip.generateAsync({ type: "blob" }, (metadata) => {
-        if (metadata.percent) setProgress(Math.round(metadata.percent));
-      });
-
-      setResultBlob(zipBlob);
-      const filename = `${baseName}-pages.zip`;
-      setResultFilename(filename);
-      setStatus("done");
-      toast.success("All pages split successfully!", { id: "split" });
-
-      addFile({ filename, size: zipBlob.size, timestamp: Date.now(), tool: "split" });
-    } catch {
-      setStatus("error");
-      toast.error("Failed to split PDF. Please try another file.", { id: "split" });
-    }
+    worker.process(file, {
+      tool: "split",
+      options: { mode: "all", filename }
+    }, filename);
   };
 
   const handleSplit = () => {
@@ -222,27 +158,35 @@ export default function SplitPage() {
   };
 
   useEffect(() => {
+    if (worker.status === "done" && worker.resultBlob && worker.resultFilename) {
+      toast.success(mode === "all" ? "All pages split successfully!" : "Pages extracted successfully!", { id: "split" });
+      addFile({ filename: worker.resultFilename, size: worker.resultBlob.size, timestamp: Date.now(), tool: "split" });
+    } else if (worker.status === "error") {
+      toast.error(worker.error || "Failed to split PDF.", { id: "split" });
+    }
+  }, [worker.status, worker.resultBlob, worker.resultFilename, worker.error, mode, addFile]);
+
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key.toLowerCase() === "u" && !file) {
         e.preventDefault();
         open();
-      } else if (e.key.toLowerCase() === "d" && status === "done" && resultBlob) {
+      } else if (e.key.toLowerCase() === "d" && worker.status === "done" && worker.resultBlob) {
         e.preventDefault();
-        downloadBlob(resultBlob, resultFilename);
+        downloadBlob(worker.resultBlob, worker.resultFilename!);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [file, status, resultBlob, resultFilename, open]);
+  }, [file, worker.status, worker.resultBlob, worker.resultFilename, open]);
 
-  const isLoading = status === "loading";
-  const isSplitting = status === "splitting";
-  const isDone = status === "done" && resultBlob !== null;
-  const isError = status === "error";
+  const isSplitting = worker.status === "processing";
+  const isDone = worker.status === "done" && worker.resultBlob !== null;
+  const isError = worker.status === "error";
   const hasFile = file !== null && pageCount > 0;
   const rangeError = hasFile && mode === "range" ? validateRange() : null;
-  const canSplit = hasFile && !isSplitting && !isLoading && (mode === "all" || !rangeError);
+  const canSplit = hasFile && !isSplitting && (mode === "all" || !rangeError);
 
   return (
     <AppShell>
@@ -404,10 +348,10 @@ export default function SplitPage() {
           <div className="mt-8 rounded-2xl border border-border bg-card p-5 shadow-sm">
             <div className="flex items-center gap-3">
               <div className="h-5 w-5 animate-spin rounded-full border-2 border-split/30 border-t-split" aria-hidden />
-              <p className="text-sm font-semibold text-foreground">Splitting PDF… {progress}%</p>
+              <p className="text-sm font-semibold text-foreground">{worker.message || "Splitting PDF…"} {worker.progress}%</p>
             </div>
             <div className="mt-4 h-2 overflow-hidden rounded-full bg-border">
-              <div className="h-full rounded-full bg-split transition-all duration-300" style={{ width: `${progress}%` }} />
+              <div className="h-full rounded-full bg-split transition-all duration-300" style={{ width: `${worker.progress}%` }} />
             </div>
           </div>
         )}
@@ -432,8 +376,8 @@ export default function SplitPage() {
           </div>
         )}
 
-        {isDone && resultBlob && file && (
-          <SizeComparisonBadge originalSize={file.size} compressedSize={resultBlob.size} />
+        {isDone && worker.resultBlob && file && (
+          <SizeComparisonBadge originalSize={file.size} compressedSize={worker.resultBlob.size} />
         )}
 
         {/* Actions */}
@@ -444,7 +388,7 @@ export default function SplitPage() {
                 <div className="flex w-full items-center gap-2 sm:w-auto">
                   <button
                     type="button"
-                    onClick={() => { if (resultBlob) downloadBlob(resultBlob, resultFilename); }}
+                    onClick={() => { if (worker.resultBlob) downloadBlob(worker.resultBlob, worker.resultFilename!); }}
                     className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-split px-8 py-3.5 text-base font-semibold text-white shadow-lg transition hover:bg-split/90 sm:w-auto"
                   >
                     <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -474,7 +418,7 @@ export default function SplitPage() {
 
         {isDone && (
           <p className="mt-4 text-center text-sm text-muted">
-            Ready: <span className="font-medium text-foreground">{resultFilename}</span>
+            Ready: <span className="font-medium text-foreground">{worker.resultFilename}</span>
           </p>
         )}
 

@@ -1,9 +1,9 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "PDF to Markdown — PDFTools",
+  title: "PDF to Markdown Text Extraction - PDFTools",
   description:
-    "Convert PDF documents to clean Markdown format free in your browser. Extract structured text, headings, and lists. 100% private, no uploads.",
+    "Extract selectable PDF text into Markdown with approximate headings, lists, columns, and simple tables. Complex layout reconstruction is limited.",
 };
 
 export default function Layout({ children }: { children: React.ReactNode }) {

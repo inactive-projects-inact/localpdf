@@ -3,18 +3,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { RotateCw } from "lucide-react";
-import { degrees, PDFDocument } from "pdf-lib";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import ShortcutHint from "../components/ShortcutHint";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { formatBytes } from "../lib/format-bytes";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
 
 type RotateMode = "all" | "single";
 type RotateAngle = 90 | 180 | 270;
-type RotateStatus = "idle" | "loading" | "rotating" | "done" | "error";
 
 const TOOL = getToolDefinition("rotate");
 const ACCENT = "#10B981";
@@ -58,10 +57,10 @@ export default function RotatePage() {
   const [mode, setMode] = useState<RotateMode>("all");
   const [selectedPage, setSelectedPage] = useState(1);
   const [angle, setAngle] = useState<RotateAngle>(90);
-  const [status, setStatus] = useState<RotateStatus>("idle");
-  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
-  const [resultFilename, setResultFilename] = useState("rotated.pdf");
   const [previewRendering, setPreviewRendering] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  
+  const worker = useProcessorWorker();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewTaskRef = useRef(0);
@@ -76,8 +75,7 @@ export default function RotatePage() {
     setSelectedPage(1);
     setMode("all");
     setAngle(90);
-    setResultBlob(null);
-    setStatus("idle");
+    worker.reset();
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext("2d");
@@ -89,37 +87,38 @@ export default function RotatePage() {
 
   const loadPdf = useCallback(
     async (uploaded: File) => {
-      setStatus("loading");
-      setResultBlob(null);
+      worker.reset();
 
       const valid = await hasPdfHeader(uploaded);
       if (!valid) {
-        setStatus("error");
         toast.error("This file is not a valid PDF.", { id: "rotate-load" });
         return;
       }
 
+      setIsLoading(true);
       try {
         const bytes = await uploaded.arrayBuffer();
-        const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
-        const count = pdf.getPageCount();
-        const firstPage = pdf.getPage(0);
-        const existingRotation = firstPage.getRotation().angle;
+        const { getDocument } = await getPdfjs();
+        const pdf = await getDocument({ data: bytes.slice(0) }).promise;
+        const count = pdf.numPages;
+        const firstPage = await pdf.getPage(1);
+        const existingRotation = firstPage.rotate;
+        await pdf.destroy();
 
         setFile(uploaded);
         setPdfBytes(bytes);
         setPageCount(count);
         setBasePageRotation(existingRotation);
         setSelectedPage(1);
-        setStatus("idle");
       } catch {
-        setStatus("error");
         toast.error("Could not read this PDF. It may be corrupted or password-protected.", {
           id: "rotate-load",
         });
+      } finally {
+        setIsLoading(false);
       }
     },
-    [],
+    [worker],
   );
 
   useEffect(() => {
@@ -202,48 +201,38 @@ export default function RotatePage() {
     return () => window.clearTimeout(timer);
   }, [pdfBytes, pageCount, mode, selectedPage, angle, basePageRotation, renderPreview]);
 
-  const applyRotation = async () => {
-    if (!pdfBytes || !file) return;
+  const applyRotation = () => {
+    if (!file) return;
 
-    setStatus("rotating");
-    setResultBlob(null);
-    toast.loading("Rotating PDF...", { id: "rotate" });
+    const baseName = file.name.replace(/\.pdf$/i, "") || "document";
+    const filename = `rotated-${baseName}.pdf`;
 
-    try {
-      const pdf = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
-
-      if (mode === "all") {
-        for (const page of pdf.getPages()) {
-          const current = page.getRotation().angle;
-          page.setRotation(degrees(normalizeAngle(current + angle)));
-        }
-      } else {
-        const page = pdf.getPage(selectedPage - 1);
-        const current = page.getRotation().angle;
-        page.setRotation(degrees(normalizeAngle(current + angle)));
-      }
-
-      const result = await pdf.save();
-      const blob = new Blob([new Uint8Array(result)], { type: "application/pdf" });
-      const baseName = file.name.replace(/\.pdf$/i, "") || "document";
-      const filename = `rotated-${baseName}.pdf`;
-
-      setResultBlob(blob);
-      setResultFilename(filename);
-      setStatus("done");
-      toast.success("Done! PDF rotated successfully.", { id: "rotate" });
-      addFile({ filename, size: blob.size, timestamp: Date.now(), tool: "rotate" });
-
-      const rotatedBytes = new Uint8Array(result).slice();
-      setPdfBytes(rotatedBytes.buffer);
-      const updated = await PDFDocument.load(rotatedBytes);
-      setBasePageRotation(updated.getPage(0).getRotation().angle);
-      void renderPreview();
-    } catch {
-      setStatus("error");
-      toast.error("Something went wrong. Please try again.", { id: "rotate" });
-    }
+    worker.process(file, {
+      tool: "rotate",
+      options: { mode, angle, page: selectedPage }
+    }, filename);
   };
+
+  useEffect(() => {
+    if (worker.status === "done" && worker.resultBlob && worker.resultFilename) {
+      toast.success("Done! PDF rotated successfully.", { id: "rotate" });
+      addFile({ filename: worker.resultFilename, size: worker.resultBlob.size, timestamp: Date.now(), tool: "rotate" });
+      
+      const updatePreviewAfterWorker = async () => {
+         const bytes = await worker.resultBlob!.arrayBuffer();
+         setPdfBytes(bytes);
+         const { getDocument } = await getPdfjs();
+         const updated = await getDocument({ data: bytes.slice(0) }).promise;
+         const firstPage = await updated.getPage(1);
+         setBasePageRotation(firstPage.rotate);
+         await updated.destroy();
+         void renderPreview();
+      };
+      void updatePreviewAfterWorker();
+    } else if (worker.status === "error") {
+      toast.error(worker.error || "Something went wrong.", { id: "rotate" });
+    }
+  }, [worker.status, worker.resultBlob, worker.resultFilename, worker.error, addFile]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -253,21 +242,20 @@ export default function RotatePage() {
       if (e.key.toLowerCase() === "u" && !file) {
         e.preventDefault();
         open();
-      } else if (e.key.toLowerCase() === "d" && status === "done" && resultBlob) {
+      } else if (e.key.toLowerCase() === "d" && worker.status === "done" && worker.resultBlob) {
         e.preventDefault();
-        downloadBlob(resultBlob, resultFilename);
+        downloadBlob(worker.resultBlob, worker.resultFilename!);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [file, status, resultBlob, resultFilename, open]);
+  }, [file, worker.status, worker.resultBlob, worker.resultFilename, open]);
 
-  const isLoading = status === "loading";
-  const isRotating = status === "rotating";
-  const isDone = status === "done" && resultBlob !== null;
-  const isError = status === "error";
+  const isRotating = worker.status === "processing";
+  const isDone = worker.status === "done" && worker.resultBlob !== null;
+  const isError = worker.status === "error";
   const hasFile = file !== null && pageCount > 0;
-  const canRotate = hasFile && !isRotating && !isLoading;
+  const canRotate = hasFile && !isRotating;
 
   const angleButtons: { value: RotateAngle; label: string }[] = [
     { value: 90, label: "90°" },
@@ -374,8 +362,7 @@ export default function RotatePage() {
                 aria-selected={mode === "all"}
                 onClick={() => {
                   setMode("all");
-                  setResultBlob(null);
-                  setStatus("idle");
+                  worker.reset();
                 }}
                 className={`flex-1 rounded-lg px-3 py-2.5 text-sm font-semibold transition sm:px-4 ${
                   mode === "all"
@@ -391,8 +378,7 @@ export default function RotatePage() {
                 aria-selected={mode === "single"}
                 onClick={() => {
                   setMode("single");
-                  setResultBlob(null);
-                  setStatus("idle");
+                  worker.reset();
                 }}
                 className={`flex-1 rounded-lg px-3 py-2.5 text-sm font-semibold transition sm:px-4 ${
                   mode === "single"
@@ -415,8 +401,7 @@ export default function RotatePage() {
                     value={selectedPage}
                     onChange={(e) => {
                       setSelectedPage(Number(e.target.value));
-                      setResultBlob(null);
-                      setStatus("idle");
+                      worker.reset();
                     }}
                     className="mt-2 w-full rounded-xl border border-border bg-background px-3 py-3 text-sm font-medium text-foreground outline-none transition focus:border-[#10B981] focus:ring-2 focus:ring-[#10B981]/20"
                   >
@@ -437,8 +422,7 @@ export default function RotatePage() {
                     type="button"
                     onClick={() => {
                       setAngle(btn.value);
-                      setResultBlob(null);
-                      setStatus("idle");
+                      worker.reset();
                     }}
                     className={`min-w-[4.5rem] flex-1 rounded-xl border px-4 py-3 text-sm font-bold transition sm:flex-none ${
                       angle === btn.value
@@ -491,7 +475,7 @@ export default function RotatePage() {
               style={{ borderColor: `${ACCENT}4D`, borderTopColor: ACCENT }}
               aria-hidden
             />
-            <p className="text-sm font-medium text-foreground">Rotating PDF…</p>
+            <p className="text-sm font-medium text-foreground">{worker.message || "Rotating PDF…"} {worker.progress}%</p>
           </div>
         )}
 
@@ -509,8 +493,8 @@ export default function RotatePage() {
           </div>
         )}
 
-        {isDone && resultBlob && file && (
-          <SizeComparisonBadge originalSize={file.size} compressedSize={resultBlob.size} />
+        {isDone && worker.resultBlob && file && (
+          <SizeComparisonBadge originalSize={file.size} compressedSize={worker.resultBlob.size} />
         )}
 
         {hasFile && (
@@ -521,7 +505,7 @@ export default function RotatePage() {
                   <button
                     type="button"
                     onClick={() => {
-                      if (resultBlob) downloadBlob(resultBlob, resultFilename);
+                      if (worker.resultBlob) downloadBlob(worker.resultBlob, worker.resultFilename!);
                     }}
                     className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-8 py-3.5 text-base font-semibold text-white shadow-lg transition hover:opacity-90 sm:w-auto"
                     style={{ backgroundColor: ACCENT }}
@@ -540,8 +524,7 @@ export default function RotatePage() {
                 <button
                   type="button"
                   onClick={() => {
-                    setResultBlob(null);
-                    setStatus("idle");
+                    worker.reset();
                   }}
                   className="inline-flex w-full items-center justify-center rounded-xl border border-border bg-card px-8 py-3.5 text-base font-semibold text-foreground transition hover:bg-accent-light hover:text-accent sm:w-auto"
                 >
@@ -565,7 +548,7 @@ export default function RotatePage() {
 
         {isDone && (
           <p className="mt-4 text-center text-sm text-muted">
-            Ready: <span className="font-medium text-foreground">{resultFilename}</span>
+            Ready: <span className="font-medium text-foreground">{worker.resultFilename}</span>
           </p>
         )}
       </main>

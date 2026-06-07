@@ -3,7 +3,7 @@
 import Link from "next/link";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
-import { ChevronRight, Loader2 } from "lucide-react";
+import { ChevronRight, Loader2, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
@@ -13,7 +13,7 @@ import type { FileHistoryItem } from "../components/FileHistoryProvider";
 
 type Step = "input" | "config" | "processing" | "result";
 type InputMode = "paste" | "upload";
-type PageSize = "A4" | "A3" | "Letter" | "Legal";
+type PageSize = "A4" | "A3" | "Letter" | "Legal" | "Custom";
 type Orientation = "portrait" | "landscape";
 type Margin = "none" | "small" | "medium" | "large";
 type ScaleMode = "fit" | "actual";
@@ -27,6 +27,8 @@ type Config = {
   scale: ScaleMode;
   background: Background;
   pagination: Pagination;
+  customWidthMm: number;
+  customHeightMm: number;
 };
 
 type UploadedHtmlFile = {
@@ -36,6 +38,11 @@ type UploadedHtmlFile = {
 };
 
 const ACCENT_COLOR = "#10B981";
+const MAX_HTML_BYTES = 2 * 1024 * 1024;
+const MM_TO_POINTS = 72 / 25.4;
+const CSS_PX_PER_POINT = 96 / 72;
+const MIN_CUSTOM_MM = 25;
+const MAX_CUSTOM_MM = 1000;
 const DEFAULT_HTML = `<h1>Hello World</h1>
 <p>This is a sample HTML document.</p>
 <ul>
@@ -44,10 +51,11 @@ const DEFAULT_HTML = `<h1>Hello World</h1>
   <li>Free</li>
 </ul>`;
 const PAGE_DIMS: Record<PageSize, [number, number]> = {
-  A4: [595, 842],
-  A3: [842, 1191],
+  A4: [595.28, 841.89],
+  A3: [841.89, 1190.55],
   Letter: [612, 792],
   Legal: [612, 1008],
+  Custom: [595.28, 841.89],
 };
 const MARGINS: Record<Margin, number> = {
   none: 0,
@@ -64,9 +72,99 @@ function filenameWithoutExtension(name: string): string {
   return name.replace(/\.[^/.]+$/, "");
 }
 
+function clampCustomMm(value: number): number {
+  if (!Number.isFinite(value)) return MIN_CUSTOM_MM;
+  return Math.min(MAX_CUSTOM_MM, Math.max(MIN_CUSTOM_MM, value));
+}
+
 function pageDimensions(config: Config): [number, number] {
-  const [pageW, pageH] = PAGE_DIMS[config.pageSize];
+  const [pageW, pageH] =
+    config.pageSize === "Custom"
+      ? [clampCustomMm(config.customWidthMm) * MM_TO_POINTS, clampCustomMm(config.customHeightMm) * MM_TO_POINTS]
+      : PAGE_DIMS[config.pageSize];
   return config.orientation === "landscape" ? [pageH, pageW] : [pageW, pageH];
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => resolve());
+    });
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function withTimeout(task: Promise<void>, ms: number): Promise<void> {
+  await Promise.race([task, delay(ms)]);
+}
+
+async function waitForIframeContent(iframe: HTMLIFrameElement): Promise<Document> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timeout = 0;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      iframe.removeEventListener("load", finish);
+      iframe.removeEventListener("error", fail);
+      resolve();
+    };
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      iframe.removeEventListener("load", finish);
+      iframe.removeEventListener("error", fail);
+      reject(new Error("Could not load HTML preview frame."));
+    };
+
+    iframe.addEventListener("load", finish);
+    iframe.addEventListener("error", fail);
+    timeout = window.setTimeout(finish, 4000);
+  });
+
+  const iframeDocument = iframe.contentDocument;
+  if (!iframeDocument) {
+    throw new Error("Could not access iframe document.");
+  }
+
+  if (iframeDocument.fonts) {
+    await withTimeout(iframeDocument.fonts.ready.then(() => undefined), 3000);
+  }
+
+  const pendingImages = Array.from(iframeDocument.images).filter((image) => !image.complete);
+  await Promise.all(
+    pendingImages.map((image) =>
+      withTimeout(
+        new Promise<void>((resolve) => {
+          image.addEventListener("load", () => resolve(), { once: true });
+          image.addEventListener("error", () => resolve(), { once: true });
+        }),
+        5000,
+      ),
+    ),
+  );
+
+  await nextFrame();
+  return iframeDocument;
+}
+
+async function canvasToPdfImageBytes(canvas: HTMLCanvasElement, background: Background): Promise<{ bytes: Uint8Array; format: "jpg" | "png" }> {
+  const mimeType = background === "white" ? "image/jpeg" : "image/png";
+  const blob = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, mimeType, 0.9);
+  });
+  if (!blob) {
+    throw new Error("Could not encode captured HTML image.");
+  }
+  return {
+    bytes: new Uint8Array(await blob.arrayBuffer()),
+    format: mimeType === "image/jpeg" ? "jpg" : "png",
+  };
 }
 
 export default function HtmlToPdfPage() {
@@ -76,7 +174,6 @@ export default function HtmlToPdfPage() {
   const [rawHtml, setRawHtml] = useState(DEFAULT_HTML);
   const [sanitizedHtml, setSanitizedHtml] = useState("");
   const [uploadedFile, setUploadedFile] = useState<UploadedHtmlFile | null>(null);
-  const [showLimitations, setShowLimitations] = useState(false);
   const [config, setConfig] = useState<Config>({
     pageSize: "A4",
     orientation: "portrait",
@@ -84,15 +181,20 @@ export default function HtmlToPdfPage() {
     scale: "fit",
     background: "white",
     pagination: "auto",
+    customWidthMm: 210,
+    customHeightMm: 297,
   });
   const [processingLabel, setProcessingLabel] = useState("");
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
   const [pdfPageCount, setPdfPageCount] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const activeRunId = useRef(0);
 
   const htmlBytes = useMemo(() => byteLength(rawHtml), [rawHtml]);
+  const inputTooLarge = htmlBytes > MAX_HTML_BYTES;
   const pdfByteLength = pdfBytes?.byteLength ?? 0;
   const lineCount = rawHtml.length === 0 ? 0 : rawHtml.split("\n").length;
+  const previewDimensions = useMemo(() => pageDimensions(config), [config]);
 
   const sanitizeHtml = useCallback(async (html: string): Promise<string> => {
     const DOMPurify = (await import("dompurify")).default;
@@ -106,32 +208,29 @@ export default function HtmlToPdfPage() {
   const createHiddenIframeCapture = useCallback(
     async (cleanHtml: string): Promise<HTMLCanvasElement> => {
       let iframe: HTMLIFrameElement | null = document.createElement("iframe");
+      const [pageW, pageH] = pageDimensions(config);
+      const margin = MARGINS[config.margin];
+      const contentW = pageW - margin * 2;
+      const contentH = pageH - margin * 2;
+      if (contentW <= 0 || contentH <= 0) {
+        throw new Error("Selected margins leave no printable area.");
+      }
+
+      const frameWidthPx = config.scale === "fit" ? Math.ceil(contentW * CSS_PX_PER_POINT) : 1200;
+      const frameMinHeightPx = Math.ceil(contentH * CSS_PX_PER_POINT);
       iframe.style.position = "absolute";
       iframe.style.left = "-9999px";
       iframe.style.top = "0";
-      iframe.style.width = config.scale === "fit" ? "794px" : "1200px";
-      iframe.style.minHeight = "1123px";
+      iframe.style.width = `${frameWidthPx}px`;
+      iframe.style.minHeight = `${frameMinHeightPx}px`;
       iframe.style.background = config.background === "white" ? "#ffffff" : "transparent";
       iframe.setAttribute("aria-hidden", "true");
 
       try {
+        const loaded = waitForIframeContent(iframe);
         document.body.appendChild(iframe);
-        const iframeDocument = iframe.contentDocument;
-        if (!iframeDocument) {
-          throw new Error("Could not access iframe document.");
-        }
-
-        const loaded = new Promise<void>((resolve) => {
-          if (!iframe) return;
-          iframe.onload = () => {
-            window.setTimeout(resolve, 600);
-          };
-        });
-
-        iframeDocument.open();
-        iframeDocument.write(cleanHtml);
-        iframeDocument.close();
-        await loaded;
+        iframe.srcdoc = cleanHtml;
+        const iframeDocument = await loaded;
 
         setProcessingLabel("Capturing layout...");
         const html2canvas = (await import("html2canvas")).default;
@@ -145,20 +244,36 @@ export default function HtmlToPdfPage() {
         iframe = null;
       }
     },
-    [config.background, config.scale],
+    [config],
   );
 
   const generatePdf = useCallback(async () => {
     if (!rawHtml.trim()) return;
 
+    if (htmlBytes > MAX_HTML_BYTES) {
+      toast.error("Input too large. Please limit HTML to 2MB.");
+      return;
+    }
+
+    const runId = activeRunId.current + 1;
+    activeRunId.current = runId;
+    setPdfBytes(null);
+    setPdfPageCount(0);
     setStep("processing");
     setProcessingLabel("Rendering HTML...");
     toast.info("Rendering HTML...");
+    
+    // Yield to allow UI to update to processing state
+    await delay(100);
+
+    let canvas: HTMLCanvasElement | null = null;
 
     try {
       const clean = await sanitizeHtml(rawHtml);
+      if (activeRunId.current !== runId) return;
       setSanitizedHtml(clean);
-      const canvas = await createHiddenIframeCapture(clean);
+      canvas = await createHiddenIframeCapture(clean);
+      if (activeRunId.current !== runId) return;
       toast.info("Building PDF...");
       setProcessingLabel("Building PDF pages... 0 of 0");
 
@@ -167,54 +282,82 @@ export default function HtmlToPdfPage() {
       const [pageW, pageH] = pageDimensions(config);
       const margin = MARGINS[config.margin];
       const contentW = pageW - margin * 2;
+      const contentH = pageH - margin * 2;
+      if (contentW <= 0 || contentH <= 0) {
+        throw new Error("Selected margins leave no printable area.");
+      }
+      const pxToPtScale = config.scale === "fit" ? contentW / canvas.width : 1;
+      if (!Number.isFinite(pxToPtScale) || pxToPtScale <= 0) {
+        throw new Error("Captured HTML layout has an invalid size.");
+      }
+      const embedCanvas = async (sourceCanvas: HTMLCanvasElement) => {
+        const imageBytes = await canvasToPdfImageBytes(sourceCanvas, config.background);
+        return imageBytes.format === "jpg" ? pdfDoc.embedJpg(imageBytes.bytes) : pdfDoc.embedPng(imageBytes.bytes);
+      };
 
       if (config.pagination === "single") {
-        const slicePng = canvas.toDataURL("image/jpeg", 0.9);
-        const img = await pdfDoc.embedJpg(slicePng.split(",")[1]);
-        const scaleToPt = config.scale === "fit" ? contentW / canvas.width : 1;
-        const imgW = config.scale === "fit" ? contentW : canvas.width;
-        const imgH = canvas.height * scaleToPt;
+        const img = await embedCanvas(canvas);
+        if (activeRunId.current !== runId) return;
+        const imgW = canvas.width * pxToPtScale;
+        const imgH = canvas.height * pxToPtScale;
         const page = pdfDoc.addPage([pageW, imgH + margin * 2]);
         page.drawImage(img, { x: margin, y: margin, width: imgW, height: imgH });
         setPdfPageCount(1);
       } else {
-        const A4_HEIGHT_PX = 1123;
-        const totalPages = Math.ceil(canvas.height / A4_HEIGHT_PX);
+        const sliceHeightPx = Math.floor(contentH / pxToPtScale);
+        if (sliceHeightPx < 1) {
+          throw new Error("Selected page settings leave no printable area.");
+        }
+        const totalPages = Math.ceil(canvas.height / sliceHeightPx);
+        
         for (let i = 0; i < totalPages; i++) {
+          if (activeRunId.current !== runId) return;
           setProcessingLabel(`Building PDF pages... ${i + 1} of ${totalPages}`);
+          await nextFrame();
           const sliceCanvas = document.createElement("canvas");
           sliceCanvas.width = canvas.width;
-          sliceCanvas.height = Math.min(A4_HEIGHT_PX, canvas.height - i * A4_HEIGHT_PX);
+          sliceCanvas.height = Math.min(sliceHeightPx, canvas.height - i * sliceHeightPx);
           const ctx = sliceCanvas.getContext("2d");
           if (!ctx) {
             throw new Error("Could not create canvas context.");
           }
-          ctx.drawImage(canvas, 0, -i * A4_HEIGHT_PX);
-          const slicePng = sliceCanvas.toDataURL("image/jpeg", 0.9);
-          const img = await pdfDoc.embedJpg(slicePng.split(",")[1]);
+          ctx.drawImage(canvas, 0, -i * sliceHeightPx);
+          const img = await embedCanvas(sliceCanvas);
           const page = pdfDoc.addPage([pageW, pageH]);
-          const ptHeight = config.scale === "fit" ? sliceCanvas.height * (contentW / canvas.width) : sliceCanvas.height;
-          const imgW = config.scale === "fit" ? contentW : canvas.width;
+          const ptHeight = sliceCanvas.height * pxToPtScale;
+          const imgW = canvas.width * pxToPtScale;
           page.drawImage(img, {
             x: margin,
             y: pageH - margin - ptHeight,
             width: imgW,
             height: ptHeight,
           });
+          
+          sliceCanvas.width = 0;
+          sliceCanvas.height = 0;
         }
         setPdfPageCount(totalPages);
       }
 
       const bytes = await pdfDoc.save();
+      if (activeRunId.current !== runId) return;
       setPdfBytes(bytes);
       setStep("result");
       toast.success("Done! PDF is ready.");
     } catch (error) {
-      console.error(error);
-      toast.error("Something went wrong. Check your HTML and try again.");
-      setStep("config");
+      if (activeRunId.current === runId) {
+        console.error(error);
+        toast.error("Something went wrong. Check your HTML and try again.");
+        setStep("config");
+      }
+    } finally {
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+        canvas = null;
+      }
     }
-  }, [config, createHiddenIframeCapture, rawHtml, sanitizeHtml]);
+  }, [config, createHiddenIframeCapture, htmlBytes, rawHtml, sanitizeHtml]);
 
   const downloadPdf = useCallback(() => {
     if (!pdfBytes) return;
@@ -227,7 +370,7 @@ export default function HtmlToPdfPage() {
     anchor.href = url;
     anchor.download = downloadName;
     anchor.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
     addFile({
       filename: downloadName,
       size: pdfBytes.byteLength,
@@ -238,6 +381,8 @@ export default function HtmlToPdfPage() {
 
   const handleTextareaChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
     setRawHtml(event.target.value);
+    setPdfBytes(null);
+    setPdfPageCount(0);
   }, []);
 
   const handleTextareaKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -249,6 +394,8 @@ export default function HtmlToPdfPage() {
     const end = target.selectionEnd;
     const nextValue = `${target.value.slice(0, start)}  ${target.value.slice(end)}`;
     setRawHtml(nextValue);
+    setPdfBytes(null);
+    setPdfPageCount(0);
     window.setTimeout(() => {
       target.selectionStart = start + 2;
       target.selectionEnd = start + 2;
@@ -256,11 +403,22 @@ export default function HtmlToPdfPage() {
   }, []);
 
   const readUploadedFile = useCallback((file: File) => {
+    if (file.size > MAX_HTML_BYTES) {
+      toast.error("Input too large. Please limit HTML to 2MB.");
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = () => {
       const text = typeof reader.result === "string" ? reader.result : "";
+      if (byteLength(text) > MAX_HTML_BYTES) {
+        toast.error("Input too large. Please limit HTML to 2MB.");
+        return;
+      }
       setRawHtml(text);
       setUploadedFile({ name: file.name, size: file.size, preview: text.slice(0, 300) });
+      setPdfBytes(null);
+      setPdfPageCount(0);
     };
     reader.onerror = () => {
       toast.error("Something went wrong. Check your HTML and try again.");
@@ -277,18 +435,28 @@ export default function HtmlToPdfPage() {
     [readUploadedFile],
   );
 
+  const handleDropRejected = useCallback(() => {
+    toast.error("Use a .html or .htm file under 2MB.");
+  }, []);
+
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
+    onDropRejected: handleDropRejected,
     accept: { "text/html": [".html", ".htm"] },
+    maxSize: MAX_HTML_BYTES,
     multiple: false,
     noKeyboard: true,
   });
 
   const goToPreview = useCallback(async () => {
+    if (inputTooLarge) {
+      toast.error("Input too large. Please limit HTML to 2MB.");
+      return;
+    }
     const clean = await sanitizeHtml(rawHtml);
     setSanitizedHtml(clean);
     setStep("config");
-  }, [rawHtml, sanitizeHtml]);
+  }, [inputTooLarge, rawHtml, sanitizeHtml]);
 
   const setModePaste = useCallback(() => {
     setInputMode("paste");
@@ -298,11 +466,8 @@ export default function HtmlToPdfPage() {
     setInputMode("upload");
   }, []);
 
-  const toggleLimitations = useCallback(() => {
-    setShowLimitations((current) => !current);
-  }, []);
-
   const editInput = useCallback(() => {
+    activeRunId.current += 1;
     setStep("input");
   }, []);
 
@@ -319,6 +484,10 @@ export default function HtmlToPdfPage() {
     const timer = window.setTimeout(() => {
       void (async () => {
         if (!rawHtml.trim()) {
+          if (!cancelled) setSanitizedHtml("");
+          return;
+        }
+        if (byteLength(rawHtml) > MAX_HTML_BYTES) {
           if (!cancelled) setSanitizedHtml("");
           return;
         }
@@ -432,9 +601,15 @@ export default function HtmlToPdfPage() {
                       className="min-h-[280px] w-full resize-y rounded-lg border border-border bg-gray-950 p-4 font-mono text-[13px] text-gray-100 outline-none ring-emerald-500 transition focus:ring-2"
                     />
                     <p className="absolute bottom-3 right-3 rounded bg-gray-950 px-2 py-1 font-mono text-xs text-gray-400">
-                      {lineCount} lines · {rawHtml.length} characters
+                      {lineCount} lines | {rawHtml.length} characters | {(htmlBytes / 1024).toFixed(1)} KB
                     </p>
                   </div>
+                )}
+
+                {inputTooLarge && (
+                  <p className="mt-3 text-sm font-semibold text-red-600 dark:text-red-400">
+                    HTML input is over the 2 MB browser-side limit. Reduce the file before previewing or generating.
+                  </p>
                 )}
 
                 {inputMode === "upload" && (
@@ -469,31 +644,26 @@ export default function HtmlToPdfPage() {
                   </div>
                 )}
 
-                <div className="mt-6 rounded-lg border border-border bg-background">
-                  <button
-                    type="button"
-                    onClick={toggleLimitations}
-                    aria-expanded={showLimitations}
-                    aria-label="Toggle conversion limitations"
-                    className="w-full px-4 py-3 text-left text-sm font-semibold text-muted transition hover:text-foreground"
-                  >
-                    ⓘ What may not convert perfectly
-                  </button>
-                  {showLimitations && (
-                    <ul className="space-y-1 border-t border-border px-6 py-4 text-sm text-muted">
-                      <li>External images can be blocked by CORS policies.</li>
-                      <li>Custom web fonts may fall back to system fonts.</li>
-                      <li>CSS animations are captured in their static state.</li>
-                      <li>JavaScript is stripped and not executed.</li>
-                    </ul>
-                  )}
+                <div className="mt-6 rounded-lg border border-amber-500/30 bg-amber-500/10 p-5">
+                  <h3 className="mb-2 flex items-center text-sm font-bold text-amber-700 dark:text-amber-400">
+                    <AlertTriangle className="mr-2 h-4 w-4" />
+                    Browser-Side Limitations
+                  </h3>
+                  <ul className="list-inside list-disc space-y-1 text-sm text-amber-700/80 dark:text-amber-400/80">
+                    <li>Inputs larger than 2 MB are rejected to avoid browser hangs and memory exhaustion.</li>
+                    <li>External images can be blocked by CORS policies.</li>
+                    <li>Custom web fonts may fall back to system fonts.</li>
+                    <li>CSS animations are captured in their static state.</li>
+                    <li>JavaScript is stripped and not executed.</li>
+                    <li>The output is a raster capture of the rendered HTML, not selectable HTML text.</li>
+                  </ul>
                 </div>
 
                 <div className="mt-8 flex justify-end">
                   <button
                     type="button"
                     onClick={goToPreview}
-                    disabled={!rawHtml.trim()}
+                    disabled={!rawHtml.trim() || inputTooLarge}
                     aria-label="Preview HTML"
                     className="rounded-md bg-emerald-500 px-6 py-3 font-bold text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                   >
@@ -507,7 +677,7 @@ export default function HtmlToPdfPage() {
               <div className="grid gap-6 lg:grid-cols-[minmax(0,3fr)_minmax(280px,2fr)]">
                 <div className="rounded-lg border border-border bg-muted/10 p-5">
                   <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <h2 className="text-lg font-bold">Preview — actual PDF may vary slightly</h2>
+                    <h2 className="text-lg font-bold">Preview - actual PDF may vary slightly</h2>
                     <button
                       type="button"
                       onClick={editInput}
@@ -521,8 +691,8 @@ export default function HtmlToPdfPage() {
                     <div
                       className="mx-auto overflow-hidden bg-white shadow-xl"
                       style={{
-                        width: config.orientation === "portrait" ? "min(100%, 420px)" : "min(100%, 560px)",
-                        aspectRatio: config.orientation === "portrait" ? "595 / 842" : "842 / 595",
+                        width: previewDimensions[0] <= previewDimensions[1] ? "min(100%, 420px)" : "min(100%, 560px)",
+                        aspectRatio: `${previewDimensions[0]} / ${previewDimensions[1]}`,
                       }}
                     >
                       <iframe
@@ -542,7 +712,7 @@ export default function HtmlToPdfPage() {
                     <fieldset>
                       <legend className="mb-2 text-sm font-bold">Page Size</legend>
                       <div className="grid grid-cols-2 gap-2">
-                        {(["A4", "A3", "Letter", "Legal"] as PageSize[]).map((size) => (
+                        {(["A4", "A3", "Letter", "Legal", "Custom"] as PageSize[]).map((size) => (
                           <label key={size} className="rounded-md border border-border px-3 py-2 text-sm font-semibold">
                             <input
                               type="radio"
@@ -557,6 +727,35 @@ export default function HtmlToPdfPage() {
                         ))}
                       </div>
                     </fieldset>
+
+                    {config.pageSize === "Custom" && (
+                      <div className="grid grid-cols-2 gap-3">
+                        <label className="block text-sm font-bold">
+                          Width (mm)
+                          <input
+                            type="number"
+                            min={MIN_CUSTOM_MM}
+                            max={MAX_CUSTOM_MM}
+                            value={config.customWidthMm}
+                            onChange={(event) => updateConfig("customWidthMm", clampCustomMm(Number(event.target.value)))}
+                            aria-label="Custom page width in millimeters"
+                            className="mt-2 w-full rounded-md border border-border bg-background px-3 py-2"
+                          />
+                        </label>
+                        <label className="block text-sm font-bold">
+                          Height (mm)
+                          <input
+                            type="number"
+                            min={MIN_CUSTOM_MM}
+                            max={MAX_CUSTOM_MM}
+                            value={config.customHeightMm}
+                            onChange={(event) => updateConfig("customHeightMm", clampCustomMm(Number(event.target.value)))}
+                            aria-label="Custom page height in millimeters"
+                            className="mt-2 w-full rounded-md border border-border bg-background px-3 py-2"
+                          />
+                        </label>
+                      </div>
+                    )}
 
                     <fieldset>
                       <legend className="mb-2 text-sm font-bold">Orientation</legend>
@@ -648,13 +847,18 @@ export default function HtmlToPdfPage() {
                         ))}
                       </div>
                     </fieldset>
+
+                    <p className="text-sm text-muted">
+                      Actual size preserves captured CSS pixels as PDF points and may overflow narrow pages; use Fit to width when page bounds matter.
+                    </p>
                   </div>
 
                   <button
                     type="button"
                     onClick={() => void generatePdf()}
+                    disabled={inputTooLarge}
                     aria-label="Generate PDF"
-                    className="mt-7 flex w-full items-center justify-center gap-3 rounded-md bg-emerald-500 px-5 py-3 font-bold text-white transition hover:bg-emerald-600"
+                    className="mt-7 flex w-full items-center justify-center gap-3 rounded-md bg-emerald-500 px-5 py-3 font-bold text-white transition hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     Generate PDF &rarr;
                     <ShortcutHint shortcut="Ctrl+Enter" />
@@ -667,7 +871,7 @@ export default function HtmlToPdfPage() {
               <div className="mx-auto flex max-w-lg flex-col items-center py-16 text-center">
                 <Loader2 aria-hidden="true" className="mb-6 h-12 w-12 animate-spin text-emerald-500" />
                 <h2 className="text-xl font-bold">{processingLabel}</h2>
-                <p className="mt-2 text-sm text-muted">This is happening entirely in your browser.</p>
+                <p className="mt-2 text-sm text-muted">This is happening entirely in your browser. Very complex pages can still pause during capture.</p>
               </div>
             )}
 
