@@ -1,0 +1,1751 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: app/hooks/useMergeWorker.ts, app/hooks/useProcessorWorker.ts, app/lib/*.worker.ts, app/lib/*protocol*.ts, app/lib/pdf-utils.ts
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app/hooks/useMergeWorker.ts
+app/hooks/useProcessorWorker.ts
+app/lib/excelToPdf.worker.ts
+app/lib/merge-worker-protocol.ts
+app/lib/pdf-processor-protocol.ts
+app/lib/pdf-processor.worker.ts
+app/lib/pdf-utils.ts
+app/lib/pdfMerge.worker.ts
+app/lib/pdfToExcel.worker.ts
+app/lib/pdfToPptx.worker.ts
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/hooks/useMergeWorker.ts">
+"use client";
+
+/**
+ * useMergeWorker.ts
+ *
+ * React hook that manages the full lifecycle of the pdfMerge.worker.
+ *
+ * Lifecycle contract
+ * ──────────────────
+ * • The worker is created fresh on every merge() call — no reuse.
+ * • On completion (COMPLETE / ERROR): the worker is terminated and the ref nulled.
+ * • On cancel(): worker.terminate() is called immediately. No message is sent
+ *   to the worker first — terminate() is instantaneous and correct for a
+ *   stateless, single-use worker.
+ * • On component unmount: any running worker is force-terminated.
+ *   This prevents zombie workers if the user navigates away mid-merge.
+ *
+ * State shape
+ * ───────────
+ * MergeWorkerState is the single object the UI thread reads. It includes
+ * every field needed to render progress, errors, and the download trigger.
+ *
+ * TypeScript
+ * ──────────
+ * All message handling is fully typed through WorkerOutboundMessage.
+ * There are no `as any` casts in this file.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  MergeFileDescriptor,
+  WorkerOutboundMessage,
+  FileStage,
+} from "../lib/merge-worker-protocol";
+
+// ─── Public state types ───────────────────────────────────────────────────────
+
+export type MergePhase =
+  | "idle"
+  | "merging"
+  | "saving"
+  | "done"
+  | "error"
+  | "cancelled";
+
+/** Granular progress for the file currently being processed. */
+export interface CurrentFileProgress {
+  fileId: string;
+  fileName: string;
+  /** 1-based position in the queue. */
+  fileIndex: number;
+  totalFiles: number;
+  stage: FileStage;
+  pagesDone: number;
+  totalPages: number;
+}
+
+/** A file that was skipped during the merge due to a per-file error. */
+export interface SkippedFile {
+  fileId: string;
+  fileName: string;
+  reason: "encrypted" | "corrupted" | "empty";
+}
+
+export interface MergeWorkerState {
+  phase: MergePhase;
+  /** How many files have been fully processed (including skipped). */
+  completedFiles: number;
+  totalFiles: number;
+  /** Progress for the file currently under processing. null when idle/done. */
+  currentFile: CurrentFileProgress | null;
+  /** Set when phase === "done". The Uint8Array holding the merged PDF bytes. */
+  resultBytes: Uint8Array | null;
+  /** Set when phase === "error". */
+  errorMessage: string | null;
+  /** Files skipped due to encryption, corruption, or being empty. */
+  skippedFiles: SkippedFile[];
+  /** Set when estimated peak memory exceeds the safe threshold. */
+  memoryWarning: { estimatedBytes: number; availableBytes: number | null } | null;
+}
+
+export interface UseMergeWorkerReturn {
+  state: MergeWorkerState;
+  /** Start a merge. Throws if a merge is already in progress. */
+  merge: (files: MergeFileDescriptor[]) => void;
+  /** Cancel an in-progress merge. No-op if idle. */
+  cancel: () => void;
+  /** Reset state back to idle (e.g. to allow merging again). */
+  reset: () => void;
+}
+
+// ─── Initial state ────────────────────────────────────────────────────────────
+
+const INITIAL_STATE: MergeWorkerState = {
+  phase: "idle",
+  completedFiles: 0,
+  totalFiles: 0,
+  currentFile: null,
+  resultBytes: null,
+  errorMessage: null,
+  skippedFiles: [],
+  memoryWarning: null,
+};
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
+export function useMergeWorker(): UseMergeWorkerReturn {
+  const [state, setState] = useState<MergeWorkerState>(INITIAL_STATE);
+
+  /**
+   * Holds the active Worker instance.
+   * We use a ref (not state) because mutating it must never trigger a
+   * re-render — only the state changes should do that.
+   */
+  const workerRef = useRef<Worker | null>(null);
+
+  // ── Unmount guard ──────────────────────────────────────────────────────────
+  // Terminates a running worker when the component unmounts (e.g. navigation).
+  // This is the single place that prevents zombie workers.
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
+
+  // ── Worker teardown helper ─────────────────────────────────────────────────
+  const teardownWorker = useCallback(() => {
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+  }, []);
+
+  // ── Message handler ────────────────────────────────────────────────────────
+  /**
+   * Processes every outbound message from the worker.
+   * Because we create a fresh worker per merge, there is no risk of
+   * stale closures — the handler is bound at creation time.
+   */
+  const buildMessageHandler = useCallback(
+    () => (event: MessageEvent<WorkerOutboundMessage>) => {
+      const msg = event.data;
+
+      switch (msg.type) {
+        case "FILE_STARTED": {
+          setState((prev) => ({
+            ...prev,
+            totalFiles: msg.totalFiles,
+            currentFile: {
+              fileId: msg.fileId,
+              fileName: msg.fileName,
+              fileIndex: msg.fileIndex,
+              totalFiles: msg.totalFiles,
+              stage: "loading",
+              pagesDone: 0,
+              totalPages: 0,
+            },
+          }));
+          break;
+        }
+
+        case "PROGRESS_UPDATE": {
+          setState((prev) => {
+            // Guard: ignore stale messages if phase has already moved on
+            if (prev.phase !== "merging") return prev;
+            return {
+              ...prev,
+              currentFile: prev.currentFile
+                ? {
+                    ...prev.currentFile,
+                    stage: msg.stage as FileStage,
+                    pagesDone: msg.pagesDone,
+                    totalPages: msg.totalPages,
+                  }
+                : prev.currentFile,
+            };
+          });
+          break;
+        }
+
+        case "FILE_COMPLETED": {
+          setState((prev) => ({
+            ...prev,
+            completedFiles: msg.fileIndex,
+          }));
+          break;
+        }
+
+        case "PIPELINE_STAGE": {
+          if (msg.stage === "saving") {
+            setState((prev) => ({
+              ...prev,
+              phase: "saving",
+              currentFile: null,
+            }));
+          }
+          break;
+        }
+
+        case "FILE_SKIPPED": {
+          setState((prev) => ({
+            ...prev,
+            completedFiles: msg.fileIndex,
+            skippedFiles: [
+              ...prev.skippedFiles,
+              { fileId: msg.fileId, fileName: msg.fileName, reason: msg.reason },
+            ],
+          }));
+          break;
+        }
+
+        case "MEMORY_WARNING": {
+          setState((prev) => ({
+            ...prev,
+            memoryWarning: {
+              estimatedBytes: msg.estimatedBytes,
+              availableBytes: msg.availableBytes,
+            },
+          }));
+          break;
+        }
+
+        case "COMPLETE": {
+          teardownWorker();
+          // Use functional form to preserve skippedFiles accumulated during the run.
+          setState((prev) => ({
+            phase: "done",
+            completedFiles: 0,
+            totalFiles: 0,
+            currentFile: null,
+            resultBytes: msg.result,
+            errorMessage: null,
+            skippedFiles: prev.skippedFiles,
+            memoryWarning: null,
+          }));
+          break;
+        }
+
+        case "ERROR": {
+          teardownWorker();
+          setState((prev) => ({
+            ...prev,
+            phase: "error",
+            currentFile: null,
+            errorMessage: msg.message,
+          }));
+          break;
+        }
+
+        default: {
+          // Exhaustive check — TypeScript will warn if a new message type
+          // is added to the protocol but not handled here.
+          const _exhaustive: never = msg;
+          console.warn("[useMergeWorker] Unhandled worker message:", _exhaustive);
+        }
+      }
+    },
+    [teardownWorker],
+  );
+
+  // ── merge ──────────────────────────────────────────────────────────────────
+  const merge = useCallback(
+    (files: MergeFileDescriptor[]) => {
+      // Defensive: terminate any leftover worker before creating a new one.
+      teardownWorker();
+
+      setState({
+        phase: "merging",
+        completedFiles: 0,
+        totalFiles: files.length,
+        currentFile: null,
+        resultBytes: null,
+        errorMessage: null,
+        skippedFiles: [],
+        memoryWarning: null,
+      });
+
+      const worker = new Worker(
+        new URL("../lib/pdfMerge.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+
+      const handleMessage = buildMessageHandler();
+
+      worker.addEventListener("message", handleMessage);
+
+      // Catch unhandled runtime errors inside the worker (e.g. import failures)
+      worker.addEventListener("error", (err: ErrorEvent) => {
+        teardownWorker();
+        setState((prev) => ({
+          ...prev,
+          phase: "error",
+          currentFile: null,
+          errorMessage: err.message || "An unexpected error occurred in the merge worker.",
+        }));
+      });
+
+      workerRef.current = worker;
+
+      worker.postMessage({ type: "START_MERGE", files, onFileError: "skip" });
+    },
+    [teardownWorker, buildMessageHandler],
+  );
+
+  // ── cancel ─────────────────────────────────────────────────────────────────
+  const cancel = useCallback(() => {
+    if (!workerRef.current) return;
+    // Immediately terminate the worker thread. This is instantaneous —
+    // the worker cannot post any further messages after this call.
+    // No CANCEL message is sent; worker.terminate() is the correct and
+    // complete cancellation mechanism for a stateless Web Worker.
+    teardownWorker();
+    setState((prev) => ({
+      ...prev,
+      phase: "cancelled",
+      currentFile: null,
+    }));
+  }, [teardownWorker]);
+
+  // ── reset ──────────────────────────────────────────────────────────────────
+  const reset = useCallback(() => {
+    teardownWorker();
+    setState(INITIAL_STATE);
+  }, [teardownWorker]);
+
+  return { state, merge, cancel, reset };
+}
+</file>
+
+<file path="app/hooks/useProcessorWorker.ts">
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  ProcessorInboundMessage,
+  ProcessorOutboundMessage,
+  ProcessorTaskOptions,
+} from "../lib/pdf-processor-protocol";
+
+interface ProcessorWorkerState {
+  status: "idle" | "processing" | "done" | "error";
+  progress: number;
+  message: string;
+  resultBlob: Blob | null;
+  resultFilename: string | null;
+  error: string | null;
+}
+
+export function useProcessorWorker() {
+  const [state, setState] = useState<ProcessorWorkerState>({
+    status: "idle",
+    progress: 0,
+    message: "",
+    resultBlob: null,
+    resultFilename: null,
+    error: null,
+  });
+
+  const workerRef = useRef<Worker | null>(null);
+  const currentJobIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    workerRef.current = new Worker(new URL("../lib/pdf-processor.worker.ts", import.meta.url), {
+      type: "module",
+    });
+
+    workerRef.current.onmessage = (e: MessageEvent<ProcessorOutboundMessage>) => {
+      const msg = e.data;
+      if (msg.jobId !== currentJobIdRef.current) return; // Ignore stale messages
+
+      if (msg.type === "PROGRESS") {
+        setState((s) => ({ ...s, progress: msg.percent, message: msg.message || s.message }));
+      } else if (msg.type === "ERROR") {
+        setState((s) => ({ ...s, status: "error", error: msg.error, progress: 0 }));
+      } else if (msg.type === "COMPLETE") {
+        const type = msg.isZip ? "application/zip" : "application/pdf";
+        const blob = new Blob([new Uint8Array(msg.result)], { type });
+        setState((s) => ({ ...s, status: "done", resultBlob: blob, progress: 100, message: "Done!" }));
+      }
+    };
+
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+  }, []);
+
+  const process = useCallback(
+    async (file: File | null, task: ProcessorTaskOptions, outputFilename: string) => {
+      const jobId = ++currentJobIdRef.current;
+      setState({
+        status: "processing",
+        progress: 0,
+        message: "Starting...",
+        resultBlob: null,
+        resultFilename: outputFilename,
+        error: null,
+      });
+
+      try {
+        const fileBytes = file ? await file.arrayBuffer() : new ArrayBuffer(0);
+        if (workerRef.current) {
+          const msg: ProcessorInboundMessage = {
+            type: "START_PROCESS",
+            jobId,
+            fileBytes,
+            task,
+          };
+          workerRef.current.postMessage(msg, [fileBytes]); // transfer the array buffer
+        }
+      } catch (err) {
+        setState((s) => ({
+          ...s,
+          status: "error",
+          error: "Could not read file for processing.",
+        }));
+      }
+    },
+    []
+  );
+
+  const cancel = useCallback(() => {
+    if (workerRef.current && state.status === "processing") {
+      currentJobIdRef.current++; // Invalidate the current job immediately
+      const msg: ProcessorInboundMessage = { type: "CANCEL_PROCESS" };
+      workerRef.current.postMessage(msg);
+      setState((s) => ({ ...s, status: "idle", progress: 0, message: "Cancelled." }));
+    }
+  }, [state.status]);
+
+  const reset = useCallback(() => {
+    setState({
+      status: "idle",
+      progress: 0,
+      message: "",
+      resultBlob: null,
+      resultFilename: null,
+      error: null,
+    });
+  }, []);
+
+  return {
+    ...state,
+    process,
+    cancel,
+    reset,
+  };
+}
+</file>
+
+<file path="app/lib/excelToPdf.worker.ts">
+import * as XLSX from "xlsx";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+
+type PageSize = "A4" | "A3" | "Letter" | "Legal";
+type FontSize = "small" | "medium" | "large";
+type Orientation = "landscape" | "portrait";
+
+type LoadMessage = { type: "LOAD"; jobId: number; fileBytes: ArrayBuffer };
+type ConvertMessage = {
+  type: "CONVERT";
+  jobId: number;
+  sheetsToConvert: string[];
+  orientation: Orientation;
+  pageSize: PageSize;
+  fontSize: FontSize;
+  includeSheetTitle: boolean;
+};
+type WorkerMessage = LoadMessage | ConvertMessage | { type: "RESET" };
+
+const PAGE_DIMS: Record<PageSize, { width: number; height: number }> = {
+  A4: { width: 595, height: 842 },
+  A3: { width: 842, height: 1191 },
+  Letter: { width: 612, height: 792 },
+  Legal: { width: 612, height: 1008 },
+};
+
+const FONT_SIZES: Record<FontSize, number> = {
+  small: 8,
+  medium: 10,
+  large: 12,
+};
+
+let workbook: XLSX.WorkBook | null = null;
+
+function postError(jobId: number, error: unknown) {
+  self.postMessage({ type: "ERROR", jobId, error: error instanceof Error ? error.message : "Spreadsheet conversion failed." });
+}
+
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
+  const message = e.data;
+  if (message.type === "RESET") {
+    workbook = null;
+    return;
+  }
+
+  try {
+    if (message.type === "LOAD") {
+      workbook = XLSX.read(message.fileBytes, { type: "array" });
+      const sheetNames = workbook.SheetNames.filter((name) => Boolean(workbook?.Sheets[name]));
+      if (sheetNames.length === 0) throw new Error("No readable sheets found in this workbook.");
+      self.postMessage({ type: "LOADED", jobId: message.jobId, sheetNames });
+      return;
+    }
+
+    if (!workbook) throw new Error("Spreadsheet is not loaded. Choose the file again.");
+    const pdfDoc = await PDFDocument.create();
+    const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    const dims = PAGE_DIMS[message.pageSize];
+    const pgW = message.orientation === "landscape" ? dims.height : dims.width;
+    const pgH = message.orientation === "landscape" ? dims.width : dims.height;
+    const fSize = FONT_SIZES[message.fontSize];
+    const margin = 40;
+    const rowH = fSize + 8;
+    const headerH = rowH + 4;
+    let writtenSheets = 0;
+
+    for (const sheetName of message.sheetsToConvert) {
+      const ws = workbook.Sheets[sheetName];
+      if (!ws) continue;
+
+      const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" })
+        .map((row) => row.map((cell) => String(cell ?? "")));
+      if (rows.length === 0) continue;
+      if (!rows.some((row) => row.some((cell) => cell.trim().length > 0))) continue;
+
+      const colCount = Math.max(...rows.map((row) => row.length));
+      if (colCount === 0) continue;
+
+      const colWidths: number[] = Array(colCount).fill(0);
+      for (const row of rows) {
+        row.forEach((cell, i) => {
+          const w = regularFont.widthOfTextAtSize(cell, fSize) + 8;
+          colWidths[i] = Math.max(colWidths[i], Math.min(w, 120));
+        });
+      }
+
+      const totalColWidth = colWidths.reduce((a, b) => a + b, 0);
+      const availW = pgW - margin * 2;
+      const scale = totalColWidth > availW ? availW / totalColWidth : 1;
+      const scaledWidths = colWidths.map((w) => w * scale);
+
+      let page = pdfDoc.addPage([pgW, pgH]);
+      let y = pgH - margin;
+      writtenSheets += 1;
+
+      if (message.includeSheetTitle) {
+        page.drawText(sheetName, { x: margin, y, size: fSize + 4, font: boldFont, color: rgb(0.05, 0.05, 0.05) });
+        y -= fSize + 12;
+      }
+
+      rows.forEach((row, rowIdx) => {
+        const isHeader = rowIdx === 0;
+        const rowBackground = isHeader ? rgb(0.06, 0.06, 0.06) : rowIdx % 2 === 0 ? rgb(0.97, 0.97, 0.97) : rgb(1, 1, 1);
+        const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1);
+        const currentRowH = isHeader ? headerH : rowH;
+
+        if (y - currentRowH < margin) {
+          page = pdfDoc.addPage([pgW, pgH]);
+          y = pgH - margin;
+          if (rowIdx > 0 && rows[0]) {
+            let hx = margin;
+            page.drawRectangle({ x: margin, y: y - headerH, width: availW, height: headerH, color: rgb(0.06, 0.06, 0.06) });
+            rows[0].forEach((cell, i) => {
+              const cw = scaledWidths[i] ?? 60;
+              page.drawText(cell.slice(0, 40), { x: hx + 3, y: y - headerH + 5, size: fSize, font: boldFont, color: rgb(1, 1, 1), maxWidth: cw - 6 });
+              hx += cw;
+            });
+            y -= headerH;
+          }
+        }
+
+        let x = margin;
+        page.drawRectangle({ x: margin, y: y - currentRowH, width: availW, height: currentRowH, color: rowBackground });
+
+        row.forEach((cell, i) => {
+          const cw = scaledWidths[i] ?? 60;
+          const text = cell.slice(0, 60);
+          page.drawRectangle({ x, y: y - currentRowH, width: cw, height: currentRowH, borderColor: rgb(0.9, 0.91, 0.92), borderWidth: 0.5 });
+          if (text) {
+            page.drawText(text, { x: x + 3, y: y - currentRowH + 5, size: fSize, font: isHeader ? boldFont : regularFont, color: textColor, maxWidth: cw - 6 });
+          }
+          x += cw;
+        });
+
+        y -= currentRowH;
+      });
+    }
+
+    if (writtenSheets === 0) throw new Error("Selected sheets contain no extractable cell data.");
+    const pdfBytes = await pdfDoc.save();
+    self.postMessage({ type: "DONE", jobId: message.jobId, result: pdfBytes }, { transfer: [pdfBytes.buffer] });
+  } catch (error) {
+    postError("jobId" in message ? message.jobId : 0, error);
+  }
+};
+</file>
+
+<file path="app/lib/merge-worker-protocol.ts">
+/**
+ * merge-worker-protocol.ts
+ *
+ * Single source of truth for all messages exchanged between the merge Web Worker
+ * and the React UI thread.  Both sides import from this file so the contract
+ * can never silently drift.
+ *
+ * Rule: NOTHING in this file may be changed without updating both sides.
+ */
+
+// ─── Inbound (UI → Worker) ───────────────────────────────────────────────────
+
+/**
+ * Serialisable description of one file to merge.
+ * We send the File object directly; it is transferred by reference inside a
+ * Worker postMessage, so there is zero copy overhead.
+ */
+export interface MergeFileDescriptor {
+  /** Stable UI identifier (crypto.randomUUID from the React state). */
+  id: string;
+  /**
+   * The original File object. Sent via Structured Clone (not transferred).
+   * This is lightweight — the browser clones the File metadata reference,
+   * not the underlying bytes. The actual bytes are read inside the worker
+   * via file.arrayBuffer().
+   */
+  file: File;
+}
+
+/**
+ * What to do when a single file fails to load.
+ * "skip"  – post FILE_SKIPPED and continue with remaining files (default).
+ * "abort" – post ERROR and halt immediately.
+ */
+export type FileErrorStrategy = "skip" | "abort";
+
+export interface StartMergeMessage {
+  type: "START_MERGE";
+  files: MergeFileDescriptor[];
+  /** Defaults to "skip" inside the worker when not provided. */
+  onFileError?: FileErrorStrategy;
+}
+
+/** Union of every message the UI thread can send to the worker. */
+export type WorkerInboundMessage = StartMergeMessage;
+
+// ─── Outbound (Worker → UI) ──────────────────────────────────────────────────
+
+/**
+ * Processing stages reported for a single file.
+ * "loading"       – reading the File's ArrayBuffer + PDFDocument.load()
+ * "copying_pages" – iterating copyPages() for each page in the document
+ * "done"          – all pages from this file have been copied
+ */
+export type FileStage = "loading" | "copying_pages" | "done";
+
+/**
+ * Global pipeline stages reported across the whole merge operation.
+ * "saving"   – the final PDFDocument.save() serialisation
+ */
+export type PipelineStage = "saving";
+
+// ─── Individual message shapes ───────────────────────────────────────────────
+
+/** A file has started being processed. */
+export interface FileStartedMessage {
+  type: "FILE_STARTED";
+  fileId: string;
+  fileName: string;
+  /** 1-based position in the queue (e.g. "Processing 2 of 5"). */
+  fileIndex: number;
+  totalFiles: number;
+}
+
+/** Granular progress within a single file. */
+export interface ProgressUpdateMessage {
+  type: "PROGRESS_UPDATE";
+  fileId: string;
+  stage: FileStage;
+  /**
+   * For "copying_pages": pages copied so far.
+   * For "loading" / "done": always 0.
+   */
+  pagesDone: number;
+  totalPages: number;
+}
+
+/** A file has been fully processed and its pages appended. */
+export interface FileCompletedMessage {
+  type: "FILE_COMPLETED";
+  fileId: string;
+  fileIndex: number;
+  totalFiles: number;
+}
+
+/** The worker encountered a fatal error and has stopped. */
+export interface ErrorMessage {
+  type: "ERROR";
+  message: string;
+  /** Which file caused the error, if known. */
+  fileId?: string;
+}
+
+/** A single file was skipped due to an unrecoverable per-file error. */
+export interface FileSkippedMessage {
+  type: "FILE_SKIPPED";
+  fileId: string;
+  fileName: string;
+  /** 1-based position in the queue. */
+  fileIndex: number;
+  totalFiles: number;
+  reason: "encrypted" | "corrupted" | "empty";
+}
+
+/**
+ * Posted once before processing begins when the estimated memory
+ * requirement is high. Does not abort the merge — informs the UI only.
+ */
+export interface MemoryWarningMessage {
+  type: "MEMORY_WARNING";
+  /** Estimated peak bytes this merge will consume. */
+  estimatedBytes: number;
+  /** Approximate JS heap available (from performance.memory), or null if unavailable. */
+  availableBytes: number | null;
+}
+
+/** The merge is complete; the result bytes are transferred back. */
+export interface CompleteMessage {
+  type: "COMPLETE";
+  /**
+   * The merged PDF as a Uint8Array.
+   * Transferred (zero-copy) via the Transferable mechanism.
+   */
+  result: Uint8Array;
+  totalBytes: number;
+}
+
+/** Pipeline-level stage update (e.g. final save). */
+export interface PipelineStageMessage {
+  type: "PIPELINE_STAGE";
+  stage: PipelineStage;
+}
+
+/** Union of every message the worker can send to the UI thread. */
+export type WorkerOutboundMessage =
+  | FileStartedMessage
+  | ProgressUpdateMessage
+  | FileCompletedMessage
+  | ErrorMessage
+  | FileSkippedMessage
+  | MemoryWarningMessage
+  | CompleteMessage
+  | PipelineStageMessage;
+</file>
+
+<file path="app/lib/pdf-processor-protocol.ts">
+import type { TextAlignment, TextFontFamily, TextMarginPreset, TextPageSize } from "./text-to-pdf";
+import type { NumberColorKey, NumberFormat, NumberPosition } from "./pdf-page-numbers";
+
+export type ProcessorTool = "split" | "rotate" | "crop" | "organize" | "text-to-pdf" | "page-numbers";
+
+export interface SplitOptions {
+  mode: "range" | "all";
+  startPage?: number;
+  endPage?: number;
+  filename: string;
+}
+
+export interface RotateOptions {
+  mode: "single" | "all";
+  page?: number;
+  angle: number;
+}
+
+export interface CropOptions {
+  mode: "single" | "range" | "all";
+  singlePage?: number;
+  rangeStart?: number;
+  rangeEnd?: number;
+  margins: { top: number; bottom: number; left: number; right: number };
+}
+
+export interface OrganizePageEntry {
+  originalIndex: number | null; // null means blank page
+  rotation: number;
+}
+
+export interface OrganizeOptions {
+  pages: OrganizePageEntry[];
+}
+
+export interface TextToPdfOptions {
+  text: string;
+  fontFamily: TextFontFamily;
+  fontSize: number;
+  pageSize: TextPageSize;
+  margin: TextMarginPreset;
+  alignment: TextAlignment;
+  colorKey: string;
+}
+
+export interface PageNumbersOptions {
+  position: NumberPosition;
+  format: NumberFormat;
+  startNumber: number;
+  fontSize: number;
+  colorKey: NumberColorKey;
+  marginPreset: "small" | "medium" | "large";
+  skipFirstPage: boolean;
+  useCustomRange: boolean;
+  rangeStart: number;
+  rangeEnd: number;
+}
+
+export type ProcessorTaskOptions =
+  | { tool: "split"; options: SplitOptions }
+  | { tool: "rotate"; options: RotateOptions }
+  | { tool: "crop"; options: CropOptions }
+  | { tool: "organize"; options: OrganizeOptions }
+  | { tool: "text-to-pdf"; options: TextToPdfOptions }
+  | { tool: "page-numbers"; options: PageNumbersOptions };
+
+export interface StartProcessorMessage {
+  type: "START_PROCESS";
+  /** Monotonically increasing ID so the hook can discard stale COMPLETE messages. */
+  jobId: number;
+  fileBytes: ArrayBuffer;
+  task: ProcessorTaskOptions;
+}
+
+export interface CancelProcessorMessage {
+  type: "CANCEL_PROCESS";
+}
+
+export type ProcessorInboundMessage = StartProcessorMessage | CancelProcessorMessage;
+
+export interface ProcessorProgressMessage {
+  type: "PROGRESS";
+  jobId: number;
+  percent: number;
+  message?: string;
+}
+
+export interface ProcessorErrorMessage {
+  type: "ERROR";
+  jobId: number;
+  error: string;
+}
+
+export interface ProcessorCompleteMessage {
+  type: "COMPLETE";
+  jobId: number;
+  result: Uint8Array; // Could be PDF bytes or ZIP bytes (for split all)
+  isZip: boolean;
+}
+
+export type ProcessorOutboundMessage =
+  | ProcessorProgressMessage
+  | ProcessorErrorMessage
+  | ProcessorCompleteMessage;
+</file>
+
+<file path="app/lib/pdf-processor.worker.ts">
+import { PDFDocument, degrees, StandardFonts } from "pdf-lib";
+import JSZip from "jszip";
+import { COLOR_MAP as TEXT_COLOR_MAP, FONT_MAP, MARGIN_POINTS, PAGE_SIZES, wrapLines } from "./text-to-pdf";
+import { COLOR_MAP as NUM_COLOR_MAP, MARGIN_MM, formatLabel, getCoordinates } from "./pdf-page-numbers";
+import type {
+  ProcessorInboundMessage,
+  ProcessorOutboundMessage,
+  ProcessorTaskOptions,
+} from "./pdf-processor-protocol";
+
+let currentJobId = -1;
+
+function post(msg: ProcessorOutboundMessage, transfer?: Transferable[]) {
+  postMessage(msg, { transfer: transfer || [] });
+}
+
+function mmToPoints(mm: number): number {
+  return (mm * 72) / 25.4;
+}
+
+self.addEventListener("message", (event: MessageEvent<ProcessorInboundMessage>) => {
+  const msg = event.data;
+
+  if (msg.type === "CANCEL_PROCESS") {
+    currentJobId = -1;
+    return;
+  }
+
+  if (msg.type === "START_PROCESS") {
+    currentJobId = msg.jobId;
+    void handleTask(msg.jobId, msg.fileBytes, msg.task);
+  }
+});
+
+async function handleTask(jobId: number, fileBytes: ArrayBuffer, task: ProcessorTaskOptions) {
+  const checkCancel = () => { if (currentJobId !== jobId) throw new Error("Cancelled"); };
+
+  try {
+    let resultBytes: Uint8Array;
+    let isZip = false;
+
+    let sourceDoc: PDFDocument | undefined;
+    if (fileBytes && fileBytes.byteLength > 0 && task.tool !== "text-to-pdf") {
+      post({ type: "PROGRESS", jobId, percent: 10, message: "Loading PDF..." });
+      sourceDoc = await PDFDocument.load(fileBytes, { ignoreEncryption: true });
+      checkCancel();
+    }
+
+    switch (task.tool) {
+      case "split": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { mode, startPage, endPage, filename } = task.options;
+        const total = sourceDoc.getPageCount();
+
+        if (mode === "range") {
+          const s = Math.max(1, startPage || 1) - 1;
+          const e = Math.min(total, endPage || total) - 1;
+          const indices: number[] = [];
+          for (let i = s; i <= e; i++) indices.push(i);
+
+          post({ type: "PROGRESS", jobId, percent: 30, message: "Extracting pages..." });
+          const newPdf = await PDFDocument.create();
+          const pages = await newPdf.copyPages(sourceDoc, indices);
+          pages.forEach((page) => newPdf.addPage(page));
+
+          checkCancel();
+          
+          post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+          resultBytes = await newPdf.save();
+        } else {
+          // split all
+          isZip = true;
+          const zip = new JSZip();
+          const baseName = filename.replace(/\.pdf$/i, "") || "document";
+
+          for (let i = 0; i < total; i++) {
+            checkCancel();
+            post({ type: "PROGRESS", jobId, percent: Math.round(10 + (i / total) * 70), message: `Processing page ${i + 1} of ${total}...` });
+            
+            const newPdf = await PDFDocument.create();
+            const [page] = await newPdf.copyPages(sourceDoc, [i]);
+            newPdf.addPage(page);
+            const pageBytes = await newPdf.save();
+            zip.file(`${baseName}-page-${i + 1}.pdf`, pageBytes);
+          }
+
+          checkCancel();
+          post({ type: "PROGRESS", jobId, percent: 85, message: "Generating ZIP archive..." });
+          
+          const zipBlob = await zip.generateAsync({ type: "uint8array" }, (metadata) => {
+            if (currentJobId === jobId) post({ type: "PROGRESS", jobId, percent: Math.round(85 + metadata.percent * 0.15), message: "Compressing..." });
+          });
+          resultBytes = zipBlob;
+        }
+        break;
+      }
+      
+      case "rotate": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { mode, angle, page } = task.options;
+        post({ type: "PROGRESS", jobId, percent: 30, message: "Applying rotation..." });
+        
+        if (mode === "all") {
+          for (const p of sourceDoc.getPages()) {
+            const current = p.getRotation().angle;
+            p.setRotation(degrees((current + angle + 360) % 360));
+          }
+        } else if (page !== undefined && page > 0) {
+          const p = sourceDoc.getPage(page - 1);
+          const current = p.getRotation().angle;
+          p.setRotation(degrees((current + angle + 360) % 360));
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+        resultBytes = await sourceDoc.save();
+        break;
+      }
+
+      case "crop": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { mode, singlePage, rangeStart, rangeEnd, margins } = task.options;
+        const total = sourceDoc.getPageCount();
+        const top = mmToPoints(margins.top);
+        const bottom = mmToPoints(margins.bottom);
+        const left = mmToPoints(margins.left);
+        const right = mmToPoints(margins.right);
+
+        post({ type: "PROGRESS", jobId, percent: 30, message: "Applying crops..." });
+        
+        for (let i = 0; i < total; i++) {
+          let inScope = false;
+          if (mode === "all") inScope = true;
+          else if (mode === "single" && i + 1 === singlePage) inScope = true;
+          else if (mode === "range" && rangeStart && rangeEnd && i + 1 >= rangeStart && i + 1 <= rangeEnd) inScope = true;
+
+          if (inScope) {
+            const p = sourceDoc.getPage(i);
+            const { width, height } = p.getSize();
+            const cropWidth = width - left - right;
+            const cropHeight = height - bottom - top;
+            if (cropWidth > 0 && cropHeight > 0) {
+               p.setCropBox(left, bottom, cropWidth, cropHeight);
+            }
+          }
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+        resultBytes = await sourceDoc.save();
+        break;
+      }
+
+      case "organize": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { pages } = task.options;
+        post({ type: "PROGRESS", jobId, percent: 20, message: "Building new PDF structure..." });
+        
+        const newDoc = await PDFDocument.create();
+        
+        for (let i = 0; i < pages.length; i++) {
+          checkCancel();
+          if (i % 10 === 0) {
+            post({ type: "PROGRESS", jobId, percent: Math.round(20 + (i / pages.length) * 60), message: `Processing page ${i + 1} of ${pages.length}...` });
+          }
+
+          const entry = pages[i];
+          if (entry.originalIndex === null) {
+            newDoc.addPage([595, 842]);
+          } else {
+            const [copiedPage] = await newDoc.copyPages(sourceDoc, [entry.originalIndex]);
+            if (entry.rotation !== 0) {
+               copiedPage.setRotation(degrees(entry.rotation));
+            }
+            newDoc.addPage(copiedPage);
+          }
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+        resultBytes = await newDoc.save();
+        break;
+      }
+      
+      case "text-to-pdf": {
+        const { text, fontFamily, fontSize, pageSize, margin, alignment, colorKey } = task.options;
+        post({ type: "PROGRESS", jobId, percent: 20, message: "Preparing document..." });
+        
+        const pdf = await PDFDocument.create();
+        const font = await pdf.embedFont(FONT_MAP[fontFamily]);
+        const color = TEXT_COLOR_MAP[colorKey] ?? TEXT_COLOR_MAP.black;
+
+        const [pageWidth, pageHeight] = PAGE_SIZES[pageSize];
+        const marginPt = MARGIN_POINTS[margin];
+        const maxWidth = pageWidth - marginPt * 2;
+        const lineHeight = fontSize * 1.45;
+        
+        post({ type: "PROGRESS", jobId, percent: 30, message: "Validating text encoding..." });
+        
+        const unsupportedMatch = text.match(/[^\x00-\xFF\u0152\u0153\u0178\u0192\u2013\u2014\u2018-\u201E\u2020-\u2022\u2026\u2030\u2039\u203A\u20AC\r\n\t]/);
+        if (unsupportedMatch) {
+          throw new Error(`Text contains unsupported character: "${unsupportedMatch[0]}". Please use standard Latin characters.`);
+        }
+
+        try {
+          font.encodeText(text);
+        } catch (e) {
+          throw new Error("Text contains unsupported characters. Please use standard Latin characters.");
+        }
+
+        post({ type: "PROGRESS", jobId, percent: 40, message: "Processing text..." });
+        const lines = wrapLines(text, font, fontSize, maxWidth);
+
+        let page = pdf.addPage([pageWidth, pageHeight]);
+        let y = pageHeight - marginPt - fontSize;
+
+        for (let i = 0; i < lines.length; i++) {
+          checkCancel();
+          if (i % 100 === 0) {
+            post({ type: "PROGRESS", jobId, percent: Math.round(40 + (i / lines.length) * 45), message: "Writing pages..." });
+          }
+          
+          const line = lines[i];
+          if (y < marginPt) {
+            page = pdf.addPage([pageWidth, pageHeight]);
+            y = pageHeight - marginPt - fontSize;
+          }
+
+          const textWidth = font.widthOfTextAtSize(line, fontSize);
+          let x = marginPt;
+          if (alignment === "center") {
+            x = (pageWidth - textWidth) / 2;
+          } else if (alignment === "right") {
+            x = pageWidth - marginPt - textWidth;
+          }
+
+          page.drawText(line, { x, y, size: fontSize, font, color });
+          y -= lineHeight;
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 85, message: "Saving PDF..." });
+        resultBytes = await pdf.save();
+        break;
+      }
+
+      case "page-numbers": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const {
+          position,
+          format,
+          startNumber,
+          fontSize,
+          colorKey,
+          marginPreset,
+          skipFirstPage,
+          useCustomRange,
+          rangeStart,
+          rangeEnd,
+        } = task.options;
+
+        post({ type: "PROGRESS", jobId, percent: 20, message: "Preparing fonts..." });
+        const font = await sourceDoc.embedFont(StandardFonts.Helvetica);
+        const color = NUM_COLOR_MAP[colorKey];
+        const marginPt = mmToPoints(MARGIN_MM[marginPreset]);
+        const pageCount = sourceDoc.getPageCount();
+
+        let displayNumber = startNumber;
+
+        for (let i = 0; i < pageCount; i++) {
+          checkCancel();
+          if (i % 10 === 0) {
+             post({ type: "PROGRESS", jobId, percent: Math.round(20 + (i / pageCount) * 60), message: `Numbering page ${i + 1} of ${pageCount}...` });
+          }
+
+          const pageIndex = i + 1;
+          if (skipFirstPage && i === 0) continue;
+          if (useCustomRange && (pageIndex < rangeStart || pageIndex > rangeEnd)) continue;
+
+          const label = formatLabel(displayNumber, pageCount, format);
+          const page = sourceDoc.getPage(i);
+          const { width, height } = page.getSize();
+          const rotationAngle = page.getRotation().angle;
+          const normRot = ((rotationAngle % 360) + 360) % 360;
+
+          // Compute visual dimensions
+          const visualWidth = normRot === 90 || normRot === 270 ? height : width;
+          const visualHeight = normRot === 90 || normRot === 270 ? width : height;
+
+          const textWidth = font.widthOfTextAtSize(label, fontSize);
+          
+          const { x: visualX, y: visualY } = getCoordinates(position, visualWidth, visualHeight, textWidth, fontSize, marginPt);
+
+          let unrotatedX = visualX;
+          let unrotatedY = visualY;
+          
+          if (normRot === 90) {
+            unrotatedX = width - visualY;
+            unrotatedY = visualX;
+          } else if (normRot === 180) {
+            unrotatedX = width - visualX;
+            unrotatedY = height - visualY;
+          } else if (normRot === 270) {
+            unrotatedX = visualY;
+            unrotatedY = height - visualX;
+          }
+
+          page.drawText(label, { x: unrotatedX, y: unrotatedY, size: fontSize, font, color, rotate: degrees(0) });
+          displayNumber += 1;
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 85, message: "Saving PDF..." });
+        resultBytes = await sourceDoc.save();
+        break;
+      }
+      
+      default:
+        throw new Error("Unknown tool task.");
+    }
+
+    checkCancel();
+
+    post({ type: "PROGRESS", jobId, percent: 100, message: "Done" });
+    post({ type: "COMPLETE", jobId, result: resultBytes, isZip }, [resultBytes.buffer]);
+  } catch (err) {
+    if (currentJobId === jobId) {
+      const msg = err instanceof Error ? err.message : "An unexpected error occurred.";
+      post({ type: "ERROR", jobId, error: msg });
+    }
+  }
+}
+</file>
+
+<file path="app/lib/pdf-utils.ts">
+export type PageSizeKey = "A4" | "A3" | "A5" | "Letter" | "Legal" | "Tabloid" | "Custom";
+export type Orientation = "portrait" | "landscape";
+
+export const PAGE_SIZE_MM: Record<Exclude<PageSizeKey, "Custom">, { width: number; height: number }> = {
+  A4: { width: 210, height: 297 },
+  A3: { width: 297, height: 420 },
+  A5: { width: 148, height: 210 },
+  Letter: { width: 216, height: 279 },
+  Legal: { width: 216, height: 356 },
+  Tabloid: { width: 279, height: 432 },
+};
+
+export function mmToPoints(mm: number): number {
+  return (mm * 72) / 25.4;
+}
+
+export function getPageSizePoints(
+  size: PageSizeKey,
+  orientation: Orientation,
+  customWidthMm?: number,
+  customHeightMm?: number,
+): { width: number; height: number } {
+  let widthMm: number;
+  let heightMm: number;
+
+  if (size === "Custom") {
+    widthMm = customWidthMm ?? 210;
+    heightMm = customHeightMm ?? 297;
+  } else {
+    widthMm = PAGE_SIZE_MM[size].width;
+    heightMm = PAGE_SIZE_MM[size].height;
+  }
+
+  if (orientation === "landscape") {
+    [widthMm, heightMm] = [heightMm, widthMm];
+  }
+
+  return { width: mmToPoints(widthMm), height: mmToPoints(heightMm) };
+}
+
+export function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function getPdfjs() {
+  const pdfjs = await import("pdfjs-dist");
+  if (typeof window !== "undefined") {
+    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+  }
+  return pdfjs;
+}
+
+export async function renderPdfPageToCanvas(
+  pdfBytes: ArrayBuffer,
+  pageNumber: number,
+  canvas: HTMLCanvasElement,
+  scale = 1.25,
+): Promise<void> {
+  const { getDocument } = await getPdfjs();
+  const pdf = await getDocument({ data: pdfBytes.slice(0) }).promise;
+  try {
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale });
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: context, viewport }).promise;
+  } finally {
+    await pdf.destroy();
+  }
+}
+
+export function pageIndexInScope(
+  index: number,
+  mode: "all" | "single" | "range",
+  singlePage: number,
+  rangeStart: number,
+  rangeEnd: number,
+): boolean {
+  if (mode === "all") return true;
+  if (mode === "single") return index === singlePage - 1;
+  return index >= rangeStart - 1 && index <= rangeEnd - 1;
+}
+</file>
+
+<file path="app/lib/pdfMerge.worker.ts">
+/**
+ * pdfMerge.worker.ts
+ *
+ * Dedicated Web Worker for the PDF merge pipeline.
+ * Runs in a completely separate thread — the main UI thread is never blocked.
+ *
+ * Responsibilities
+ * ────────────────
+ * 1. Receive a START_MERGE message containing an ordered list of File objects.
+ * 2. For each file:
+ *    a. Read its ArrayBuffer  (File → ArrayBuffer, happens inside worker)
+ *    b. Load via PDFDocument.load()  (pdf-lib)
+ *    c. Bulk-copy all pages into the accumulator with a single copyPages() call.
+ * 3. Serialise the accumulator with PDFDocument.save().
+ * 4. Transfer the resulting Uint8Array back to the main thread (zero-copy).
+ *
+ * Cancellation
+ * ────────────
+ * Handled exclusively by worker.terminate() from the hook (useMergeWorker).
+ * The worker itself has no cancel logic — a terminated worker simply stops.
+ * This is the correct model for a stateless, single-use worker.
+ *
+ * Error handling
+ * ──────────────
+ * Any thrown error (including encryption, corruption) is caught at the top
+ * level and posted as an ERROR message. The hook then terminates the worker.
+ *
+ * What is NOT done here (future phases)
+ * ──────────────────────────────────────
+ * • Memory batching for >N files
+ * • Corrupted-PDF recovery / partial page rescue
+ */
+
+import { PDFDocument } from "pdf-lib";
+import type {
+  WorkerInboundMessage,
+  WorkerOutboundMessage,
+  MergeFileDescriptor,
+  FileErrorStrategy,
+} from "./merge-worker-protocol";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * Estimated peak heap budget. When the pre-flight estimate exceeds this,
+ * a MEMORY_WARNING is posted. Processing continues regardless.
+ * 512 MB is conservative for modern desktop browsers; mobile may be lower.
+ */
+const MEMORY_LIMIT_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Multiplier applied to the sum of raw file sizes to estimate peak heap.
+ * Accounts for: raw ArrayBuffer (1×) + pdf-lib parsed object graph (~1.5×)
+ * + accumulator page copies (~1×) = 3.5× total.
+ */
+const MEMORY_MULTIPLIER = 3.5;
+
+// ─── Typed postMessage helper ─────────────────────────────────────────────────
+
+function post(msg: WorkerOutboundMessage, transfer: Transferable[] = []): void {
+  if (transfer.length > 0) {
+    (self as unknown as Worker).postMessage(msg, transfer);
+  } else {
+    self.postMessage(msg);
+  }
+}
+
+// ─── Memory estimation ────────────────────────────────────────────────────────
+
+function estimateMemoryRequirement(files: MergeFileDescriptor[]): number {
+  const totalRaw = files.reduce((sum, d) => sum + d.file.size, 0);
+  return Math.round(totalRaw * MEMORY_MULTIPLIER);
+}
+
+function getAvailableHeap(): number | null {
+  // performance.memory is a non-standard Chrome extension; may be undefined.
+  const mem = (performance as unknown as Record<string, unknown>).memory as
+    | { jsHeapSizeLimit: number; usedJSHeapSize: number }
+    | undefined;
+  if (!mem) return null;
+  return mem.jsHeapSizeLimit - mem.usedJSHeapSize;
+}
+
+// ─── Core pipeline ────────────────────────────────────────────────────────────
+
+async function readFileBytes(file: File): Promise<ArrayBuffer> {
+  return file.arrayBuffer();
+}
+
+/**
+ * Process every file sequentially, releasing references after each one.
+ *
+ * Memory strategy:
+ * - rawBytes is nulled immediately after PDFDocument.load() succeeds.
+ * - sourceDoc is nulled immediately after copyPages() completes.
+ * - Both are released in a finally block so GC can reclaim even on error.
+ *
+ * @param files Ordered list of files to merge.
+ * @param mergedDoc The accumulator PDFDocument (created once, reused across files).
+ * @param strategy What to do when a file fails: skip it or abort the batch.
+ * @returns Number of pages successfully copied across all files.
+ */
+async function processMergeQueue(
+  files: MergeFileDescriptor[],
+  mergedDoc: PDFDocument,
+  strategy: FileErrorStrategy,
+): Promise<number> {
+  const totalFiles = files.length;
+  let totalPagesCopied = 0;
+
+  for (let fileIndex = 0; fileIndex < totalFiles; fileIndex++) {
+    const descriptor = files[fileIndex];
+    const oneBasedIndex = fileIndex + 1;
+
+    // ── Empty-file guard ──────────────────────────────────────────────────────
+    if (descriptor.file.size === 0) {
+      post({
+        type: "FILE_SKIPPED",
+        fileId: descriptor.id,
+        fileName: descriptor.file.name,
+        fileIndex: oneBasedIndex,
+        totalFiles,
+        reason: "empty",
+      });
+      continue;
+    }
+
+    // ── FILE_STARTED ──────────────────────────────────────────────────────────
+    post({
+      type: "FILE_STARTED",
+      fileId: descriptor.id,
+      fileName: descriptor.file.name,
+      fileIndex: oneBasedIndex,
+      totalFiles,
+    });
+
+    // ── LOADING stage ─────────────────────────────────────────────────────────
+    post({
+      type: "PROGRESS_UPDATE",
+      fileId: descriptor.id,
+      stage: "loading",
+      pagesDone: 0,
+      totalPages: 0,
+    });
+
+    // Nullable refs — both released in finally to guarantee GC opportunity.
+    let rawBytes: ArrayBuffer | null = null;
+    let sourceDoc: PDFDocument | null = null;
+
+    try {
+      rawBytes = await readFileBytes(descriptor.file);
+
+      try {
+        sourceDoc = await PDFDocument.load(rawBytes, { ignoreEncryption: false });
+
+        // ── COPYING_PAGES stage ─────────────────────────────────────────────────
+        const pageIndices = sourceDoc.getPageIndices();
+        const totalPages = pageIndices.length;
+
+        post({
+          type: "PROGRESS_UPDATE",
+          fileId: descriptor.id,
+          stage: "copying_pages",
+          pagesDone: 0,
+          totalPages,
+        });
+
+        // Single bulk call — pdf-lib resolves shared object references across
+        // all pages together. Calling it N times for N pages is O(N²).
+        const copiedPages = await mergedDoc.copyPages(sourceDoc, pageIndices);
+        for (const page of copiedPages) {
+          mergedDoc.addPage(page);
+        }
+        totalPagesCopied += copiedPages.length;
+
+      } catch (loadErr) {
+        const msg = loadErr instanceof Error ? loadErr.message : "";
+        const isEncrypted =
+          msg.toLowerCase().includes("encrypt") ||
+          msg.toLowerCase().includes("password");
+        const reason: "encrypted" | "corrupted" = isEncrypted ? "encrypted" : "corrupted";
+
+        if (strategy === "skip") {
+          post({
+            type: "FILE_SKIPPED",
+            fileId: descriptor.id,
+            fileName: descriptor.file.name,
+            fileIndex: oneBasedIndex,
+            totalFiles,
+            reason,
+          });
+          continue;
+        }
+
+        // strategy === "abort"
+        throw new Error(
+          isEncrypted
+            ? `"${descriptor.file.name}" is password-protected and cannot be merged.`
+            : `"${descriptor.file.name}" could not be parsed or processed. The file may be corrupted.`,
+        );
+      } finally {
+        // Release the raw bytes immediately — sourceDoc holds everything it
+        // needs; keeping rawBytes alive doubles peak memory for no benefit.
+        rawBytes = null;
+      }
+
+    } finally {
+      // Always release sourceDoc after copyPages, even if copyPages threw.
+      sourceDoc = null;
+      rawBytes = null; // defensive: cover early-exit paths
+    }
+
+    // ── FILE_COMPLETED ────────────────────────────────────────────────────────
+    post({
+      type: "FILE_COMPLETED",
+      fileId: descriptor.id,
+      fileIndex: oneBasedIndex,
+      totalFiles,
+    });
+  }
+
+  return totalPagesCopied;
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+// This worker is single-use. The hook (useMergeWorker) creates a fresh
+// instance for every merge and terminates it immediately on completion,
+// error, or cancellation. No CANCEL message is ever sent to this worker;
+// the hook calls worker.terminate() directly, which is the correct and
+// instantaneous cancellation mechanism for a stateless worker.
+
+self.addEventListener("message", (event: MessageEvent<WorkerInboundMessage>) => {
+  const msg = event.data;
+
+  if (msg.type !== "START_MERGE") {
+    return;
+  }
+
+  const strategy: FileErrorStrategy = msg.onFileError ?? "skip";
+
+  void (async () => {
+    try {
+      // ── Pre-flight memory estimation ────────────────────────────────────────
+      const estimatedBytes = estimateMemoryRequirement(msg.files);
+      if (estimatedBytes > MEMORY_LIMIT_BYTES) {
+        throw new Error(
+          `Merge request exceeds the safe memory limit (~${Math.round(
+            estimatedBytes / 1024 / 1024
+          )} MB estimated, limit is ${Math.round(
+            MEMORY_LIMIT_BYTES / 1024 / 1024
+          )} MB). Please merge fewer or smaller PDF files.`
+        );
+      }
+
+      const mergedDoc = await PDFDocument.create();
+
+      const totalPagesCopied = await processMergeQueue(msg.files, mergedDoc, strategy);
+
+      // ── Zero-pages guard ─────────────────────────────────────────────────────
+      if (totalPagesCopied === 0) {
+        post({ type: "ERROR", message: "No valid PDFs could be merged. All files were skipped or empty." });
+        return;
+      }
+
+      // ── PIPELINE_STAGE: saving ───────────────────────────────────────────────
+      post({ type: "PIPELINE_STAGE", stage: "saving" });
+
+      const resultBytes = await mergedDoc.save({ useObjectStreams: true });
+
+      post(
+        {
+          type: "COMPLETE",
+          result: resultBytes,
+          totalBytes: resultBytes.byteLength,
+        },
+        [resultBytes.buffer],
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "An unexpected error occurred during merge.";
+      post({ type: "ERROR", message });
+    }
+  })();
+});
+</file>
+
+<file path="app/lib/pdfToExcel.worker.ts">
+import * as XLSX from "xlsx";
+
+type PageRows = { pageNumber: number; rows: string[][] };
+type WorkerMessage = { type: "BUILD"; jobId: number; pages: PageRows[] };
+
+self.onmessage = (event: MessageEvent<WorkerMessage>) => {
+  try {
+    const { jobId, pages } = event.data;
+    const validPages = pages.filter((page) => page.rows.length > 0);
+    if (validPages.length === 0) throw new Error("No extractable text rows were found in the selected pages.");
+
+    const workbook = XLSX.utils.book_new();
+    for (const page of validPages) {
+      const ws = XLSX.utils.aoa_to_sheet(page.rows);
+      const colWidths: number[] = [];
+      for (const row of page.rows) {
+        row.forEach((cell, index) => {
+          colWidths[index] = Math.max(colWidths[index] ?? 8, cell.length + 2);
+        });
+      }
+      ws["!cols"] = colWidths.map((width) => ({ wch: Math.min(width, 40) }));
+      XLSX.utils.book_append_sheet(workbook, ws, `Page ${page.pageNumber}`);
+    }
+
+    const xlsxBytes: Uint8Array = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+    self.postMessage({ type: "DONE", jobId, result: xlsxBytes }, { transfer: [xlsxBytes.buffer] });
+  } catch (error) {
+    self.postMessage({ type: "ERROR", jobId: event.data.jobId, error: error instanceof Error ? error.message : "Excel export failed." });
+  }
+};
+</file>
+
+<file path="app/lib/pdfToPptx.worker.ts">
+import * as pdfjsLib from "pdfjs-dist";
+
+type RenderMessage = {
+  type: "RENDER";
+  jobId: number;
+  fileBytes: ArrayBuffer;
+  startPage: number;
+  endPage: number;
+  scale: number;
+  quality: number;
+};
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+self.onmessage = async (event: MessageEvent<RenderMessage>) => {
+  const message = event.data;
+  let pdf: pdfjsLib.PDFDocumentProxy | null = null;
+  try {
+    if (typeof OffscreenCanvas === "undefined") {
+      throw new Error("This browser cannot render PDF pages off the main thread.");
+    }
+
+    const source = { data: new Uint8Array(message.fileBytes), disableWorker: true } as unknown as Parameters<typeof pdfjsLib.getDocument>[0];
+    const task = pdfjsLib.getDocument(source);
+    pdf = await task.promise;
+    if (pdf.numPages < 1) throw new Error("Could not read any pages from this PDF.");
+
+    const start = Math.max(1, Math.min(message.startPage, pdf.numPages));
+    const end = Math.max(start, Math.min(message.endPage, pdf.numPages));
+    for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+      self.postMessage({ type: "START", jobId: message.jobId, pageNumber });
+      const page = await pdf.getPage(pageNumber);
+      let canvas: OffscreenCanvas | null = null;
+      try {
+        const viewport = page.getViewport({ scale: message.scale });
+        canvas = new OffscreenCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Could not create offscreen canvas context.");
+        await page.render({ canvasContext: context as unknown as CanvasRenderingContext2D, viewport }).promise;
+        const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: message.quality });
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        self.postMessage({
+          type: "PAGE",
+          jobId: message.jobId,
+          pageNumber,
+          dataUrl: `data:image/jpeg;base64,${bytesToBase64(bytes)}`,
+          size: bytes.byteLength,
+        });
+      } finally {
+        page.cleanup();
+        if (canvas) {
+          canvas.width = 0;
+          canvas.height = 0;
+        }
+      }
+    }
+
+    self.postMessage({ type: "DONE", jobId: message.jobId });
+  } catch (error) {
+    self.postMessage({ type: "ERROR", jobId: message.jobId, error: error instanceof Error ? error.message : "PowerPoint conversion failed." });
+  } finally {
+    await pdf?.cleanup?.();
+    await pdf?.destroy?.();
+  }
+};
+</file>
+
+</files>

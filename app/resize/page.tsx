@@ -17,11 +17,13 @@ import {
   type PageSizeKey,
 } from "../lib/pdf-utils";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
+import { usePdfPipelineWorker } from "../hooks/usePdfPipelineWorker";
 
 const TOOL = getToolDefinition("resize");
 const ACCENT = "#3B82F6";
 
 type Status = "idle" | "loading" | "processing" | "done" | "error";
+type PipelineOperation = "idle" | "resize";
 
 export default function ResizePage() {
   const [file, setFile] = useState<File | null>(null);
@@ -39,10 +41,25 @@ export default function ResizePage() {
   const [status, setStatus] = useState<Status>("idle");
   const [resultBlob, setResultBlob] = useState<Blob | null>(null);
   const [resultFilename, setResultFilename] = useState("resized.pdf");
+  const [activeOperation, setActiveOperation] = useState<PipelineOperation>("idle");
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewTaskRef = useRef(0);
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
+  const createResizeWorker = useCallback(
+    () => new Worker(new URL("../lib/resizePdf.worker.ts", import.meta.url), { type: "module" }),
+    [],
+  );
+  const {
+    status: pipelineStatus,
+    progress: pipelineProgress,
+    memoryWarning,
+    result: pipelineResult,
+    error: pipelineError,
+    process: startPipeline,
+    cancel,
+    reset: resetPipeline,
+  } = usePdfPipelineWorker(createResizeWorker);
 
   const validateRange = useCallback((): string | null => {
     if (mode === "single") {
@@ -59,14 +76,18 @@ export default function ResizePage() {
   }, [mode, singlePage, rangeStart, rangeEnd, pageCount]);
 
   const resetAll = useCallback(() => {
+    resetPipeline();
+    setActiveOperation("idle");
     setFile(null);
     setPdfBytes(null);
     setPageCount(0);
     setStatus("idle");
     setResultBlob(null);
-  }, []);
+  }, [resetPipeline]);
 
   const loadPdf = useCallback(async (uploaded: File) => {
+    resetPipeline();
+    setActiveOperation("idle");
     setStatus("loading");
     setResultBlob(null);
     const valid = await hasPdfHeader(uploaded);
@@ -91,7 +112,7 @@ export default function ResizePage() {
       setStatus("error");
       toast.error("Could not read this PDF.", { id: "resize-load" });
     }
-  }, []);
+  }, [resetPipeline]);
 
   useEffect(() => {
     if (pendingFiles.length > 0 && !file && (!pendingTool || pendingTool === "resize")) {
@@ -180,11 +201,12 @@ export default function ResizePage() {
 
     setStatus("processing");
     setResultBlob(null);
+    setActiveOperation("resize");
     toast.loading("Resizing PDF...", { id: "resize" });
-
-    try {
-      const result = await resizePdf({
-        pdfBytes,
+    await startPipeline(file, {
+      tool: "resize-pdf",
+      operation: "convert",
+      options: {
         mode,
         singlePage,
         rangeStart,
@@ -194,20 +216,44 @@ export default function ResizePage() {
         customWidthMm,
         customHeightMm,
         scaleContent,
-      });
-      const blob = new Blob([new Uint8Array(result)], { type: "application/pdf" });
-      const base = file.name.replace(/\.pdf$/i, "") || "document";
-      const filename = `resized-${base}.pdf`;
-      setResultBlob(blob);
-      setResultFilename(filename);
-      setStatus("done");
-      toast.success("Done! PDF resized successfully.", { id: "resize" });
-      addFile({ filename, size: blob.size, timestamp: Date.now(), tool: "resize" });
-    } catch {
-      setStatus("error");
-      toast.error("Something went wrong. Please try again.", { id: "resize" });
-    }
+      },
+    });
   };
+
+  useEffect(() => {
+    if (pipelineStatus === "done" && activeOperation === "resize" && pipelineResult.blob && pipelineResult.output?.kind === "file") {
+      const filename = pipelineResult.filename || pipelineResult.output.filename;
+      const blob = pipelineResult.blob;
+      queueMicrotask(() => {
+        setResultBlob(blob);
+        setResultFilename(filename);
+        setStatus("done");
+        setActiveOperation("idle");
+        toast.success("Done! PDF resized successfully.", { id: "resize" });
+        addFile({ filename, size: blob.size, timestamp: Date.now(), tool: "resize" });
+      });
+      return;
+    }
+
+    if (pipelineStatus === "error" && activeOperation === "resize" && pipelineError) {
+      queueMicrotask(() => {
+        setStatus("error");
+        setActiveOperation("idle");
+        toast.error(pipelineError.message, { id: "resize" });
+        resetPipeline();
+      });
+      return;
+    }
+
+    if (pipelineStatus === "cancelled" && activeOperation === "resize") {
+      queueMicrotask(() => {
+        setStatus("idle");
+        setActiveOperation("idle");
+        toast.info("Resize cancelled.", { id: "resize" });
+        resetPipeline();
+      });
+    }
+  }, [activeOperation, addFile, pipelineError, pipelineResult.blob, pipelineResult.filename, pipelineResult.output, pipelineStatus, resetPipeline]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -343,7 +389,22 @@ export default function ResizePage() {
           </>
         )}
 
-        {status === "processing" && <LoadingState accent={ACCENT} label="Resizing PDF…" />}
+        {status === "processing" && (
+          <div className="mt-6 rounded-2xl border border-border bg-card p-6">
+            <LoadingState accent={ACCENT} label={pipelineProgress?.message ?? "Resizing PDF..."} />
+            <div className="mt-4 h-2 overflow-hidden rounded-full bg-muted">
+              <div className="h-full transition-all" style={{ width: `${pipelineProgress?.percent ?? 0}%`, backgroundColor: ACCENT }} />
+            </div>
+            {memoryWarning && (
+              <p className="mt-4 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-300">
+                Large PDF detected. Resizing may use about {formatBytes(memoryWarning.estimatedBytes)} of memory.
+              </p>
+            )}
+            <button type="button" onClick={cancel} className="mt-4 rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-muted">
+              Cancel
+            </button>
+          </div>
+        )}
         {isDone && resultBlob && file && <SizeComparisonBadge originalSize={file.size} compressedSize={resultBlob.size} />}
 
         {hasFile && (

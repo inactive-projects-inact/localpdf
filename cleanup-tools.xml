@@ -1,0 +1,4905 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: app/sign/**, app/unlock/**, app/lib/*.worker.ts, app/hooks/*.ts
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app/hooks/use-motion-enabled.ts
+app/hooks/useCanvasRenderer.ts
+app/hooks/useMergeWorker.ts
+app/hooks/usePdfPipelineWorker.ts
+app/hooks/useProcessorWorker.ts
+app/lib/excelToPdf.worker.ts
+app/lib/flattenPdf.worker.ts
+app/lib/pdf-processor.worker.ts
+app/lib/pdfMerge.worker.ts
+app/lib/pdfToExcel.worker.ts
+app/lib/pdfToMarkdown.worker.ts
+app/lib/pdfToPptx.worker.ts
+app/lib/pdfToWord.worker.ts
+app/lib/redactPdf.worker.ts
+app/lib/resizePdf.worker.ts
+app/lib/thumbnailRenderer.worker.ts
+app/lib/wordToPdf.worker.ts
+app/sign/layout.tsx
+app/sign/page.tsx
+app/unlock/layout.tsx
+app/unlock/page.tsx
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/hooks/useCanvasRenderer.ts">
+// ---------------------------------------------------------------------------
+// useCanvasRenderer
+// Shared hook for all canvas-producing worker paths.
+//
+// Design:
+// - Lazy worker init: worker is created on first request(), not on mount.
+// - fileBytes are sliced inside the hook — caller's ArrayBuffer is never detached.
+// - ImageBitmaps are closed immediately after blob conversion or direct draw.
+// - Object URLs are tracked in a Set; revoked explicitly via revokeUrl() or
+//   swept on unmount. Both paths are guarded.
+// - Stale-result protection: requestIds not in pendingRequests are discarded.
+// - Cancelled results ("cancelled" message) are silently ignored; onError is
+//   only called for real failures.
+// - Worker is terminated and all tracked URLs revoked on unmount, in that order.
+// - React StrictMode safe: lazy init prevents double-worker on double-mount.
+// ---------------------------------------------------------------------------
+
+import { useCallback, useEffect, useRef } from "react";
+import type { ThumbnailOutboundMessage } from "../lib/thumbnail-worker-protocol";
+
+export type RenderParams = {
+  /** Caller-owned job identifier. Used for bulk cancel. */
+  jobId: number;
+  /** Unique per-request identifier. Use crypto.randomUUID(). */
+  requestId: string;
+  /** PDF bytes. Hook slices internally — caller's buffer is never detached. */
+  fileBytes: ArrayBuffer;
+  /** 0-based page index. */
+  pageIndex: number;
+  /** Target render width in px. */
+  targetWidth: number;
+  /** Degrees added on top of the page's own rotation. */
+  extraRotation?: number;
+};
+
+export type RenderResult = {
+  requestId: string;
+  pageIndex: number;
+  /**
+   * Object URL ready for <img src>.
+   * null when OffscreenCanvas is unavailable — caller must render on main thread.
+   */
+  url: string | null;
+  width: number;
+  height: number;
+};
+
+export type UseCanvasRendererOptions = {
+  onResult: (result: RenderResult) => void;
+  onError?: (requestId: string, pageIndex: number, reason: string) => void;
+};
+
+export function useCanvasRenderer(options: UseCanvasRendererOptions): {
+  request: (params: RenderParams) => void;
+  cancel: (jobId: number) => void;
+  cancelAll: () => void;
+  revokeUrl: (url: string) => void;
+} {
+  const { onResult, onError } = options;
+
+  // Stable refs so callbacks capture the latest version without being
+  // re-registered as effect deps.
+  const onResultRef = useRef(onResult);
+  onResultRef.current = onResult;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  const workerRef = useRef<Worker | null>(null);
+  /** requestIds that are still pending a result. */
+  const pendingRequestsRef = useRef<Set<string>>(new Set());
+  /** All live object URLs created by this hook instance. */
+  const trackedUrlsRef = useRef<Set<string>>(new Set());
+
+  // ---------------------------------------------------------------------------
+  // Worker factory — lazy, called only on first request()
+  // ---------------------------------------------------------------------------
+  const ensureWorker = useCallback((): Worker => {
+    if (workerRef.current) return workerRef.current;
+
+    const w = new Worker(
+      new URL("../lib/thumbnailRenderer.worker.ts", import.meta.url),
+      { type: "module" },
+    );
+
+    w.onmessage = (event: MessageEvent<ThumbnailOutboundMessage>) => {
+      const msg = event.data;
+
+      if (msg.type === "THUMBNAIL_RESULT") {
+        const { requestId, pageIndex, bitmap, width, height } = msg;
+
+        // Stale-result guard: discard if this requestId is no longer wanted.
+        if (!pendingRequestsRef.current.has(requestId)) {
+          bitmap?.close();
+          return;
+        }
+        pendingRequestsRef.current.delete(requestId);
+
+        if (!bitmap) {
+          // OffscreenCanvas unavailable — signal caller to fall back.
+          onResultRef.current({ requestId, pageIndex, url: null, width, height });
+          return;
+        }
+
+        // Convert ImageBitmap → object URL via a temporary canvas.
+        // This keeps the URL lifecycle inside the hook.
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width;
+        canvas.height = bitmap.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          bitmap.close();
+          canvas.width = 0;
+          canvas.height = 0;
+          onResultRef.current({ requestId, pageIndex, url: null, width, height });
+          return;
+        }
+        ctx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+        canvas.toBlob((blob) => {
+          canvas.width = 0;
+          canvas.height = 0;
+          if (!blob) {
+            onResultRef.current({ requestId, pageIndex, url: null, width, height });
+            return;
+          }
+          const url = URL.createObjectURL(blob);
+          trackedUrlsRef.current.add(url);
+          onResultRef.current({ requestId, pageIndex, url, width, height });
+        }, "image/jpeg", 0.85);
+      } else if (msg.type === "THUMBNAIL_ERROR") {
+        const { requestId, pageIndex, message } = msg;
+        pendingRequestsRef.current.delete(requestId);
+        // "cancelled" is a normal non-error path — do not forward to onError.
+        if (message !== "cancelled") {
+          onErrorRef.current?.(requestId, pageIndex, message);
+        }
+      }
+    };
+
+    w.onerror = () => {
+      // Worker crashed — silently degrade. Pending requests will time out.
+      // Callers see no result, which is handled by their own skeleton state.
+    };
+
+    workerRef.current = w;
+    return w;
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  const request = useCallback((params: RenderParams) => {
+    const { jobId, requestId, fileBytes, pageIndex, targetWidth, extraRotation = 0 } = params;
+    const w = ensureWorker();
+    pendingRequestsRef.current.add(requestId);
+    // Slice before transfer — caller's buffer is never detached.
+    const transferBuffer = fileBytes.slice(0);
+    w.postMessage(
+      {
+        type: "THUMBNAIL_RENDER",
+        jobId,
+        requestId,
+        fileBytes: transferBuffer,
+        pageIndex,
+        targetWidth,
+        extraRotation,
+      },
+      [transferBuffer],
+    );
+  }, [ensureWorker]);
+
+  const cancel = useCallback((jobId: number) => {
+    workerRef.current?.postMessage({ type: "THUMBNAIL_CANCEL", jobId });
+    // Remove matching requestIds — they follow the convention `${jobId}-*`.
+    const toDelete: string[] = [];
+    for (const id of pendingRequestsRef.current) {
+      if (id.startsWith(`${jobId}-`)) toDelete.push(id);
+    }
+    toDelete.forEach((id) => pendingRequestsRef.current.delete(id));
+  }, []);
+
+  const cancelAll = useCallback(() => {
+    workerRef.current?.postMessage({ type: "THUMBNAIL_CANCEL_ALL" });
+    pendingRequestsRef.current.clear();
+  }, []);
+
+  const revokeUrl = useCallback((url: string) => {
+    URL.revokeObjectURL(url);
+    trackedUrlsRef.current.delete(url);
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Unmount cleanup — cancel → terminate → revoke all URLs
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.postMessage({ type: "THUMBNAIL_CANCEL_ALL" });
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      pendingRequestsRef.current.clear();
+      trackedUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      trackedUrlsRef.current.clear();
+    };
+  }, []);
+
+  return { request, cancel, cancelAll, revokeUrl };
+}
+</file>
+
+<file path="app/hooks/usePdfPipelineWorker.ts">
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  PdfPipelineComplete,
+  PdfPipelineError,
+  PdfPipelineMemoryWarning,
+  PdfPipelineProgress,
+  PdfPipelineRequest,
+  PdfPipelineResponse,
+  PdfPipelineTask,
+} from "../lib/pdf-pipeline-protocol";
+
+export type PdfPipelineStatus = "idle" | "processing" | "done" | "error" | "cancelled";
+
+export type PdfPipelineResult = {
+  blob: Blob | null;
+  text: string | null;
+  filename: string;
+  output: PdfPipelineComplete["output"] | null;
+};
+
+export type PdfPipelineState = {
+  status: PdfPipelineStatus;
+  progress: PdfPipelineProgress | null;
+  memoryWarning: PdfPipelineMemoryWarning | null;
+  result: PdfPipelineResult;
+  error: PdfPipelineError | null;
+};
+
+const INITIAL_RESULT: PdfPipelineResult = {
+  blob: null,
+  text: null,
+  filename: "",
+  output: null,
+};
+
+const INITIAL_STATE: PdfPipelineState = {
+  status: "idle",
+  progress: null,
+  memoryWarning: null,
+  result: INITIAL_RESULT,
+  error: null,
+};
+
+export function usePdfPipelineWorker(createWorker: () => Worker) {
+  const [state, setState] = useState<PdfPipelineState>(INITIAL_STATE);
+  const workerRef = useRef<Worker | null>(null);
+  const activeJobIdRef = useRef(0);
+
+  const terminateWorker = useCallback(() => {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+  }, []);
+
+  const reset = useCallback(() => {
+    activeJobIdRef.current += 1;
+    terminateWorker();
+    setState(INITIAL_STATE);
+  }, [terminateWorker]);
+
+  const cancel = useCallback(() => {
+    const worker = workerRef.current;
+    if (!worker) return;
+    const jobId = activeJobIdRef.current;
+    const cancelMessage: PdfPipelineRequest = { type: "CANCEL", jobId };
+    worker.postMessage(cancelMessage);
+    activeJobIdRef.current += 1;
+    terminateWorker();
+    setState((current) => ({ ...current, status: "cancelled", progress: null }));
+  }, [terminateWorker]);
+
+  const process = useCallback(
+    async (file: File, task: PdfPipelineTask) => {
+      const jobId = activeJobIdRef.current + 1;
+      activeJobIdRef.current = jobId;
+      terminateWorker();
+      setState({
+        status: "processing",
+        progress: { type: "PROGRESS", jobId, phase: "reading", percent: 0, message: "Reading file..." },
+        memoryWarning: null,
+        result: INITIAL_RESULT,
+        error: null,
+      });
+
+      try {
+        const fileBytes = await file.arrayBuffer();
+        if (activeJobIdRef.current !== jobId) return;
+
+        const worker = createWorker();
+        workerRef.current = worker;
+
+        worker.onmessage = (event: MessageEvent<PdfPipelineResponse>) => {
+          const message = event.data;
+          if (message.jobId !== activeJobIdRef.current) return;
+
+          if (message.type === "PROGRESS") {
+            setState((current) => ({ ...current, progress: message }));
+            return;
+          }
+
+          if (message.type === "MEMORY_WARNING") {
+            setState((current) => ({ ...current, memoryWarning: message }));
+            return;
+          }
+
+          if (message.type === "CANCELLED") {
+            terminateWorker();
+            setState((current) => ({ ...current, status: "cancelled", progress: null }));
+            return;
+          }
+
+          if (message.type === "ERROR") {
+            terminateWorker();
+            setState((current) => ({ ...current, status: "error", progress: null, error: message }));
+            return;
+          }
+
+          terminateWorker();
+          if (message.output.kind === "text" || message.output.kind === "file") {
+            const buffer = message.output.bytes.buffer.slice(
+              message.output.bytes.byteOffset,
+              message.output.bytes.byteOffset + message.output.bytes.byteLength,
+            ) as ArrayBuffer;
+            const blob = new Blob([buffer], { type: message.output.mimeType });
+            const text = message.output.kind === "text" ? new TextDecoder().decode(message.output.bytes) : null;
+            setState((current) => ({
+              ...current,
+              status: "done",
+              progress: null,
+              result: {
+                blob,
+                text,
+                filename: message.output.filename,
+                output: message.output,
+              },
+            }));
+            return;
+          }
+
+          setState((current) => ({
+            ...current,
+            status: "done",
+            progress: null,
+            result: {
+              blob: null,
+              text: null,
+              filename: message.output.filename,
+              output: message.output,
+            },
+          }));
+        };
+
+        worker.onerror = (event) => {
+          if (activeJobIdRef.current !== jobId) return;
+          terminateWorker();
+          setState((current) => ({
+            ...current,
+            status: "error",
+            progress: null,
+            error: {
+              type: "ERROR",
+              jobId,
+              code: "unknown",
+              message: event.message || "Worker failed.",
+              recoverable: true,
+            },
+          }));
+        };
+
+        const message: PdfPipelineRequest = {
+          type: "START",
+          jobId,
+          input: {
+            fileBytes,
+            fileName: file.name,
+            fileSize: file.size,
+          },
+          task,
+        };
+        worker.postMessage(message, [fileBytes]);
+      } catch {
+        if (activeJobIdRef.current !== jobId) return;
+        setState((current) => ({
+          ...current,
+          status: "error",
+          progress: null,
+          error: {
+            type: "ERROR",
+            jobId,
+            code: "unknown",
+            message: "Could not read file for processing.",
+            recoverable: true,
+          },
+        }));
+      }
+    },
+    [createWorker, terminateWorker],
+  );
+
+  useEffect(() => {
+    return () => {
+      activeJobIdRef.current += 1;
+      terminateWorker();
+    };
+  }, [terminateWorker]);
+
+  return {
+    ...state,
+    process,
+    cancel,
+    reset,
+  };
+}
+</file>
+
+<file path="app/lib/flattenPdf.worker.ts">
+import { PDFDocument } from "pdf-lib";
+import type { PdfPipelineRequest, PdfPipelineValidation } from "./pdf-pipeline-protocol";
+import {
+  assertActiveJob,
+  buildMemoryWarning,
+  PdfPipelineWorkerError,
+  postPipelineMessage,
+  validatePipelineOutput,
+} from "./pdf-worker-utils";
+
+let activeJobId = -1;
+
+function flattenedFilename(fileName: string): string {
+  return fileName.toLowerCase().endsWith(".pdf") ? `flattened-${fileName}` : `flattened-${fileName}.pdf`;
+}
+
+async function loadDocument(fileBytes: ArrayBuffer): Promise<PDFDocument> {
+  try {
+    return await PDFDocument.load(new Uint8Array(fileBytes));
+  } catch (error) {
+    const message = error instanceof Error ? error.message.toLowerCase() : "";
+    if (message.includes("encrypted")) {
+      throw new PdfPipelineWorkerError("Encrypted PDFs are not supported for AcroForm flattening.", "encrypted", true);
+    }
+    throw new PdfPipelineWorkerError("Could not read this PDF.", "corrupted", true);
+  }
+}
+
+async function analyzePdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize, 3);
+  if (memoryWarning) postPipelineMessage(memoryWarning);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 25, message: "Reading PDF..." });
+  const pdfDoc = await loadDocument(message.input.fileBytes);
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "analyzing", percent: 70, message: "Checking AcroForm fields..." });
+  const pageCount = pdfDoc.getPageCount();
+  const fieldCount = pdfDoc.getForm().getFields().length;
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({
+    type: "COMPLETE",
+    jobId: message.jobId,
+    output: {
+      kind: "flatten-pdf-analysis",
+      filename: message.input.fileName,
+      pageCount,
+      fieldCount,
+    },
+  });
+}
+
+async function flattenPdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize, 4);
+  if (memoryWarning) postPipelineMessage(memoryWarning);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 15, message: "Loading PDF..." });
+  const pdfDoc = await loadDocument(message.input.fileBytes);
+  assertActiveJob(message.jobId, activeJobId);
+
+  const form = pdfDoc.getForm();
+  const fieldCount = form.getFields().length;
+  if (fieldCount === 0) {
+    throw new PdfPipelineWorkerError(
+      "No AcroForm fields found. This tool only flattens AcroForm fields.",
+      "no-flattenable-fields",
+      true,
+    );
+  }
+
+  postPipelineMessage({
+    type: "PROGRESS",
+    jobId: message.jobId,
+    phase: "processing",
+    percent: 55,
+    message: `Flattening ${fieldCount} AcroForm field${fieldCount === 1 ? "" : "s"}...`,
+    unitsDone: 0,
+    totalUnits: fieldCount,
+  });
+  form.flatten();
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "saving", percent: 80, message: "Saving flattened PDF..." });
+  const outputBytes = await pdfDoc.save();
+  if (!outputBytes) {
+    throw new PdfPipelineWorkerError("Flattening produced no output.", "empty-output", true);
+  }
+
+  const validation: PdfPipelineValidation = {
+    minBytes: 500,
+    requireContent: true,
+    contentUnits: fieldCount,
+    contentDescription: "fields",
+  };
+  validatePipelineOutput(outputBytes.byteLength, validation);
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({
+    type: "COMPLETE",
+    jobId: message.jobId,
+    output: {
+      kind: "file",
+      bytes: outputBytes,
+      filename: flattenedFilename(message.input.fileName),
+      mimeType: "application/pdf",
+      byteLength: outputBytes.byteLength,
+      validation,
+    },
+  }, [outputBytes.buffer]);
+}
+
+self.onmessage = (event: MessageEvent<PdfPipelineRequest>) => {
+  const message = event.data;
+  if (message.type === "CANCEL") {
+    if (message.jobId === activeJobId) {
+      activeJobId = -1;
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+    }
+    return;
+  }
+
+  activeJobId = message.jobId;
+  const run = message.task.tool === "flatten-pdf" && message.task.operation === "analyze" ? analyzePdf(message) : flattenPdf(message);
+  run.catch((error: unknown) => {
+    if (message.jobId !== activeJobId && !(error instanceof PdfPipelineWorkerError && error.code === "cancelled")) return;
+    if (error instanceof PdfPipelineWorkerError && error.code === "cancelled") {
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+      return;
+    }
+    postPipelineMessage({
+      type: "ERROR",
+      jobId: message.jobId,
+      code: error instanceof PdfPipelineWorkerError ? error.code : "unknown",
+      message: error instanceof Error ? error.message : "Flattening failed.",
+      recoverable: error instanceof PdfPipelineWorkerError ? error.recoverable : true,
+    });
+  });
+};
+</file>
+
+<file path="app/lib/pdfToMarkdown.worker.ts">
+import * as pdfjsLib from "pdfjs-dist";
+import type {
+  PdfPipelineRequest,
+  PdfToMarkdownOptions,
+  PdfPipelineValidation,
+} from "./pdf-pipeline-protocol";
+import {
+  assertActiveJob,
+  buildMemoryWarning,
+  PdfPipelineWorkerError,
+  postPipelineMessage,
+  validatePipelineOutput,
+} from "./pdf-worker-utils";
+
+type TextContentItem = {
+  str: string;
+  transform: number[];
+  height: number;
+  width: number;
+};
+
+type Line = {
+  text: string;
+  x: number;
+  y: number;
+  height: number;
+  width: number;
+};
+
+let activeJobId = -1;
+
+function getMedian(values: number[]): number {
+  if (values.length === 0) return 12;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)] || 12;
+}
+
+function normalizeListLine(text: string): string {
+  if (/^\d+\.\s+/.test(text)) return text;
+  return text.replace(/^[\u2022*\u2013-]\s*/, "- ");
+}
+
+function filenameBase(fileName: string): string {
+  return fileName.replace(/\.pdf$/i, "");
+}
+
+async function pageToMarkdown(page: pdfjsLib.PDFPageProxy, options: PdfToMarkdownOptions): Promise<string> {
+  const content = await page.getTextContent({ includeMarkedContent: true });
+  const items = content.items
+    .filter((item): item is TextContentItem => {
+      if (!("str" in item) || typeof item.str !== "string" || item.str.trim().length === 0) return false;
+      if (!("transform" in item) || !Array.isArray(item.transform)) return false;
+      return "height" in item && "width" in item;
+    });
+  const fontSizes = items.map((item) => Number(item.height)).filter((height) => height > 0);
+  const medianSize = getMedian(fontSizes);
+  const viewport = page.getViewport({ scale: 1 });
+  const sorted = [...items].sort((a, b) => Number(b.transform[5]) - Number(a.transform[5]) || Number(a.transform[4]) - Number(b.transform[4]));
+  const lines: Line[] = [];
+
+  for (const item of sorted) {
+    const y = Number(item.transform[5]);
+    const x = Number(item.transform[4]);
+    const width = Math.max(0, Number(item.width) || 0);
+    const existing = lines.find((line) => Math.abs(line.y - y) <= Math.max(2, medianSize * 0.35));
+    if (existing) {
+      const gap = x - (existing.x + existing.width);
+      const separator = gap > medianSize * 1.8 ? "\t" : " ";
+      existing.text = `${existing.text}${separator}${item.str}`.replace(/ {2,}/g, " ").trim();
+      existing.height = Math.max(existing.height, Number(item.height));
+      existing.x = Math.min(existing.x, x);
+      existing.width = Math.max(existing.width, x + width - existing.x);
+    } else {
+      lines.push({ text: item.str.trim(), x, y, height: Number(item.height), width });
+    }
+  }
+
+  const leftColumn = lines.filter((line) => line.x < viewport.width * 0.55);
+  const rightColumn = lines.filter((line) => line.x >= viewport.width * 0.55);
+  const orderedLines =
+    leftColumn.length > 2 && rightColumn.length > 2
+      ? [...leftColumn.sort((a, b) => b.y - a.y), ...rightColumn.sort((a, b) => b.y - a.y)]
+      : lines;
+  const blocks: string[] = [];
+  let paragraph: string[] = [];
+  let lastIndent: number | null = null;
+  const tableRows: string[] = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length > 0) {
+      blocks.push(paragraph.join(" ").replace(/\s+/g, " ").trim());
+      paragraph = [];
+    }
+  };
+
+  const flushTable = () => {
+    if (tableRows.length === 0) return;
+    if (tableRows.length < 2) {
+      blocks.push(...tableRows.map((row) => row.replace(/\t/g, " ")));
+      tableRows.length = 0;
+      return;
+    }
+    const columnCount = Math.max(...tableRows.map((row) => row.split("\t").length));
+    const rows = tableRows.map((row) => {
+      const cells = row.split("\t").map((cell) => cell.trim());
+      while (cells.length < columnCount) cells.push("");
+      return `| ${cells.join(" | ")} |`;
+    });
+    blocks.push(rows[0], `| ${Array.from({ length: columnCount }, () => "---").join(" | ")} |`, ...rows.slice(1));
+    tableRows.length = 0;
+  };
+
+  for (const line of orderedLines) {
+    const text = line.text.trim();
+    if (!text) continue;
+    const isList = options.lists && (/^[\u2022*\u2013-]\s+/.test(text) || /^\d+\.\s+/.test(text));
+    const headingPrefix =
+      options.headings && line.height >= medianSize * 2.0
+        ? "# "
+        : options.headings && line.height >= medianSize * 1.5
+          ? "## "
+          : options.headings && line.height >= medianSize * 1.2
+            ? "### "
+            : "";
+
+    if (headingPrefix || isList) {
+      flushParagraph();
+      flushTable();
+      blocks.push(isList ? normalizeListLine(text) : `${headingPrefix}${text}`);
+      lastIndent = null;
+      continue;
+    }
+
+    if (text.includes("\t")) {
+      flushParagraph();
+      tableRows.push(text);
+      lastIndent = null;
+      continue;
+    }
+
+    flushTable();
+    if (lastIndent !== null && Math.abs(line.x - lastIndent) > 8) {
+      flushParagraph();
+    }
+    paragraph.push(text);
+    lastIndent = line.x;
+  }
+
+  flushParagraph();
+  flushTable();
+  return blocks.join("\n\n");
+}
+
+async function analyzePdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  let pdf: pdfjsLib.PDFDocumentProxy | null = null;
+  let firstPage: pdfjsLib.PDFPageProxy | null = null;
+  try {
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 20, message: "Reading PDF..." });
+    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(message.input.fileBytes), disableWorker: true }).promise;
+    assertActiveJob(message.jobId, activeJobId);
+    if (pdf.numPages < 1) throw new PdfPipelineWorkerError("Could not read any pages from this PDF.", "corrupted", true);
+
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "analyzing", percent: 60, message: "Checking selectable text..." });
+    firstPage = await pdf.getPage(1);
+    const content = await firstPage.getTextContent({ includeMarkedContent: true });
+    const textBased = content.items.some((item) => "str" in item && typeof item.str === "string" && item.str.trim().length > 0);
+    assertActiveJob(message.jobId, activeJobId);
+
+    postPipelineMessage({
+      type: "COMPLETE",
+      jobId: message.jobId,
+      output: {
+        kind: "pdf-to-markdown-analysis",
+        filename: message.input.fileName,
+        pageCount: pdf.numPages,
+        textBased,
+      },
+    });
+  } finally {
+    await firstPage?.cleanup();
+    await pdf?.cleanup?.();
+    await pdf?.destroy?.();
+  }
+}
+
+async function convertPdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  let pdf: pdfjsLib.PDFDocumentProxy | null = null;
+  const options = message.task.options;
+  try {
+    const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize);
+    if (memoryWarning) postPipelineMessage(memoryWarning);
+
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 10, message: "Loading PDF..." });
+    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(message.input.fileBytes), disableWorker: true }).promise;
+    assertActiveJob(message.jobId, activeJobId);
+    if (pdf.numPages < 1) throw new PdfPipelineWorkerError("Could not read any pages from this PDF.", "corrupted", true);
+
+    const startPage = Math.max(1, Math.min(options.startPage, pdf.numPages));
+    const endPage = Math.max(startPage, Math.min(options.endPage, pdf.numPages));
+    const totalPages = endPage - startPage + 1;
+    if (totalPages > 100) {
+      throw new PdfPipelineWorkerError("Document too large. Extraction is limited to 100 pages at a time.", "unsupported", true);
+    }
+
+    const pages: string[] = [];
+    let completed = 0;
+    for (let pageNum = startPage; pageNum <= endPage; pageNum += 1) {
+      assertActiveJob(message.jobId, activeJobId);
+      postPipelineMessage({
+        type: "PROGRESS",
+        jobId: message.jobId,
+        phase: "processing",
+        percent: Math.round(15 + (completed / totalPages) * 70),
+        message: `Extracting page ${pageNum} of ${endPage}...`,
+        page: { current: pageNum, total: endPage },
+        unitsDone: completed,
+        totalUnits: totalPages,
+      });
+
+      const page = await pdf.getPage(pageNum);
+      try {
+        pages.push(await pageToMarkdown(page, options));
+      } finally {
+        await page.cleanup();
+      }
+      completed += 1;
+    }
+
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "validating", percent: 90, message: "Validating Markdown..." });
+    let output = options.separators ? pages.join("\n\n---\n\n") : pages.join("\n\n");
+    if (options.cleanWhitespace) {
+      output = output.replace(/\n{3,}/g, "\n\n").trim();
+    }
+
+    const bytes = new TextEncoder().encode(output);
+    const contentUnits = pages.join("").replace(/\s+/g, "").length;
+    const validation: PdfPipelineValidation = {
+      minBytes: 1,
+      requireContent: true,
+      contentUnits,
+      contentDescription: "text",
+    };
+    validatePipelineOutput(bytes.byteLength, validation);
+    assertActiveJob(message.jobId, activeJobId);
+
+    postPipelineMessage({
+      type: "COMPLETE",
+      jobId: message.jobId,
+      output: {
+        kind: "text",
+        bytes,
+        filename: `${filenameBase(message.input.fileName)}.md`,
+        mimeType: "text/markdown",
+        byteLength: bytes.byteLength,
+        validation,
+      },
+    }, [bytes.buffer]);
+  } finally {
+    await pdf?.cleanup?.();
+    await pdf?.destroy?.();
+  }
+}
+
+self.onmessage = (event: MessageEvent<PdfPipelineRequest>) => {
+  const message = event.data;
+  if (message.type === "CANCEL") {
+    if (message.jobId === activeJobId) {
+      activeJobId = -1;
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+    }
+    return;
+  }
+
+  activeJobId = message.jobId;
+  const run = message.task.operation === "analyze" ? analyzePdf(message) : convertPdf(message);
+  run.catch((error: unknown) => {
+    if (message.jobId !== activeJobId && !(error instanceof PdfPipelineWorkerError && error.code === "cancelled")) return;
+    if (error instanceof PdfPipelineWorkerError && error.code === "cancelled") {
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+      return;
+    }
+    postPipelineMessage({
+      type: "ERROR",
+      jobId: message.jobId,
+      code: error instanceof PdfPipelineWorkerError ? error.code : "unknown",
+      message: error instanceof Error ? error.message : "Markdown conversion failed.",
+      recoverable: error instanceof PdfPipelineWorkerError ? error.recoverable : true,
+    });
+  });
+};
+</file>
+
+<file path="app/lib/pdfToWord.worker.ts">
+import * as pdfjsLib from "pdfjs-dist";
+import { Document, Packer, PageBreak, Paragraph, TextRun } from "docx";
+import type { PdfPipelineRequest, PdfPipelineValidation } from "./pdf-pipeline-protocol";
+import {
+  assertActiveJob,
+  buildMemoryWarning,
+  PdfPipelineWorkerError,
+  postPipelineMessage,
+  validatePipelineOutput,
+} from "./pdf-worker-utils";
+
+type TextItemLike = {
+  str: string;
+  transform: readonly number[];
+  height?: number;
+};
+
+type Line = {
+  text: string;
+  maxHeight: number;
+};
+
+let activeJobId = -1;
+
+function isTextItemLike(item: unknown): item is TextItemLike {
+  if (typeof item !== "object" || item === null) return false;
+  const candidate = item as { str?: unknown; transform?: unknown; height?: unknown };
+  return typeof candidate.str === "string" && Array.isArray(candidate.transform);
+}
+
+function convertedFilename(fileName: string): string {
+  const baseName = fileName.replace(/\.pdf$/i, "") || "document";
+  return `converted-${baseName}.docx`;
+}
+
+function createPdfTask(fileBytes: ArrayBuffer) {
+  const source = { data: new Uint8Array(fileBytes), disableWorker: true } as unknown as Parameters<typeof pdfjsLib.getDocument>[0];
+  return pdfjsLib.getDocument(source);
+}
+
+function extractLines(items: TextItemLike[]): Line[] {
+  const sorted = [...items].sort((a, b) => {
+    const yDiff = Number(b.transform[5]) - Number(a.transform[5]);
+    if (Math.abs(yDiff) > 3) return yDiff;
+    return Number(a.transform[4]) - Number(b.transform[4]);
+  });
+  const lines: Line[] = [];
+  let currentLine: Line | null = null;
+  let lastY = -Infinity;
+
+  for (const item of sorted) {
+    const y = Number(item.transform[5]);
+    if (currentLine === null || Math.abs(y - lastY) > 5) {
+      if (currentLine) lines.push(currentLine);
+      currentLine = { text: item.str, maxHeight: item.height ?? 12 };
+      lastY = y;
+    } else {
+      currentLine.text += `${item.str.startsWith(" ") ? "" : " "}${item.str}`;
+      currentLine.maxHeight = Math.max(currentLine.maxHeight, item.height ?? 12);
+    }
+  }
+
+  if (currentLine) lines.push(currentLine);
+  return lines;
+}
+
+async function analyzePdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  let pdfDoc: pdfjsLib.PDFDocumentProxy | null = null;
+  try {
+    const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize, 3);
+    if (memoryWarning) postPipelineMessage(memoryWarning);
+
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 30, message: "Reading PDF..." });
+    pdfDoc = await createPdfTask(message.input.fileBytes).promise;
+    assertActiveJob(message.jobId, activeJobId);
+
+    postPipelineMessage({
+      type: "COMPLETE",
+      jobId: message.jobId,
+      output: {
+        kind: "pdf-to-word-analysis",
+        filename: message.input.fileName,
+        pageCount: pdfDoc.numPages,
+      },
+    });
+  } finally {
+    await pdfDoc?.cleanup?.();
+    await pdfDoc?.destroy?.();
+  }
+}
+
+async function convertPdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  let pdfDoc: pdfjsLib.PDFDocumentProxy | null = null;
+  try {
+    const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize, 5);
+    if (memoryWarning) postPipelineMessage(memoryWarning);
+
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 8, message: "Loading PDF..." });
+    pdfDoc = await createPdfTask(message.input.fileBytes).promise;
+    assertActiveJob(message.jobId, activeJobId);
+
+    if (pdfDoc.numPages > 100) {
+      throw new PdfPipelineWorkerError("Document too large. Client-side text extraction is limited to 100 pages.", "unsupported", true);
+    }
+
+    const docChildren: Paragraph[] = [];
+    let extractedTextLength = 0;
+
+    for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum += 1) {
+      assertActiveJob(message.jobId, activeJobId);
+      postPipelineMessage({
+        type: "PROGRESS",
+        jobId: message.jobId,
+        phase: "processing",
+        percent: Math.round(10 + ((pageNum - 1) / pdfDoc.numPages) * 65),
+        message: `Extracting page ${pageNum} of ${pdfDoc.numPages}...`,
+        page: { current: pageNum, total: pdfDoc.numPages },
+        unitsDone: pageNum - 1,
+        totalUnits: pdfDoc.numPages,
+      });
+
+      const page = await pdfDoc.getPage(pageNum);
+      try {
+        const textContent = await page.getTextContent();
+        const textItems: TextItemLike[] = [];
+        for (const item of textContent.items) {
+          if (isTextItemLike(item)) {
+            textItems.push({ str: item.str, transform: item.transform, height: item.height });
+          }
+        }
+        const lines = extractLines(textItems);
+        for (const line of lines) {
+          const text = line.text.trim();
+          if (!text) continue;
+          extractedTextLength += text.replace(/\s+/g, "").length;
+          docChildren.push(new Paragraph({ children: [new TextRun({ text })] }));
+        }
+
+        if (pageNum < pdfDoc.numPages) {
+          docChildren.push(new Paragraph({ children: [new PageBreak()] }));
+        }
+      } finally {
+        await page.cleanup();
+      }
+    }
+
+    if (extractedTextLength === 0) {
+      throw new PdfPipelineWorkerError("No extractable text was found in this PDF.", "no-extractable-content", true);
+    }
+
+    postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "saving", percent: 82, message: "Generating Word document..." });
+    const doc = new Document({ sections: [{ children: docChildren }] });
+    const arrayBuffer = await Packer.toArrayBuffer(doc);
+    const outputBytes = new Uint8Array(arrayBuffer);
+    if (!outputBytes) {
+      throw new PdfPipelineWorkerError("Conversion produced no output.", "empty-output", true);
+    }
+
+    const validation: PdfPipelineValidation = {
+      minBytes: 500,
+      requireContent: true,
+      contentUnits: extractedTextLength,
+      contentDescription: "text",
+    };
+    validatePipelineOutput(outputBytes.byteLength, validation);
+    assertActiveJob(message.jobId, activeJobId);
+
+    postPipelineMessage({
+      type: "COMPLETE",
+      jobId: message.jobId,
+      output: {
+        kind: "file",
+        bytes: outputBytes,
+        filename: convertedFilename(message.input.fileName),
+        mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        byteLength: outputBytes.byteLength,
+        validation,
+      },
+    }, [outputBytes.buffer]);
+  } finally {
+    await pdfDoc?.cleanup?.();
+    await pdfDoc?.destroy?.();
+  }
+}
+
+self.onmessage = (event: MessageEvent<PdfPipelineRequest>) => {
+  const message = event.data;
+  if (message.type === "CANCEL") {
+    if (message.jobId === activeJobId) {
+      activeJobId = -1;
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+    }
+    return;
+  }
+
+  activeJobId = message.jobId;
+  const run = message.task.tool === "pdf-to-word" && message.task.operation === "analyze" ? analyzePdf(message) : convertPdf(message);
+  run.catch((error: unknown) => {
+    if (message.jobId !== activeJobId && !(error instanceof PdfPipelineWorkerError && error.code === "cancelled")) return;
+    if (error instanceof PdfPipelineWorkerError && error.code === "cancelled") {
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+      return;
+    }
+    postPipelineMessage({
+      type: "ERROR",
+      jobId: message.jobId,
+      code: error instanceof PdfPipelineWorkerError ? error.code : "unknown",
+      message: error instanceof Error ? error.message : "PDF to Word conversion failed.",
+      recoverable: error instanceof PdfPipelineWorkerError ? error.recoverable : true,
+    });
+  });
+};
+</file>
+
+<file path="app/lib/redactPdf.worker.ts">
+// ---------------------------------------------------------------------------
+// Redact PDF Worker
+// ---------------------------------------------------------------------------
+// Runs the heavy render loop off the main thread.
+//
+// HONESTY NOTE: This tool paints black/white rectangles over rendered page
+// images. It does NOT remove underlying text from the PDF content stream.
+// The output is NOT forensic-grade or legally admissible redaction.
+// ---------------------------------------------------------------------------
+
+import { PDFDocument } from "pdf-lib";
+import type {
+  RedactInboundMessage,
+  RedactOutboundMessage,
+  RedactPageTask,
+} from "./redact-worker-protocol";
+
+// ─── State ─────────────────────────────────────────────────────────────────
+
+let activeJobId = -1;
+
+// ─── Post helper ───────────────────────────────────────────────────────────
+
+function post(msg: RedactOutboundMessage, transfer: Transferable[] = []): void {
+  self.postMessage(msg, { transfer });
+}
+
+// ─── Cancellation guard ────────────────────────────────────────────────────
+
+function assertActive(jobId: number): void {
+  if (jobId !== activeJobId) {
+    throw new Error("cancelled");
+  }
+}
+
+// ─── Page render helper (OffscreenCanvas) ──────────────────────────────────
+
+async function renderPageToJpeg(
+  pdfBytes: ArrayBuffer,
+  pageIndex: number,
+  task: RedactPageTask,
+  redactionStyle: "black" | "white",
+  showLabel: boolean,
+): Promise<Uint8Array> {
+  // Dynamic import of pdfjs-dist inside the worker.
+  // The workerSrc is NOT used inside a worker (pdfjs has its own internal
+  // worker handling); we disable it to avoid a nested-worker error.
+  const pdfjs = await import("pdfjs-dist");
+  // Disable pdfjs's own worker when already inside a worker.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (pdfjs as any).GlobalWorkerOptions.workerSrc = "";
+
+  const loadingTask = pdfjs.getDocument({ data: pdfBytes.slice(0) });
+  const doc = await loadingTask.promise;
+  try {
+    const page = await doc.getPage(pageIndex + 1);
+    const viewport = page.getViewport({ scale: 2.0 });
+
+    // OffscreenCanvas is available in workers.
+    const canvas = new OffscreenCanvas(
+      Math.ceil(viewport.width),
+      Math.ceil(viewport.height),
+    );
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable.");
+
+    ctx.fillStyle = "#FFFFFF";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // pdfjs render – canvasContext must be the 2d context.
+    await page.render({ canvasContext: ctx as unknown as CanvasRenderingContext2D, viewport }).promise;
+
+    // Paint redaction boxes.
+    for (const box of task.boxes) {
+      const px = box.xPct * canvas.width;
+      const py = box.yPct * canvas.height;
+      const pw = box.wPct * canvas.width;
+      const ph = box.hPct * canvas.height;
+      ctx.fillStyle = redactionStyle === "black" ? "#000000" : "#FFFFFF";
+      ctx.fillRect(px, py, pw, ph);
+      if (redactionStyle === "white") {
+        ctx.strokeStyle = "#9CA3AF";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px, py, pw, ph);
+      }
+      if (showLabel) {
+        ctx.fillStyle = redactionStyle === "black" ? "#FFFFFF" : "#6B7280";
+        ctx.font = `bold ${Math.max(10, ph * 0.25)}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("REDACTED", px + pw / 2, py + ph / 2);
+      }
+    }
+
+    // Export as JPEG blob then convert to Uint8Array.
+    const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.92 });
+    const arrayBuffer = await blob.arrayBuffer();
+    return new Uint8Array(arrayBuffer);
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// ─── Main handler ──────────────────────────────────────────────────────────
+
+async function handleRedact(
+  jobId: number,
+  fileBytes: ArrayBuffer,
+  fileName: string,
+  pageTasks: RedactPageTask[],
+  totalPages: number,
+  redactionStyle: "black" | "white",
+  showLabel: boolean,
+): Promise<void> {
+  // Memory warning: redacted pages are rendered at 2× scale; budget ~6 × file.
+  const estimatedBytes = fileBytes.byteLength * 6;
+  // @ts-ignore – performance.memory is Chrome-only but fine inside worker
+  const heapLimit: number | undefined = (performance as any)?.memory?.jsHeapSizeLimit;
+  // @ts-ignore
+  const heapUsed: number | undefined = (performance as any)?.memory?.usedJSHeapSize;
+  if (
+    heapLimit !== undefined &&
+    heapUsed !== undefined &&
+    estimatedBytes > (heapLimit - heapUsed) * 0.7
+  ) {
+    post({
+      type: "REDACT_ERROR",
+      jobId,
+      message:
+        "Estimated memory usage exceeds available heap. Try a smaller PDF or close other tabs.",
+    });
+    return;
+  }
+
+  post({
+    type: "REDACT_PROGRESS",
+    jobId,
+    percent: 5,
+    message: "Loading PDF…",
+    processingPage: 0,
+    pageStatus: "copying",
+  });
+
+  const srcDoc = await PDFDocument.load(new Uint8Array(fileBytes), {
+    ignoreEncryption: true,
+  });
+  assertActive(jobId);
+
+  const newDoc = await PDFDocument.create();
+  assertActive(jobId);
+
+  // Build a fast lookup: pageIndex → task
+  const taskMap = new Map<number, RedactPageTask>();
+  for (const task of pageTasks) {
+    taskMap.set(task.pageIndex, task);
+  }
+
+  let redactedPageCount = 0;
+
+  for (let i = 0; i < totalPages; i++) {
+    assertActive(jobId);
+
+    const task = taskMap.get(i);
+    const percent = Math.round(5 + ((i / totalPages) * 85));
+
+    if (!task || task.boxes.length === 0) {
+      // No redactions on this page — copy it unchanged.
+      post({
+        type: "REDACT_PROGRESS",
+        jobId,
+        percent,
+        message: `Copying page ${i + 1} of ${totalPages}…`,
+        processingPage: i,
+        pageStatus: "copying",
+      });
+
+      const [copiedPage] = await newDoc.copyPages(srcDoc, [i]);
+      newDoc.addPage(copiedPage);
+
+      post({ type: "REDACT_PAGE_DONE", jobId, pageIndex: i, status: "copied" });
+    } else {
+      // Render, paint boxes, embed as JPEG.
+      post({
+        type: "REDACT_PROGRESS",
+        jobId,
+        percent,
+        message: `Redacting page ${i + 1} of ${totalPages}…`,
+        processingPage: i,
+        pageStatus: "redacting",
+      });
+
+      const jpegBytes = await renderPageToJpeg(
+        fileBytes,
+        i,
+        task,
+        redactionStyle,
+        showLabel,
+      );
+      assertActive(jobId);
+
+      const jpgImage = await newDoc.embedJpg(jpegBytes);
+      const origPage = srcDoc.getPage(i);
+      const { width: pdfW, height: pdfH } = origPage.getSize();
+      const newPage = newDoc.addPage([pdfW, pdfH]);
+      newPage.drawImage(jpgImage, { x: 0, y: 0, width: pdfW, height: pdfH });
+
+      redactedPageCount += 1;
+      post({ type: "REDACT_PAGE_DONE", jobId, pageIndex: i, status: "redacted" });
+    }
+
+    assertActive(jobId);
+  }
+
+  post({
+    type: "REDACT_PROGRESS",
+    jobId,
+    percent: 92,
+    message: "Saving redacted PDF…",
+    processingPage: totalPages - 1,
+    pageStatus: "redacting",
+  });
+
+  const outputBytes = await newDoc.save();
+  assertActive(jobId);
+
+  // ─── Output validation ────────────────────────────────────────────────
+  if (!outputBytes || outputBytes.byteLength < 500) {
+    post({
+      type: "REDACT_ERROR",
+      jobId,
+      message: "Output validation failed: produced empty or corrupt PDF.",
+    });
+    return;
+  }
+  if (redactedPageCount === 0 && pageTasks.length > 0) {
+    post({
+      type: "REDACT_ERROR",
+      jobId,
+      message: "Output validation failed: zero pages were redacted despite having redaction boxes.",
+    });
+    return;
+  }
+
+  post(
+    {
+      type: "REDACT_COMPLETE",
+      jobId,
+      bytes: outputBytes,
+      byteLength: outputBytes.byteLength,
+      redactedPageCount,
+      totalPageCount: totalPages,
+    },
+    [outputBytes.buffer],
+  );
+}
+
+// ─── Message listener ──────────────────────────────────────────────────────
+
+self.onmessage = (event: MessageEvent<RedactInboundMessage>) => {
+  const msg = event.data;
+
+  if (msg.type === "REDACT_CANCEL") {
+    if (msg.jobId === activeJobId) {
+      activeJobId = -1;
+      post({ type: "REDACT_CANCELLED", jobId: msg.jobId });
+    }
+    return;
+  }
+
+  if (msg.type === "REDACT_START") {
+    activeJobId = msg.jobId;
+
+    handleRedact(
+      msg.jobId,
+      msg.fileBytes,
+      msg.fileName,
+      msg.pageTasks,
+      msg.totalPages,
+      msg.redactionStyle,
+      msg.showLabel,
+    ).catch((err: unknown) => {
+      // Discard if this job was superseded.
+      if (msg.jobId !== activeJobId) return;
+
+      const message = err instanceof Error ? err.message : "Unknown error";
+      if (message === "cancelled") {
+        post({ type: "REDACT_CANCELLED", jobId: msg.jobId });
+        return;
+      }
+      post({ type: "REDACT_ERROR", jobId: msg.jobId, message });
+    });
+  }
+};
+</file>
+
+<file path="app/lib/resizePdf.worker.ts">
+import { PDFDocument } from "pdf-lib";
+import type { PdfPipelineRequest, PdfPipelineValidation } from "./pdf-pipeline-protocol";
+import { resizePdf } from "./pdf-resize";
+import {
+  assertActiveJob,
+  buildMemoryWarning,
+  PdfPipelineWorkerError,
+  postPipelineMessage,
+  validatePipelineOutput,
+} from "./pdf-worker-utils";
+
+let activeJobId = -1;
+
+function resizedFilename(fileName: string): string {
+  const base = fileName.replace(/\.pdf$/i, "") || "document";
+  return `resized-${base}.pdf`;
+}
+
+async function convertPdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  if (message.task.tool !== "resize-pdf") {
+    throw new PdfPipelineWorkerError("Unsupported resize task.", "unsupported", true);
+  }
+
+  const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize, 5);
+  if (memoryWarning) postPipelineMessage(memoryWarning);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 10, message: "Loading PDF..." });
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "processing", percent: 45, message: "Resizing pages..." });
+  const outputBytes = await resizePdf({
+    pdfBytes: message.input.fileBytes,
+    ...message.task.options,
+  });
+  if (!outputBytes) {
+    throw new PdfPipelineWorkerError("Resize produced no output.", "empty-output", true);
+  }
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "validating", percent: 85, message: "Validating resized PDF..." });
+  let outputPageCount = 0;
+  try {
+    const outputDoc = await PDFDocument.load(outputBytes, { ignoreEncryption: true });
+    outputPageCount = outputDoc.getPageCount();
+  } catch {
+    throw new PdfPipelineWorkerError("Resize produced an unreadable PDF.", "corrupted", true);
+  }
+
+  const validation: PdfPipelineValidation = {
+    minBytes: 500,
+    requireContent: true,
+    contentUnits: outputPageCount,
+    contentDescription: "pages",
+  };
+  validatePipelineOutput(outputBytes.byteLength, validation);
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({
+    type: "COMPLETE",
+    jobId: message.jobId,
+    output: {
+      kind: "file",
+      bytes: outputBytes,
+      filename: resizedFilename(message.input.fileName),
+      mimeType: "application/pdf",
+      byteLength: outputBytes.byteLength,
+      validation,
+    },
+  }, [outputBytes.buffer]);
+}
+
+self.onmessage = (event: MessageEvent<PdfPipelineRequest>) => {
+  const message = event.data;
+  if (message.type === "CANCEL") {
+    if (message.jobId === activeJobId) {
+      activeJobId = -1;
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+    }
+    return;
+  }
+
+  activeJobId = message.jobId;
+  convertPdf(message).catch((error: unknown) => {
+    if (message.jobId !== activeJobId && !(error instanceof PdfPipelineWorkerError && error.code === "cancelled")) return;
+    if (error instanceof PdfPipelineWorkerError && error.code === "cancelled") {
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+      return;
+    }
+    postPipelineMessage({
+      type: "ERROR",
+      jobId: message.jobId,
+      code: error instanceof PdfPipelineWorkerError ? error.code : "unknown",
+      message: error instanceof Error ? error.message : "Resize failed.",
+      recoverable: error instanceof PdfPipelineWorkerError ? error.recoverable : true,
+    });
+  });
+};
+</file>
+
+<file path="app/lib/thumbnailRenderer.worker.ts">
+// ---------------------------------------------------------------------------
+// Thumbnail Renderer Worker
+// Used ONLY for thumbnail generation in Organize PDF and Rotate PDF.
+// Does NOT touch PDF conversion logic.
+// ---------------------------------------------------------------------------
+//
+// Design:
+// - Uses OffscreenCanvas where supported.
+// - Falls back gracefully: sends bitmap: null so the caller can handle it.
+// - Cancellation is per-jobId.
+// - PDF.js documents are destroyed after each render to free memory.
+// - Page references are cleaned up immediately after rendering.
+// ---------------------------------------------------------------------------
+
+import type {
+  ThumbnailInboundMessage,
+  ThumbnailOutboundMessage,
+  ThumbnailRenderRequest,
+} from "./thumbnail-worker-protocol";
+
+// ─── State ─────────────────────────────────────────────────────────────────
+
+/** Set of jobIds that have been cancelled. */
+const cancelledJobs = new Set<number>();
+/** True if OffscreenCanvas is available in this worker context. */
+const supportsOffscreenCanvas = typeof OffscreenCanvas !== "undefined";
+
+// ─── Post helper ───────────────────────────────────────────────────────────
+
+function post(msg: ThumbnailOutboundMessage, transfer: Transferable[] = []): void {
+  self.postMessage(msg, { transfer });
+}
+
+// ─── Core render function ──────────────────────────────────────────────────
+
+async function renderThumbnail(req: ThumbnailRenderRequest): Promise<void> {
+  const { jobId, requestId, pageIndex, fileBytes, targetWidth, extraRotation = 0 } = req;
+
+  // Lazy-load pdfjs. Disable its own worker (we are already in a worker).
+  const pdfjs = await import("pdfjs-dist");
+  // @ts-ignore
+  pdfjs.GlobalWorkerOptions.workerSrc = "";
+
+  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(fileBytes) });
+  let pdfDoc: import("pdfjs-dist").PDFDocumentProxy | null = null;
+
+  try {
+    pdfDoc = await loadingTask.promise;
+
+    // Check cancellation after async boundary.
+    if (cancelledJobs.has(jobId)) {
+      post({ type: "THUMBNAIL_ERROR", jobId, requestId, pageIndex, message: "cancelled" });
+      return;
+    }
+
+    const pdfPage = await pdfDoc.getPage(pageIndex + 1);
+
+    try {
+      const viewport1 = pdfPage.getViewport({ scale: 1 });
+      const scale = targetWidth / viewport1.width;
+      const viewport = pdfPage.getViewport({ scale, rotation: viewport1.rotation + extraRotation });
+      const w = Math.ceil(viewport.width);
+      const h = Math.ceil(viewport.height);
+
+      if (cancelledJobs.has(jobId)) {
+        post({ type: "THUMBNAIL_ERROR", jobId, requestId, pageIndex, message: "cancelled" });
+        return;
+      }
+
+      if (!supportsOffscreenCanvas) {
+        // Fallback: cannot render without OffscreenCanvas in a worker.
+        // Signal the main thread to handle its own rendering.
+        post({ type: "THUMBNAIL_RESULT", jobId, requestId, pageIndex, bitmap: null, width: w, height: h });
+        return;
+      }
+
+      const canvas = new OffscreenCanvas(w, h);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        post({ type: "THUMBNAIL_RESULT", jobId, requestId, pageIndex, bitmap: null, width: w, height: h });
+        return;
+      }
+
+      // White background.
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, w, h);
+
+      const renderTask = pdfPage.render({
+        canvasContext: ctx as unknown as CanvasRenderingContext2D,
+        viewport,
+      });
+
+      await renderTask.promise;
+
+      if (cancelledJobs.has(jobId)) {
+        renderTask.cancel?.();
+        post({ type: "THUMBNAIL_ERROR", jobId, requestId, pageIndex, message: "cancelled" });
+        return;
+      }
+
+      // Transfer the ImageBitmap to avoid a copy.
+      const bitmap = await createImageBitmap(canvas);
+      post(
+        { type: "THUMBNAIL_RESULT", jobId, requestId, pageIndex, bitmap, width: w, height: h },
+        [bitmap],
+      );
+    } finally {
+      // Always release the page reference.
+      pdfPage.cleanup();
+    }
+  } catch (err) {
+    const isCancelled = cancelledJobs.has(jobId);
+    const message = isCancelled ? "cancelled" : err instanceof Error ? err.message : "render failed";
+    post({ type: "THUMBNAIL_ERROR", jobId, requestId, pageIndex, message });
+  } finally {
+    // Always destroy the pdfjs document to free memory.
+    if (pdfDoc) {
+      await pdfDoc.destroy();
+    }
+  }
+}
+
+// ─── Message listener ──────────────────────────────────────────────────────
+
+self.onmessage = (event: MessageEvent<ThumbnailInboundMessage>) => {
+  const msg = event.data;
+
+  switch (msg.type) {
+    case "THUMBNAIL_CANCEL":
+      cancelledJobs.add(msg.jobId);
+      // Clean up cancelled jobs after a brief delay to avoid memory growth.
+      setTimeout(() => cancelledJobs.delete(msg.jobId), 5000);
+      break;
+
+    case "THUMBNAIL_CANCEL_ALL":
+      cancelledJobs.clear();
+      break;
+
+    case "THUMBNAIL_RENDER":
+      // Fire and forget — each render is independent.
+      renderThumbnail(msg).catch(() => {
+        // renderThumbnail always posts its own error; this is a safety net.
+      });
+      break;
+  }
+};
+</file>
+
+<file path="app/lib/wordToPdf.worker.ts">
+import mammoth from "mammoth";
+import { PDFDocument, StandardFonts, rgb, type PDFFont, type PDFPage, type RGB } from "pdf-lib";
+import type { PdfPipelineRequest, PdfPipelineValidation, WordToPdfOptions } from "./pdf-pipeline-protocol";
+import {
+  assertActiveJob,
+  buildMemoryWarning,
+  PdfPipelineWorkerError,
+  postPipelineMessage,
+  validatePipelineOutput,
+} from "./pdf-worker-utils";
+
+type PageSize = WordToPdfOptions["pageSize"];
+type FontScale = WordToPdfOptions["fontScale"];
+type MarginSize = WordToPdfOptions["marginSize"];
+
+const PAGE_SIZES: Record<PageSize, { width: number; height: number }> = {
+  A4: { width: 595, height: 842 },
+  Letter: { width: 612, height: 792 },
+  Legal: { width: 612, height: 1008 },
+};
+
+const FONT_SCALES: Record<FontScale, number> = {
+  small: 10,
+  medium: 12,
+  large: 14,
+};
+
+const MARGINS: Record<MarginSize, number> = {
+  narrow: 30,
+  normal: 50,
+  wide: 72,
+};
+
+let activeJobId = -1;
+
+function convertedFilename(fileName: string): string {
+  const baseName = fileName.replace(/\.docx$/i, "") || "document";
+  return `converted-${baseName}.pdf`;
+}
+
+function decodeDataImage(src: string): { mimeType: string; bytes: Uint8Array } | null {
+  const match = /^data:(image\/(?:png|jpeg|jpg));base64,(.+)$/i.exec(src);
+  if (!match) return null;
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return { mimeType: match[1], bytes };
+}
+
+async function convertPdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
+  if (message.task.tool !== "word-to-pdf") {
+    throw new PdfPipelineWorkerError("Unsupported Word to PDF task.", "unsupported", true);
+  }
+  if (typeof DOMParser === "undefined") {
+    throw new PdfPipelineWorkerError("This browser cannot parse Word content inside a worker.", "unsupported", true);
+  }
+
+  const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize, 5);
+  if (memoryWarning) postPipelineMessage(memoryWarning);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 10, message: "Reading Word document..." });
+  const { value: html } = await mammoth.convertToHtml(
+    { arrayBuffer: message.input.fileBytes },
+    { convertImage: mammoth.images.dataUri },
+  );
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "processing", percent: 35, message: "Building PDF..." });
+  const parser = new DOMParser();
+  const dom = parser.parseFromString(html, "text/html");
+  const body = dom.body;
+  const sourceContentUnits = (body.textContent ?? "").replace(/\s+/g, "").length + body.querySelectorAll("img").length;
+  if (sourceContentUnits === 0) {
+    throw new PdfPipelineWorkerError("No extractable content was found in this Word document.", "no-extractable-content", true);
+  }
+
+  const pdfDoc = await PDFDocument.create();
+  const { width, height } = PAGE_SIZES[message.task.options.pageSize];
+  const margin = MARGINS[message.task.options.marginSize];
+  const baseSize = FONT_SCALES[message.task.options.fontScale];
+  const contentWidth = width - margin * 2;
+  const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  let page: PDFPage = pdfDoc.addPage([width, height]);
+  let y = height - margin;
+  let renderedContentUnits = 0;
+
+  const addPage = () => {
+    page = pdfDoc.addPage([width, height]);
+    y = height - margin;
+  };
+
+  const ensureSpace = (needed: number) => {
+    if (y - needed < margin) addPage();
+  };
+
+  const drawText = (text: string, font: PDFFont, size: number, color: RGB = rgb(0, 0, 0), x = margin, maxWidth = contentWidth) => {
+    const trimmed = text.replace(/\s+/g, " ").trim();
+    if (!trimmed) return;
+
+    const words = trimmed.split(" ");
+    let line = "";
+    const lines: string[] = [];
+    for (const word of words) {
+      const testLine = line ? `${line} ${word}` : word;
+      const lineWidth = font.widthOfTextAtSize(testLine, size);
+      if (lineWidth > maxWidth && line) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = testLine;
+      }
+    }
+    if (line) lines.push(line);
+
+    for (const item of lines) {
+      ensureSpace(size + 4);
+      page.drawText(item, { x, y, size, font, color });
+      renderedContentUnits += item.replace(/\s+/g, "").length;
+      y -= size + 4;
+    }
+  };
+
+  const drawImage = async (src: string) => {
+    const imageData = decodeDataImage(src);
+    if (!imageData) return;
+    const image = imageData.mimeType.includes("png") ? await pdfDoc.embedPng(imageData.bytes) : await pdfDoc.embedJpg(imageData.bytes);
+    const scale = Math.min(contentWidth / image.width, (height - margin * 2) / image.height, 1);
+    const imageWidth = image.width * scale;
+    const imageHeight = image.height * scale;
+    ensureSpace(imageHeight + 8);
+    page.drawImage(image, { x: margin, y: y - imageHeight, width: imageWidth, height: imageHeight });
+    renderedContentUnits += 1;
+    y -= imageHeight + 8;
+  };
+
+  const drawElement = async (node: Element): Promise<void> => {
+    const tag = node.tagName.toLowerCase();
+    const text = (node.textContent ?? "").replace(/\s+/g, " ").trim();
+    const style = node.getAttribute("style") ?? "";
+    if (/page-break-before:\s*always|break-before:\s*page/i.test(style)) addPage();
+
+    if (tag === "h1") {
+      ensureSpace(baseSize * 2 + 8);
+      y -= 6;
+      drawText(text, boldFont, baseSize * 1.7, rgb(0.05, 0.05, 0.05));
+      y -= 4;
+    } else if (tag === "h2") {
+      ensureSpace(baseSize * 1.5 + 8);
+      y -= 4;
+      drawText(text, boldFont, baseSize * 1.4, rgb(0.1, 0.1, 0.1));
+      y -= 3;
+    } else if (tag === "h3") {
+      drawText(text, boldFont, baseSize * 1.2);
+      y -= 2;
+    } else if (tag === "p") {
+      drawText(text, regularFont, baseSize);
+      y -= 3;
+    } else if (tag === "ul" || tag === "ol") {
+      Array.from(node.children)
+        .filter((child) => child.tagName.toLowerCase() === "li")
+        .forEach((li, index) => {
+          const prefix = tag === "ol" ? `${index + 1}. ` : "- ";
+          drawText(`${prefix}${li.textContent ?? ""}`, regularFont, baseSize, rgb(0, 0, 0), margin + 12, contentWidth - 12);
+          y -= 1;
+        });
+      y -= 2;
+    } else if (tag === "table") {
+      const rows = Array.from(node.querySelectorAll("tr"));
+      for (const row of rows) {
+        const cells = Array.from(row.children).filter((cell) => ["td", "th"].includes(cell.tagName.toLowerCase()));
+        const cellWidth = contentWidth / Math.max(1, cells.length);
+        ensureSpace(baseSize + 8);
+        cells.forEach((cell, index) => {
+          const cellFont = cell.tagName.toLowerCase() === "th" ? boldFont : regularFont;
+          drawText((cell.textContent ?? "").replace(/\s+/g, " ").trim(), cellFont, baseSize - 1, rgb(0, 0, 0), margin + index * cellWidth, cellWidth - 6);
+        });
+        y -= 2;
+      }
+      y -= 4;
+    } else if (tag === "img") {
+      await drawImage(node.getAttribute("src") ?? "");
+    } else if (text) {
+      drawText(text, regularFont, baseSize);
+    }
+
+    if (/page-break-after:\s*always|break-after:\s*page/i.test(style)) addPage();
+  };
+
+  const nodes = Array.from(body.childNodes);
+  for (let index = 0; index < nodes.length; index += 1) {
+    assertActiveJob(message.jobId, activeJobId);
+    if (index % 10 === 0) {
+      postPipelineMessage({
+        type: "PROGRESS",
+        jobId: message.jobId,
+        phase: "processing",
+        percent: Math.round(35 + (index / Math.max(1, nodes.length)) * 45),
+        message: "Rendering Word content...",
+        unitsDone: index,
+        totalUnits: nodes.length,
+      });
+    }
+    const node = nodes[index];
+    if (node.nodeType !== 1) continue;
+    await drawElement(node as Element);
+  }
+
+  postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "saving", percent: 85, message: "Saving PDF..." });
+  if (renderedContentUnits === 0) {
+    throw new PdfPipelineWorkerError("No renderable Word content was found.", "no-extractable-content", true);
+  }
+  if (pdfDoc.getPageCount() === 0) {
+    throw new PdfPipelineWorkerError("Conversion produced an empty PDF.", "empty-output", true);
+  }
+  const outputBytes = await pdfDoc.save();
+  if (!outputBytes) {
+    throw new PdfPipelineWorkerError("Conversion produced no output.", "empty-output", true);
+  }
+
+  const validation: PdfPipelineValidation = {
+    minBytes: 500,
+    requireContent: true,
+    contentUnits: renderedContentUnits,
+    contentDescription: "document-blocks",
+  };
+  validatePipelineOutput(outputBytes.byteLength, validation);
+  assertActiveJob(message.jobId, activeJobId);
+
+  postPipelineMessage({
+    type: "COMPLETE",
+    jobId: message.jobId,
+    output: {
+      kind: "file",
+      bytes: outputBytes,
+      filename: convertedFilename(message.input.fileName),
+      mimeType: "application/pdf",
+      byteLength: outputBytes.byteLength,
+      validation,
+    },
+  }, [outputBytes.buffer]);
+}
+
+self.onmessage = (event: MessageEvent<PdfPipelineRequest>) => {
+  const message = event.data;
+  if (message.type === "CANCEL") {
+    if (message.jobId === activeJobId) {
+      activeJobId = -1;
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+    }
+    return;
+  }
+
+  activeJobId = message.jobId;
+  convertPdf(message).catch((error: unknown) => {
+    if (message.jobId !== activeJobId && !(error instanceof PdfPipelineWorkerError && error.code === "cancelled")) return;
+    if (error instanceof PdfPipelineWorkerError && error.code === "cancelled") {
+      postPipelineMessage({ type: "CANCELLED", jobId: message.jobId });
+      return;
+    }
+    postPipelineMessage({
+      type: "ERROR",
+      jobId: message.jobId,
+      code: error instanceof PdfPipelineWorkerError ? error.code : "unknown",
+      message: error instanceof Error ? error.message : "Word to PDF conversion failed.",
+      recoverable: error instanceof PdfPipelineWorkerError ? error.recoverable : true,
+    });
+  });
+};
+</file>
+
+<file path="app/hooks/use-motion-enabled.ts">
+"use client";
+
+import { useEffect, useState } from "react";
+
+export function useMotionEnabled() {
+  const [motionEnabled, setMotionEnabled] = useState(false);
+
+  useEffect(() => {
+    const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const isMobile = window.innerWidth < 768;
+    const enabled = !prefersReduced && !isMobile;
+    setMotionEnabled(enabled);
+    if (!enabled) {
+      document.documentElement.classList.add("no-motion");
+    }
+  }, []);
+
+  return motionEnabled;
+}
+</file>
+
+<file path="app/hooks/useMergeWorker.ts">
+"use client";
+
+/**
+ * useMergeWorker.ts
+ *
+ * React hook that manages the full lifecycle of the pdfMerge.worker.
+ *
+ * Lifecycle contract
+ * ──────────────────
+ * • The worker is created fresh on every merge() call — no reuse.
+ * • On completion (COMPLETE / ERROR): the worker is terminated and the ref nulled.
+ * • On cancel(): worker.terminate() is called immediately. No message is sent
+ *   to the worker first — terminate() is instantaneous and correct for a
+ *   stateless, single-use worker.
+ * • On component unmount: any running worker is force-terminated.
+ *   This prevents zombie workers if the user navigates away mid-merge.
+ *
+ * State shape
+ * ───────────
+ * MergeWorkerState is the single object the UI thread reads. It includes
+ * every field needed to render progress, errors, and the download trigger.
+ *
+ * TypeScript
+ * ──────────
+ * All message handling is fully typed through WorkerOutboundMessage.
+ * There are no `as any` casts in this file.
+ */
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  MergeFileDescriptor,
+  WorkerOutboundMessage,
+  FileStage,
+} from "../lib/merge-worker-protocol";
+
+// ─── Public state types ───────────────────────────────────────────────────────
+
+export type MergePhase =
+  | "idle"
+  | "merging"
+  | "saving"
+  | "done"
+  | "error"
+  | "cancelled";
+
+/** Granular progress for the file currently being processed. */
+export interface CurrentFileProgress {
+  fileId: string;
+  fileName: string;
+  /** 1-based position in the queue. */
+  fileIndex: number;
+  totalFiles: number;
+  stage: FileStage;
+  pagesDone: number;
+  totalPages: number;
+}
+
+/** A file that was skipped during the merge due to a per-file error. */
+export interface SkippedFile {
+  fileId: string;
+  fileName: string;
+  reason: "encrypted" | "corrupted" | "empty";
+}
+
+export interface MergeWorkerState {
+  phase: MergePhase;
+  /** How many files have been fully processed (including skipped). */
+  completedFiles: number;
+  totalFiles: number;
+  /** Progress for the file currently under processing. null when idle/done. */
+  currentFile: CurrentFileProgress | null;
+  /** Set when phase === "done". The Uint8Array holding the merged PDF bytes. */
+  resultBytes: Uint8Array | null;
+  /** Set when phase === "error". */
+  errorMessage: string | null;
+  /** Files skipped due to encryption, corruption, or being empty. */
+  skippedFiles: SkippedFile[];
+  /** Set when estimated peak memory exceeds the safe threshold. */
+  memoryWarning: { estimatedBytes: number; availableBytes: number | null } | null;
+}
+
+export interface UseMergeWorkerReturn {
+  state: MergeWorkerState;
+  /** Start a merge. Throws if a merge is already in progress. */
+  merge: (files: MergeFileDescriptor[]) => void;
+  /** Cancel an in-progress merge. No-op if idle. */
+  cancel: () => void;
+  /** Reset state back to idle (e.g. to allow merging again). */
+  reset: () => void;
+}
+
+// ─── Initial state ────────────────────────────────────────────────────────────
+
+const INITIAL_STATE: MergeWorkerState = {
+  phase: "idle",
+  completedFiles: 0,
+  totalFiles: 0,
+  currentFile: null,
+  resultBytes: null,
+  errorMessage: null,
+  skippedFiles: [],
+  memoryWarning: null,
+};
+
+// ─── Hook ─────────────────────────────────────────────────────────────────────
+
+export function useMergeWorker(): UseMergeWorkerReturn {
+  const [state, setState] = useState<MergeWorkerState>(INITIAL_STATE);
+
+  /**
+   * Holds the active Worker instance.
+   * We use a ref (not state) because mutating it must never trigger a
+   * re-render — only the state changes should do that.
+   */
+  const workerRef = useRef<Worker | null>(null);
+
+  // ── Unmount guard ──────────────────────────────────────────────────────────
+  // Terminates a running worker when the component unmounts (e.g. navigation).
+  // This is the single place that prevents zombie workers.
+  useEffect(() => {
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
+
+  // ── Worker teardown helper ─────────────────────────────────────────────────
+  const teardownWorker = useCallback(() => {
+    if (workerRef.current) {
+      workerRef.current.terminate();
+      workerRef.current = null;
+    }
+  }, []);
+
+  // ── Message handler ────────────────────────────────────────────────────────
+  /**
+   * Processes every outbound message from the worker.
+   * Because we create a fresh worker per merge, there is no risk of
+   * stale closures — the handler is bound at creation time.
+   */
+  const buildMessageHandler = useCallback(
+    () => (event: MessageEvent<WorkerOutboundMessage>) => {
+      const msg = event.data;
+
+      switch (msg.type) {
+        case "FILE_STARTED": {
+          setState((prev) => ({
+            ...prev,
+            totalFiles: msg.totalFiles,
+            currentFile: {
+              fileId: msg.fileId,
+              fileName: msg.fileName,
+              fileIndex: msg.fileIndex,
+              totalFiles: msg.totalFiles,
+              stage: "loading",
+              pagesDone: 0,
+              totalPages: 0,
+            },
+          }));
+          break;
+        }
+
+        case "PROGRESS_UPDATE": {
+          setState((prev) => {
+            // Guard: ignore stale messages if phase has already moved on
+            if (prev.phase !== "merging") return prev;
+            return {
+              ...prev,
+              currentFile: prev.currentFile
+                ? {
+                    ...prev.currentFile,
+                    stage: msg.stage as FileStage,
+                    pagesDone: msg.pagesDone,
+                    totalPages: msg.totalPages,
+                  }
+                : prev.currentFile,
+            };
+          });
+          break;
+        }
+
+        case "FILE_COMPLETED": {
+          setState((prev) => ({
+            ...prev,
+            completedFiles: msg.fileIndex,
+          }));
+          break;
+        }
+
+        case "PIPELINE_STAGE": {
+          if (msg.stage === "saving") {
+            setState((prev) => ({
+              ...prev,
+              phase: "saving",
+              currentFile: null,
+            }));
+          }
+          break;
+        }
+
+        case "FILE_SKIPPED": {
+          setState((prev) => ({
+            ...prev,
+            completedFiles: msg.fileIndex,
+            skippedFiles: [
+              ...prev.skippedFiles,
+              { fileId: msg.fileId, fileName: msg.fileName, reason: msg.reason },
+            ],
+          }));
+          break;
+        }
+
+        case "MEMORY_WARNING": {
+          setState((prev) => ({
+            ...prev,
+            memoryWarning: {
+              estimatedBytes: msg.estimatedBytes,
+              availableBytes: msg.availableBytes,
+            },
+          }));
+          break;
+        }
+
+        case "COMPLETE": {
+          teardownWorker();
+          // Use functional form to preserve skippedFiles accumulated during the run.
+          setState((prev) => ({
+            phase: "done",
+            completedFiles: 0,
+            totalFiles: 0,
+            currentFile: null,
+            resultBytes: msg.result,
+            errorMessage: null,
+            skippedFiles: prev.skippedFiles,
+            memoryWarning: null,
+          }));
+          break;
+        }
+
+        case "ERROR": {
+          teardownWorker();
+          setState((prev) => ({
+            ...prev,
+            phase: "error",
+            currentFile: null,
+            errorMessage: msg.message,
+          }));
+          break;
+        }
+
+        default: {
+          // Exhaustive check — TypeScript will warn if a new message type
+          // is added to the protocol but not handled here.
+          const _exhaustive: never = msg;
+          console.warn("[useMergeWorker] Unhandled worker message:", _exhaustive);
+        }
+      }
+    },
+    [teardownWorker],
+  );
+
+  // ── merge ──────────────────────────────────────────────────────────────────
+  const merge = useCallback(
+    (files: MergeFileDescriptor[]) => {
+      // Defensive: terminate any leftover worker before creating a new one.
+      teardownWorker();
+
+      setState({
+        phase: "merging",
+        completedFiles: 0,
+        totalFiles: files.length,
+        currentFile: null,
+        resultBytes: null,
+        errorMessage: null,
+        skippedFiles: [],
+        memoryWarning: null,
+      });
+
+      const worker = new Worker(
+        new URL("../lib/pdfMerge.worker.ts", import.meta.url),
+        { type: "module" },
+      );
+
+      const handleMessage = buildMessageHandler();
+
+      worker.addEventListener("message", handleMessage);
+
+      // Catch unhandled runtime errors inside the worker (e.g. import failures)
+      worker.addEventListener("error", (err: ErrorEvent) => {
+        teardownWorker();
+        setState((prev) => ({
+          ...prev,
+          phase: "error",
+          currentFile: null,
+          errorMessage: err.message || "An unexpected error occurred in the merge worker.",
+        }));
+      });
+
+      workerRef.current = worker;
+
+      worker.postMessage({ type: "START_MERGE", files, onFileError: "skip" });
+    },
+    [teardownWorker, buildMessageHandler],
+  );
+
+  // ── cancel ─────────────────────────────────────────────────────────────────
+  const cancel = useCallback(() => {
+    if (!workerRef.current) return;
+    // Immediately terminate the worker thread. This is instantaneous —
+    // the worker cannot post any further messages after this call.
+    // No CANCEL message is sent; worker.terminate() is the correct and
+    // complete cancellation mechanism for a stateless Web Worker.
+    teardownWorker();
+    setState((prev) => ({
+      ...prev,
+      phase: "cancelled",
+      currentFile: null,
+    }));
+  }, [teardownWorker]);
+
+  // ── reset ──────────────────────────────────────────────────────────────────
+  const reset = useCallback(() => {
+    teardownWorker();
+    setState(INITIAL_STATE);
+  }, [teardownWorker]);
+
+  return { state, merge, cancel, reset };
+}
+</file>
+
+<file path="app/hooks/useProcessorWorker.ts">
+import { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  ProcessorInboundMessage,
+  ProcessorOutboundMessage,
+  ProcessorTaskOptions,
+} from "../lib/pdf-processor-protocol";
+
+interface ProcessorWorkerState {
+  status: "idle" | "processing" | "done" | "error";
+  progress: number;
+  message: string;
+  resultBlob: Blob | null;
+  resultFilename: string | null;
+  error: string | null;
+}
+
+export function useProcessorWorker() {
+  const [state, setState] = useState<ProcessorWorkerState>({
+    status: "idle",
+    progress: 0,
+    message: "",
+    resultBlob: null,
+    resultFilename: null,
+    error: null,
+  });
+
+  const workerRef = useRef<Worker | null>(null);
+  const currentJobIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    workerRef.current = new Worker(new URL("../lib/pdf-processor.worker.ts", import.meta.url), {
+      type: "module",
+    });
+
+    workerRef.current.onmessage = (e: MessageEvent<ProcessorOutboundMessage>) => {
+      const msg = e.data;
+      if (msg.jobId !== currentJobIdRef.current) return; // Ignore stale messages
+
+      if (msg.type === "PROGRESS") {
+        setState((s) => ({ ...s, progress: msg.percent, message: msg.message || s.message }));
+      } else if (msg.type === "ERROR") {
+        setState((s) => ({ ...s, status: "error", error: msg.error, progress: 0 }));
+      } else if (msg.type === "COMPLETE") {
+        const type = msg.isZip ? "application/zip" : "application/pdf";
+        const blob = new Blob([new Uint8Array(msg.result)], { type });
+        setState((s) => ({ ...s, status: "done", resultBlob: blob, progress: 100, message: "Done!" }));
+      }
+    };
+
+    return () => {
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+  }, []);
+
+  const process = useCallback(
+    async (file: File | null, task: ProcessorTaskOptions, outputFilename: string) => {
+      const jobId = ++currentJobIdRef.current;
+      setState({
+        status: "processing",
+        progress: 0,
+        message: "Starting...",
+        resultBlob: null,
+        resultFilename: outputFilename,
+        error: null,
+      });
+
+      try {
+        const fileBytes = file ? await file.arrayBuffer() : new ArrayBuffer(0);
+        if (workerRef.current) {
+          const msg: ProcessorInboundMessage = {
+            type: "START_PROCESS",
+            jobId,
+            fileBytes,
+            task,
+          };
+          workerRef.current.postMessage(msg, [fileBytes]); // transfer the array buffer
+        }
+      } catch (err) {
+        setState((s) => ({
+          ...s,
+          status: "error",
+          error: "Could not read file for processing.",
+        }));
+      }
+    },
+    []
+  );
+
+  const cancel = useCallback(() => {
+    if (workerRef.current && state.status === "processing") {
+      currentJobIdRef.current++; // Invalidate the current job immediately
+      const msg: ProcessorInboundMessage = { type: "CANCEL_PROCESS" };
+      workerRef.current.postMessage(msg);
+      setState((s) => ({ ...s, status: "idle", progress: 0, message: "Cancelled." }));
+    }
+  }, [state.status]);
+
+  const reset = useCallback(() => {
+    setState({
+      status: "idle",
+      progress: 0,
+      message: "",
+      resultBlob: null,
+      resultFilename: null,
+      error: null,
+    });
+  }, []);
+
+  return {
+    ...state,
+    process,
+    cancel,
+    reset,
+  };
+}
+</file>
+
+<file path="app/lib/excelToPdf.worker.ts">
+import * as XLSX from "xlsx";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+
+type PageSize = "A4" | "A3" | "Letter" | "Legal";
+type FontSize = "small" | "medium" | "large";
+type Orientation = "landscape" | "portrait";
+
+type LoadMessage = { type: "LOAD"; jobId: number; fileBytes: ArrayBuffer };
+type ConvertMessage = {
+  type: "CONVERT";
+  jobId: number;
+  sheetsToConvert: string[];
+  orientation: Orientation;
+  pageSize: PageSize;
+  fontSize: FontSize;
+  includeSheetTitle: boolean;
+};
+type WorkerMessage = LoadMessage | ConvertMessage | { type: "RESET" };
+
+const PAGE_DIMS: Record<PageSize, { width: number; height: number }> = {
+  A4: { width: 595, height: 842 },
+  A3: { width: 842, height: 1191 },
+  Letter: { width: 612, height: 792 },
+  Legal: { width: 612, height: 1008 },
+};
+
+const FONT_SIZES: Record<FontSize, number> = {
+  small: 8,
+  medium: 10,
+  large: 12,
+};
+
+let workbook: XLSX.WorkBook | null = null;
+
+function postError(jobId: number, error: unknown) {
+  self.postMessage({ type: "ERROR", jobId, error: error instanceof Error ? error.message : "Spreadsheet conversion failed." });
+}
+
+self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
+  const message = e.data;
+  if (message.type === "RESET") {
+    workbook = null;
+    return;
+  }
+
+  try {
+    if (message.type === "LOAD") {
+      workbook = XLSX.read(message.fileBytes, { type: "array" });
+      const sheetNames = workbook.SheetNames.filter((name) => Boolean(workbook?.Sheets[name]));
+      if (sheetNames.length === 0) throw new Error("No readable sheets found in this workbook.");
+      self.postMessage({ type: "LOADED", jobId: message.jobId, sheetNames });
+      return;
+    }
+
+    if (!workbook) throw new Error("Spreadsheet is not loaded. Choose the file again.");
+    const pdfDoc = await PDFDocument.create();
+    const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+
+    const dims = PAGE_DIMS[message.pageSize];
+    const pgW = message.orientation === "landscape" ? dims.height : dims.width;
+    const pgH = message.orientation === "landscape" ? dims.width : dims.height;
+    const fSize = FONT_SIZES[message.fontSize];
+    const margin = 40;
+    const rowH = fSize + 8;
+    const headerH = rowH + 4;
+    let writtenSheets = 0;
+
+    for (const sheetName of message.sheetsToConvert) {
+      const ws = workbook.Sheets[sheetName];
+      if (!ws) continue;
+
+      const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" })
+        .map((row) => row.map((cell) => String(cell ?? "")));
+      if (rows.length === 0) continue;
+      if (!rows.some((row) => row.some((cell) => cell.trim().length > 0))) continue;
+
+      const colCount = Math.max(...rows.map((row) => row.length));
+      if (colCount === 0) continue;
+
+      const colWidths: number[] = Array(colCount).fill(0);
+      for (const row of rows) {
+        row.forEach((cell, i) => {
+          const w = regularFont.widthOfTextAtSize(cell, fSize) + 8;
+          colWidths[i] = Math.max(colWidths[i], Math.min(w, 120));
+        });
+      }
+
+      const totalColWidth = colWidths.reduce((a, b) => a + b, 0);
+      const availW = pgW - margin * 2;
+      const scale = totalColWidth > availW ? availW / totalColWidth : 1;
+      const scaledWidths = colWidths.map((w) => w * scale);
+
+      let page = pdfDoc.addPage([pgW, pgH]);
+      let y = pgH - margin;
+      writtenSheets += 1;
+
+      if (message.includeSheetTitle) {
+        page.drawText(sheetName, { x: margin, y, size: fSize + 4, font: boldFont, color: rgb(0.05, 0.05, 0.05) });
+        y -= fSize + 12;
+      }
+
+      rows.forEach((row, rowIdx) => {
+        const isHeader = rowIdx === 0;
+        const rowBackground = isHeader ? rgb(0.06, 0.06, 0.06) : rowIdx % 2 === 0 ? rgb(0.97, 0.97, 0.97) : rgb(1, 1, 1);
+        const textColor = isHeader ? rgb(1, 1, 1) : rgb(0.1, 0.1, 0.1);
+        const currentRowH = isHeader ? headerH : rowH;
+
+        if (y - currentRowH < margin) {
+          page = pdfDoc.addPage([pgW, pgH]);
+          y = pgH - margin;
+          if (rowIdx > 0 && rows[0]) {
+            let hx = margin;
+            page.drawRectangle({ x: margin, y: y - headerH, width: availW, height: headerH, color: rgb(0.06, 0.06, 0.06) });
+            rows[0].forEach((cell, i) => {
+              const cw = scaledWidths[i] ?? 60;
+              page.drawText(cell.slice(0, 40), { x: hx + 3, y: y - headerH + 5, size: fSize, font: boldFont, color: rgb(1, 1, 1), maxWidth: cw - 6 });
+              hx += cw;
+            });
+            y -= headerH;
+          }
+        }
+
+        let x = margin;
+        page.drawRectangle({ x: margin, y: y - currentRowH, width: availW, height: currentRowH, color: rowBackground });
+
+        row.forEach((cell, i) => {
+          const cw = scaledWidths[i] ?? 60;
+          const text = cell.slice(0, 60);
+          page.drawRectangle({ x, y: y - currentRowH, width: cw, height: currentRowH, borderColor: rgb(0.9, 0.91, 0.92), borderWidth: 0.5 });
+          if (text) {
+            page.drawText(text, { x: x + 3, y: y - currentRowH + 5, size: fSize, font: isHeader ? boldFont : regularFont, color: textColor, maxWidth: cw - 6 });
+          }
+          x += cw;
+        });
+
+        y -= currentRowH;
+      });
+    }
+
+    if (writtenSheets === 0) throw new Error("Selected sheets contain no extractable cell data.");
+    const pdfBytes = await pdfDoc.save();
+    self.postMessage({ type: "DONE", jobId: message.jobId, result: pdfBytes }, { transfer: [pdfBytes.buffer] });
+  } catch (error) {
+    postError("jobId" in message ? message.jobId : 0, error);
+  }
+};
+</file>
+
+<file path="app/lib/pdf-processor.worker.ts">
+import { PDFDocument, degrees, StandardFonts } from "pdf-lib";
+import JSZip from "jszip";
+import { COLOR_MAP as TEXT_COLOR_MAP, FONT_MAP, MARGIN_POINTS, PAGE_SIZES, wrapLines } from "./text-to-pdf";
+import { COLOR_MAP as NUM_COLOR_MAP, MARGIN_MM, formatLabel, getCoordinates } from "./pdf-page-numbers";
+import type {
+  ProcessorInboundMessage,
+  ProcessorOutboundMessage,
+  ProcessorTaskOptions,
+} from "./pdf-processor-protocol";
+
+let currentJobId = -1;
+
+function post(msg: ProcessorOutboundMessage, transfer?: Transferable[]) {
+  postMessage(msg, { transfer: transfer || [] });
+}
+
+function mmToPoints(mm: number): number {
+  return (mm * 72) / 25.4;
+}
+
+self.addEventListener("message", (event: MessageEvent<ProcessorInboundMessage>) => {
+  const msg = event.data;
+
+  if (msg.type === "CANCEL_PROCESS") {
+    currentJobId = -1;
+    return;
+  }
+
+  if (msg.type === "START_PROCESS") {
+    currentJobId = msg.jobId;
+    void handleTask(msg.jobId, msg.fileBytes, msg.task);
+  }
+});
+
+async function handleTask(jobId: number, fileBytes: ArrayBuffer, task: ProcessorTaskOptions) {
+  const checkCancel = () => { if (currentJobId !== jobId) throw new Error("Cancelled"); };
+
+  try {
+    let resultBytes: Uint8Array;
+    let isZip = false;
+
+    let sourceDoc: PDFDocument | undefined;
+    if (fileBytes && fileBytes.byteLength > 0 && task.tool !== "text-to-pdf") {
+      post({ type: "PROGRESS", jobId, percent: 10, message: "Loading PDF..." });
+      sourceDoc = await PDFDocument.load(fileBytes, { ignoreEncryption: true });
+      checkCancel();
+    }
+
+    switch (task.tool) {
+      case "split": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { mode, startPage, endPage, filename } = task.options;
+        const total = sourceDoc.getPageCount();
+
+        if (mode === "range") {
+          const s = Math.max(1, startPage || 1) - 1;
+          const e = Math.min(total, endPage || total) - 1;
+          const indices: number[] = [];
+          for (let i = s; i <= e; i++) indices.push(i);
+
+          post({ type: "PROGRESS", jobId, percent: 30, message: "Extracting pages..." });
+          const newPdf = await PDFDocument.create();
+          const pages = await newPdf.copyPages(sourceDoc, indices);
+          pages.forEach((page) => newPdf.addPage(page));
+
+          checkCancel();
+          
+          post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+          resultBytes = await newPdf.save();
+        } else {
+          // split all
+          isZip = true;
+          const zip = new JSZip();
+          const baseName = filename.replace(/\.pdf$/i, "") || "document";
+
+          for (let i = 0; i < total; i++) {
+            checkCancel();
+            post({ type: "PROGRESS", jobId, percent: Math.round(10 + (i / total) * 70), message: `Processing page ${i + 1} of ${total}...` });
+            
+            const newPdf = await PDFDocument.create();
+            const [page] = await newPdf.copyPages(sourceDoc, [i]);
+            newPdf.addPage(page);
+            const pageBytes = await newPdf.save();
+            zip.file(`${baseName}-page-${i + 1}.pdf`, pageBytes);
+          }
+
+          checkCancel();
+          post({ type: "PROGRESS", jobId, percent: 85, message: "Generating ZIP archive..." });
+          
+          const zipBlob = await zip.generateAsync({ type: "uint8array" }, (metadata) => {
+            if (currentJobId === jobId) post({ type: "PROGRESS", jobId, percent: Math.round(85 + metadata.percent * 0.15), message: "Compressing..." });
+          });
+          resultBytes = zipBlob;
+        }
+        break;
+      }
+      
+      case "rotate": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { mode, angle, page } = task.options;
+        post({ type: "PROGRESS", jobId, percent: 30, message: "Applying rotation..." });
+        
+        if (mode === "all") {
+          for (const p of sourceDoc.getPages()) {
+            const current = p.getRotation().angle;
+            p.setRotation(degrees((current + angle + 360) % 360));
+          }
+        } else if (page !== undefined && page > 0) {
+          const p = sourceDoc.getPage(page - 1);
+          const current = p.getRotation().angle;
+          p.setRotation(degrees((current + angle + 360) % 360));
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+        resultBytes = await sourceDoc.save();
+        break;
+      }
+
+      case "crop": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { mode, singlePage, rangeStart, rangeEnd, margins } = task.options;
+        const total = sourceDoc.getPageCount();
+        const top = mmToPoints(margins.top);
+        const bottom = mmToPoints(margins.bottom);
+        const left = mmToPoints(margins.left);
+        const right = mmToPoints(margins.right);
+
+        post({ type: "PROGRESS", jobId, percent: 30, message: "Applying crops..." });
+        
+        for (let i = 0; i < total; i++) {
+          let inScope = false;
+          if (mode === "all") inScope = true;
+          else if (mode === "single" && i + 1 === singlePage) inScope = true;
+          else if (mode === "range" && rangeStart && rangeEnd && i + 1 >= rangeStart && i + 1 <= rangeEnd) inScope = true;
+
+          if (inScope) {
+            const p = sourceDoc.getPage(i);
+            const { width, height } = p.getSize();
+            const cropWidth = width - left - right;
+            const cropHeight = height - bottom - top;
+            if (cropWidth > 0 && cropHeight > 0) {
+               p.setCropBox(left, bottom, cropWidth, cropHeight);
+            }
+          }
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+        resultBytes = await sourceDoc.save();
+        break;
+      }
+
+      case "organize": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const { pages } = task.options;
+        post({ type: "PROGRESS", jobId, percent: 20, message: "Building new PDF structure..." });
+        
+        const newDoc = await PDFDocument.create();
+        
+        for (let i = 0; i < pages.length; i++) {
+          checkCancel();
+          if (i % 10 === 0) {
+            post({ type: "PROGRESS", jobId, percent: Math.round(20 + (i / pages.length) * 60), message: `Processing page ${i + 1} of ${pages.length}...` });
+          }
+
+          const entry = pages[i];
+          if (entry.originalIndex === null) {
+            newDoc.addPage([595, 842]);
+          } else {
+            const [copiedPage] = await newDoc.copyPages(sourceDoc, [entry.originalIndex]);
+            if (entry.rotation !== 0) {
+               copiedPage.setRotation(degrees(entry.rotation));
+            }
+            newDoc.addPage(copiedPage);
+          }
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 80, message: "Saving PDF..." });
+        resultBytes = await newDoc.save();
+        break;
+      }
+      
+      case "text-to-pdf": {
+        const { text, fontFamily, fontSize, pageSize, margin, alignment, colorKey } = task.options;
+        post({ type: "PROGRESS", jobId, percent: 20, message: "Preparing document..." });
+        
+        const pdf = await PDFDocument.create();
+        const font = await pdf.embedFont(FONT_MAP[fontFamily]);
+        const color = TEXT_COLOR_MAP[colorKey] ?? TEXT_COLOR_MAP.black;
+
+        const [pageWidth, pageHeight] = PAGE_SIZES[pageSize];
+        const marginPt = MARGIN_POINTS[margin];
+        const maxWidth = pageWidth - marginPt * 2;
+        const lineHeight = fontSize * 1.45;
+        
+        post({ type: "PROGRESS", jobId, percent: 30, message: "Validating text encoding..." });
+        
+        const unsupportedMatch = text.match(/[^\x00-\xFF\u0152\u0153\u0178\u0192\u2013\u2014\u2018-\u201E\u2020-\u2022\u2026\u2030\u2039\u203A\u20AC\r\n\t]/);
+        if (unsupportedMatch) {
+          throw new Error(`Text contains unsupported character: "${unsupportedMatch[0]}". Please use standard Latin characters.`);
+        }
+
+        try {
+          font.encodeText(text);
+        } catch (e) {
+          throw new Error("Text contains unsupported characters. Please use standard Latin characters.");
+        }
+
+        post({ type: "PROGRESS", jobId, percent: 40, message: "Processing text..." });
+        const lines = wrapLines(text, font, fontSize, maxWidth);
+
+        let page = pdf.addPage([pageWidth, pageHeight]);
+        let y = pageHeight - marginPt - fontSize;
+
+        for (let i = 0; i < lines.length; i++) {
+          checkCancel();
+          if (i % 100 === 0) {
+            post({ type: "PROGRESS", jobId, percent: Math.round(40 + (i / lines.length) * 45), message: "Writing pages..." });
+          }
+          
+          const line = lines[i];
+          if (y < marginPt) {
+            page = pdf.addPage([pageWidth, pageHeight]);
+            y = pageHeight - marginPt - fontSize;
+          }
+
+          const textWidth = font.widthOfTextAtSize(line, fontSize);
+          let x = marginPt;
+          if (alignment === "center") {
+            x = (pageWidth - textWidth) / 2;
+          } else if (alignment === "right") {
+            x = pageWidth - marginPt - textWidth;
+          }
+
+          page.drawText(line, { x, y, size: fontSize, font, color });
+          y -= lineHeight;
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 85, message: "Saving PDF..." });
+        resultBytes = await pdf.save();
+        break;
+      }
+
+      case "page-numbers": {
+        if (!sourceDoc) throw new Error("No PDF loaded");
+        const {
+          position,
+          format,
+          startNumber,
+          fontSize,
+          colorKey,
+          marginPreset,
+          skipFirstPage,
+          useCustomRange,
+          rangeStart,
+          rangeEnd,
+        } = task.options;
+
+        post({ type: "PROGRESS", jobId, percent: 20, message: "Preparing fonts..." });
+        const font = await sourceDoc.embedFont(StandardFonts.Helvetica);
+        const color = NUM_COLOR_MAP[colorKey];
+        const marginPt = mmToPoints(MARGIN_MM[marginPreset]);
+        const pageCount = sourceDoc.getPageCount();
+
+        let displayNumber = startNumber;
+
+        for (let i = 0; i < pageCount; i++) {
+          checkCancel();
+          if (i % 10 === 0) {
+             post({ type: "PROGRESS", jobId, percent: Math.round(20 + (i / pageCount) * 60), message: `Numbering page ${i + 1} of ${pageCount}...` });
+          }
+
+          const pageIndex = i + 1;
+          if (skipFirstPage && i === 0) continue;
+          if (useCustomRange && (pageIndex < rangeStart || pageIndex > rangeEnd)) continue;
+
+          const label = formatLabel(displayNumber, pageCount, format);
+          const page = sourceDoc.getPage(i);
+          const { width, height } = page.getSize();
+          const rotationAngle = page.getRotation().angle;
+          const normRot = ((rotationAngle % 360) + 360) % 360;
+
+          // Compute visual dimensions
+          const visualWidth = normRot === 90 || normRot === 270 ? height : width;
+          const visualHeight = normRot === 90 || normRot === 270 ? width : height;
+
+          const textWidth = font.widthOfTextAtSize(label, fontSize);
+          
+          const { x: visualX, y: visualY } = getCoordinates(position, visualWidth, visualHeight, textWidth, fontSize, marginPt);
+
+          let unrotatedX = visualX;
+          let unrotatedY = visualY;
+          
+          if (normRot === 90) {
+            unrotatedX = width - visualY;
+            unrotatedY = visualX;
+          } else if (normRot === 180) {
+            unrotatedX = width - visualX;
+            unrotatedY = height - visualY;
+          } else if (normRot === 270) {
+            unrotatedX = visualY;
+            unrotatedY = height - visualX;
+          }
+
+          page.drawText(label, { x: unrotatedX, y: unrotatedY, size: fontSize, font, color, rotate: degrees(0) });
+          displayNumber += 1;
+        }
+
+        checkCancel();
+        post({ type: "PROGRESS", jobId, percent: 85, message: "Saving PDF..." });
+        resultBytes = await sourceDoc.save();
+        break;
+      }
+      
+      default:
+        throw new Error("Unknown tool task.");
+    }
+
+    checkCancel();
+
+    post({ type: "PROGRESS", jobId, percent: 100, message: "Done" });
+    post({ type: "COMPLETE", jobId, result: resultBytes, isZip }, [resultBytes.buffer]);
+  } catch (err) {
+    if (currentJobId === jobId) {
+      const msg = err instanceof Error ? err.message : "An unexpected error occurred.";
+      post({ type: "ERROR", jobId, error: msg });
+    }
+  }
+}
+</file>
+
+<file path="app/lib/pdfMerge.worker.ts">
+/**
+ * pdfMerge.worker.ts
+ *
+ * Dedicated Web Worker for the PDF merge pipeline.
+ * Runs in a completely separate thread — the main UI thread is never blocked.
+ *
+ * Responsibilities
+ * ────────────────
+ * 1. Receive a START_MERGE message containing an ordered list of File objects.
+ * 2. For each file:
+ *    a. Read its ArrayBuffer  (File → ArrayBuffer, happens inside worker)
+ *    b. Load via PDFDocument.load()  (pdf-lib)
+ *    c. Bulk-copy all pages into the accumulator with a single copyPages() call.
+ * 3. Serialise the accumulator with PDFDocument.save().
+ * 4. Transfer the resulting Uint8Array back to the main thread (zero-copy).
+ *
+ * Cancellation
+ * ────────────
+ * Handled exclusively by worker.terminate() from the hook (useMergeWorker).
+ * The worker itself has no cancel logic — a terminated worker simply stops.
+ * This is the correct model for a stateless, single-use worker.
+ *
+ * Error handling
+ * ──────────────
+ * Any thrown error (including encryption, corruption) is caught at the top
+ * level and posted as an ERROR message. The hook then terminates the worker.
+ *
+ * What is NOT done here (future phases)
+ * ──────────────────────────────────────
+ * • Memory batching for >N files
+ * • Corrupted-PDF recovery / partial page rescue
+ */
+
+import { PDFDocument } from "pdf-lib";
+import type {
+  WorkerInboundMessage,
+  WorkerOutboundMessage,
+  MergeFileDescriptor,
+  FileErrorStrategy,
+} from "./merge-worker-protocol";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * Estimated peak heap budget. When the pre-flight estimate exceeds this,
+ * a MEMORY_WARNING is posted. Processing continues regardless.
+ * 512 MB is conservative for modern desktop browsers; mobile may be lower.
+ */
+const MEMORY_LIMIT_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Multiplier applied to the sum of raw file sizes to estimate peak heap.
+ * Accounts for: raw ArrayBuffer (1×) + pdf-lib parsed object graph (~1.5×)
+ * + accumulator page copies (~1×) = 3.5× total.
+ */
+const MEMORY_MULTIPLIER = 3.5;
+
+// ─── Typed postMessage helper ─────────────────────────────────────────────────
+
+function post(msg: WorkerOutboundMessage, transfer: Transferable[] = []): void {
+  if (transfer.length > 0) {
+    (self as unknown as Worker).postMessage(msg, transfer);
+  } else {
+    self.postMessage(msg);
+  }
+}
+
+// ─── Memory estimation ────────────────────────────────────────────────────────
+
+function estimateMemoryRequirement(files: MergeFileDescriptor[]): number {
+  const totalRaw = files.reduce((sum, d) => sum + d.file.size, 0);
+  return Math.round(totalRaw * MEMORY_MULTIPLIER);
+}
+
+function getAvailableHeap(): number | null {
+  // performance.memory is a non-standard Chrome extension; may be undefined.
+  const mem = (performance as unknown as Record<string, unknown>).memory as
+    | { jsHeapSizeLimit: number; usedJSHeapSize: number }
+    | undefined;
+  if (!mem) return null;
+  return mem.jsHeapSizeLimit - mem.usedJSHeapSize;
+}
+
+// ─── Core pipeline ────────────────────────────────────────────────────────────
+
+async function readFileBytes(file: File): Promise<ArrayBuffer> {
+  return file.arrayBuffer();
+}
+
+/**
+ * Process every file sequentially, releasing references after each one.
+ *
+ * Memory strategy:
+ * - rawBytes is nulled immediately after PDFDocument.load() succeeds.
+ * - sourceDoc is nulled immediately after copyPages() completes.
+ * - Both are released in a finally block so GC can reclaim even on error.
+ *
+ * @param files Ordered list of files to merge.
+ * @param mergedDoc The accumulator PDFDocument (created once, reused across files).
+ * @param strategy What to do when a file fails: skip it or abort the batch.
+ * @returns Number of pages successfully copied across all files.
+ */
+async function processMergeQueue(
+  files: MergeFileDescriptor[],
+  mergedDoc: PDFDocument,
+  strategy: FileErrorStrategy,
+): Promise<number> {
+  const totalFiles = files.length;
+  let totalPagesCopied = 0;
+
+  for (let fileIndex = 0; fileIndex < totalFiles; fileIndex++) {
+    const descriptor = files[fileIndex];
+    const oneBasedIndex = fileIndex + 1;
+
+    // ── Empty-file guard ──────────────────────────────────────────────────────
+    if (descriptor.file.size === 0) {
+      post({
+        type: "FILE_SKIPPED",
+        fileId: descriptor.id,
+        fileName: descriptor.file.name,
+        fileIndex: oneBasedIndex,
+        totalFiles,
+        reason: "empty",
+      });
+      continue;
+    }
+
+    // ── FILE_STARTED ──────────────────────────────────────────────────────────
+    post({
+      type: "FILE_STARTED",
+      fileId: descriptor.id,
+      fileName: descriptor.file.name,
+      fileIndex: oneBasedIndex,
+      totalFiles,
+    });
+
+    // ── LOADING stage ─────────────────────────────────────────────────────────
+    post({
+      type: "PROGRESS_UPDATE",
+      fileId: descriptor.id,
+      stage: "loading",
+      pagesDone: 0,
+      totalPages: 0,
+    });
+
+    // Nullable refs — both released in finally to guarantee GC opportunity.
+    let rawBytes: ArrayBuffer | null = null;
+    let sourceDoc: PDFDocument | null = null;
+
+    try {
+      rawBytes = await readFileBytes(descriptor.file);
+
+      try {
+        sourceDoc = await PDFDocument.load(rawBytes, { ignoreEncryption: false });
+
+        // ── COPYING_PAGES stage ─────────────────────────────────────────────────
+        const pageIndices = sourceDoc.getPageIndices();
+        const totalPages = pageIndices.length;
+
+        post({
+          type: "PROGRESS_UPDATE",
+          fileId: descriptor.id,
+          stage: "copying_pages",
+          pagesDone: 0,
+          totalPages,
+        });
+
+        // Single bulk call — pdf-lib resolves shared object references across
+        // all pages together. Calling it N times for N pages is O(N²).
+        const copiedPages = await mergedDoc.copyPages(sourceDoc, pageIndices);
+        for (const page of copiedPages) {
+          mergedDoc.addPage(page);
+        }
+        totalPagesCopied += copiedPages.length;
+
+      } catch (loadErr) {
+        const msg = loadErr instanceof Error ? loadErr.message : "";
+        const isEncrypted =
+          msg.toLowerCase().includes("encrypt") ||
+          msg.toLowerCase().includes("password");
+        const reason: "encrypted" | "corrupted" = isEncrypted ? "encrypted" : "corrupted";
+
+        if (strategy === "skip") {
+          post({
+            type: "FILE_SKIPPED",
+            fileId: descriptor.id,
+            fileName: descriptor.file.name,
+            fileIndex: oneBasedIndex,
+            totalFiles,
+            reason,
+          });
+          continue;
+        }
+
+        // strategy === "abort"
+        throw new Error(
+          isEncrypted
+            ? `"${descriptor.file.name}" is password-protected and cannot be merged.`
+            : `"${descriptor.file.name}" could not be parsed or processed. The file may be corrupted.`,
+        );
+      } finally {
+        // Release the raw bytes immediately — sourceDoc holds everything it
+        // needs; keeping rawBytes alive doubles peak memory for no benefit.
+        rawBytes = null;
+      }
+
+    } finally {
+      // Always release sourceDoc after copyPages, even if copyPages threw.
+      sourceDoc = null;
+      rawBytes = null; // defensive: cover early-exit paths
+    }
+
+    // ── FILE_COMPLETED ────────────────────────────────────────────────────────
+    post({
+      type: "FILE_COMPLETED",
+      fileId: descriptor.id,
+      fileIndex: oneBasedIndex,
+      totalFiles,
+    });
+  }
+
+  return totalPagesCopied;
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+// This worker is single-use. The hook (useMergeWorker) creates a fresh
+// instance for every merge and terminates it immediately on completion,
+// error, or cancellation. No CANCEL message is ever sent to this worker;
+// the hook calls worker.terminate() directly, which is the correct and
+// instantaneous cancellation mechanism for a stateless worker.
+
+self.addEventListener("message", (event: MessageEvent<WorkerInboundMessage>) => {
+  const msg = event.data;
+
+  if (msg.type !== "START_MERGE") {
+    return;
+  }
+
+  const strategy: FileErrorStrategy = msg.onFileError ?? "skip";
+
+  void (async () => {
+    try {
+      // ── Pre-flight memory estimation ────────────────────────────────────────
+      const estimatedBytes = estimateMemoryRequirement(msg.files);
+      if (estimatedBytes > MEMORY_LIMIT_BYTES) {
+        throw new Error(
+          `Merge request exceeds the safe memory limit (~${Math.round(
+            estimatedBytes / 1024 / 1024
+          )} MB estimated, limit is ${Math.round(
+            MEMORY_LIMIT_BYTES / 1024 / 1024
+          )} MB). Please merge fewer or smaller PDF files.`
+        );
+      }
+
+      const mergedDoc = await PDFDocument.create();
+
+      const totalPagesCopied = await processMergeQueue(msg.files, mergedDoc, strategy);
+
+      // ── Zero-pages guard ─────────────────────────────────────────────────────
+      if (totalPagesCopied === 0) {
+        post({ type: "ERROR", message: "No valid PDFs could be merged. All files were skipped or empty." });
+        return;
+      }
+
+      // ── PIPELINE_STAGE: saving ───────────────────────────────────────────────
+      post({ type: "PIPELINE_STAGE", stage: "saving" });
+
+      const resultBytes = await mergedDoc.save({ useObjectStreams: true });
+
+      post(
+        {
+          type: "COMPLETE",
+          result: resultBytes,
+          totalBytes: resultBytes.byteLength,
+        },
+        [resultBytes.buffer],
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "An unexpected error occurred during merge.";
+      post({ type: "ERROR", message });
+    }
+  })();
+});
+</file>
+
+<file path="app/lib/pdfToExcel.worker.ts">
+import * as XLSX from "xlsx";
+
+type PageRows = { pageNumber: number; rows: string[][] };
+type WorkerMessage = { type: "BUILD"; jobId: number; pages: PageRows[] };
+
+self.onmessage = (event: MessageEvent<WorkerMessage>) => {
+  try {
+    const { jobId, pages } = event.data;
+    const validPages = pages.filter((page) => page.rows.length > 0);
+    if (validPages.length === 0) throw new Error("No extractable text rows were found in the selected pages.");
+
+    const workbook = XLSX.utils.book_new();
+    for (const page of validPages) {
+      const ws = XLSX.utils.aoa_to_sheet(page.rows);
+      const colWidths: number[] = [];
+      for (const row of page.rows) {
+        row.forEach((cell, index) => {
+          colWidths[index] = Math.max(colWidths[index] ?? 8, cell.length + 2);
+        });
+      }
+      ws["!cols"] = colWidths.map((width) => ({ wch: Math.min(width, 40) }));
+      XLSX.utils.book_append_sheet(workbook, ws, `Page ${page.pageNumber}`);
+    }
+
+    const xlsxBytes: Uint8Array = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+    self.postMessage({ type: "DONE", jobId, result: xlsxBytes }, { transfer: [xlsxBytes.buffer] });
+  } catch (error) {
+    self.postMessage({ type: "ERROR", jobId: event.data.jobId, error: error instanceof Error ? error.message : "Excel export failed." });
+  }
+};
+</file>
+
+<file path="app/lib/pdfToPptx.worker.ts">
+import * as pdfjsLib from "pdfjs-dist";
+
+type RenderMessage = {
+  type: "RENDER";
+  jobId: number;
+  fileBytes: ArrayBuffer;
+  startPage: number;
+  endPage: number;
+  scale: number;
+  quality: number;
+};
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+self.onmessage = async (event: MessageEvent<RenderMessage>) => {
+  const message = event.data;
+  let pdf: pdfjsLib.PDFDocumentProxy | null = null;
+  try {
+    if (typeof OffscreenCanvas === "undefined") {
+      throw new Error("This browser cannot render PDF pages off the main thread.");
+    }
+
+    const source = { data: new Uint8Array(message.fileBytes), disableWorker: true } as unknown as Parameters<typeof pdfjsLib.getDocument>[0];
+    const task = pdfjsLib.getDocument(source);
+    pdf = await task.promise;
+    if (pdf.numPages < 1) throw new Error("Could not read any pages from this PDF.");
+
+    const start = Math.max(1, Math.min(message.startPage, pdf.numPages));
+    const end = Math.max(start, Math.min(message.endPage, pdf.numPages));
+    for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+      self.postMessage({ type: "START", jobId: message.jobId, pageNumber });
+      const page = await pdf.getPage(pageNumber);
+      let canvas: OffscreenCanvas | null = null;
+      try {
+        const viewport = page.getViewport({ scale: message.scale });
+        canvas = new OffscreenCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("Could not create offscreen canvas context.");
+        await page.render({ canvasContext: context as unknown as CanvasRenderingContext2D, viewport }).promise;
+        const blob = await canvas.convertToBlob({ type: "image/jpeg", quality: message.quality });
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        self.postMessage({
+          type: "PAGE",
+          jobId: message.jobId,
+          pageNumber,
+          dataUrl: `data:image/jpeg;base64,${bytesToBase64(bytes)}`,
+          size: bytes.byteLength,
+        });
+      } finally {
+        page.cleanup();
+        if (canvas) {
+          canvas.width = 0;
+          canvas.height = 0;
+        }
+      }
+    }
+
+    self.postMessage({ type: "DONE", jobId: message.jobId });
+  } catch (error) {
+    self.postMessage({ type: "ERROR", jobId: message.jobId, error: error instanceof Error ? error.message : "PowerPoint conversion failed." });
+  } finally {
+    await pdf?.cleanup?.();
+    await pdf?.destroy?.();
+  }
+};
+</file>
+
+<file path="app/sign/layout.tsx">
+import type { Metadata } from "next";
+
+export const metadata: Metadata = {
+  title: "Visual PDF Signature Stamp | LocalPDF",
+  description:
+    "Add a visual signature image stamp to a PDF in your browser. This is not a cryptographic digital signature or certificate.",
+  alternates: { canonical: "https://localpdf.dev/sign" },
+};
+
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return <>{children}</>;
+}
+</file>
+
+<file path="app/sign/page.tsx">
+"use client";
+
+import Link from "next/link";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { useDropzone } from "react-dropzone";
+import { ChevronLeft, ChevronRight, RotateCw } from "lucide-react";
+import { toast } from "sonner";
+import AppShell from "../components/AppShell";
+import ShortcutHint from "../components/ShortcutHint";
+import SizeComparisonBadge from "../components/SizeComparisonBadge";
+import { useFileHistory } from "../components/FileHistoryProvider";
+
+type SignatureMode = "draw" | "type" | "upload";
+type Step = "upload" | "create" | "place" | "done";
+
+type Placement = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rotation: number;
+  opacity: number;
+  pageIndex: number;
+  applyAll: boolean;
+};
+
+type Point = {
+  x: number;
+  y: number;
+};
+
+type PdfJs = typeof import("pdfjs-dist");
+type PdfDocumentProxy = import("pdfjs-dist").PDFDocumentProxy;
+
+const ACCENT_COLOR = "#3B3BFF";
+const SIGNATURE_WIDTH = 560;
+const SIGNATURE_HEIGHT = 180;
+const PAGE_SCALE = 1.5;
+const COLORS = [
+  { label: "Black", value: "#0F0F0F" },
+  { label: "Navy", value: "#1e3a8a" },
+  { label: "Dark Red", value: "#991b1b" },
+] as const;
+const THICKNESSES = [
+  { label: "Thin", value: 1.5 },
+  { label: "Medium", value: 2.5 },
+  { label: "Thick", value: 4 },
+] as const;
+const FONTS = ["Dancing Script", "Pacifico", "Great Vibes", "Satisfy"] as const;
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function loadPdfJs(): Promise<PdfJs> {
+  const pdfjs = await import("pdfjs-dist");
+  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+  }
+  return pdfjs;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeRotation(angle: number): 0 | 90 | 180 | 270 {
+  const normalized = ((angle % 360) + 360) % 360;
+  if (normalized === 90 || normalized === 180 || normalized === 270) return normalized;
+  return 0;
+}
+
+function getVisualPageSize(width: number, height: number, rotation: number): { width: number; height: number } {
+  return rotation === 90 || rotation === 270 ? { width: height, height: width } : { width, height };
+}
+
+function mapVisualPointToPdf(x: number, y: number, pageWidth: number, pageHeight: number, rotation: number): Point {
+  if (rotation === 90) return { x: pageWidth - y, y: x };
+  if (rotation === 180) return { x: pageWidth - x, y: pageHeight - y };
+  if (rotation === 270) return { x: y, y: pageHeight - x };
+  return { x, y };
+}
+
+export default function SignPdfPage() {
+  const [step, setStep] = useState<Step>("upload");
+  const [file, setFile] = useState<File | null>(null);
+  const [pdfDocProxy, setPdfDocProxy] = useState<PdfDocumentProxy | null>(null);
+  const [numPages, setNumPages] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [previewCanvasUrl, setPreviewCanvasUrl] = useState("");
+  const [previewDims, setPreviewDims] = useState({ w: 0, h: 0 });
+  const [signatureMode, setSignatureMode] = useState<SignatureMode>("draw");
+  const [signatureDataUrl, setSignatureDataUrl] = useState("");
+  const [placement, setPlacement] = useState<Placement>({
+    x: 50,
+    y: 50,
+    width: 200,
+    height: 58,
+    rotation: 0,
+    opacity: 1,
+    pageIndex: 0,
+    applyAll: false,
+  });
+  const [strokeColor, setStrokeColor] = useState("#0F0F0F");
+  const [strokeWidth, setStrokeWidth] = useState(2.5);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [typedName, setTypedName] = useState("");
+  const [fontFamily, setFontFamily] = useState<(typeof FONTS)[number]>("Dancing Script");
+  const [fontSize, setFontSize] = useState(48);
+  const [signedSize, setSignedSize] = useState<number | null>(null);
+  const [isSigning, setIsSigning] = useState(false);
+
+  const { addFile } = useFileHistory();
+  const drawCanvasRef = useRef<HTMLCanvasElement>(null);
+  const drawContextRef = useRef<CanvasRenderingContext2D | null>(null);
+  const typeCanvasRef = useRef<HTMLCanvasElement>(null);
+  const typeContextRef = useRef<CanvasRenderingContext2D | null>(null);
+  const uploadCanvasRef = useRef<HTMLCanvasElement>(null);
+  const uploadContextRef = useRef<CanvasRenderingContext2D | null>(null);
+  const pointsRef = useRef<Point[]>([]);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const previewContainerRef = useRef<HTMLDivElement>(null);
+  const pdfDocProxyRef = useRef<PdfDocumentProxy | null>(null);
+
+  const destroyPdfDocProxy = useCallback(() => {
+    const proxy = pdfDocProxyRef.current;
+    pdfDocProxyRef.current = null;
+    setPdfDocProxy(null);
+    void proxy?.destroy();
+  }, []);
+
+  const setDrawCanvasRef = useCallback((node: HTMLCanvasElement | null) => {
+    drawCanvasRef.current = node;
+    drawContextRef.current = node?.getContext("2d") ?? null;
+  }, []);
+
+  const setTypeCanvasRef = useCallback((node: HTMLCanvasElement | null) => {
+    typeCanvasRef.current = node;
+    typeContextRef.current = node?.getContext("2d") ?? null;
+    if (node) {
+      const context = typeContextRef.current;
+      if (context) {
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, node.width, node.height);
+      }
+    }
+  }, []);
+
+  const setUploadCanvasRef = useCallback((node: HTMLCanvasElement | null) => {
+    uploadCanvasRef.current = node;
+    uploadContextRef.current = node?.getContext("2d", { willReadFrequently: true }) ?? null;
+    if (node) {
+      const context = uploadContextRef.current;
+      if (context) {
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, node.width, node.height);
+      }
+    }
+  }, []);
+
+  const renderPdfPage = useCallback(async (proxy: PdfDocumentProxy, pageNum: number) => {
+    const page = await proxy.getPage(pageNum);
+    const viewport = page.getViewport({ scale: PAGE_SCALE });
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvasContext: context, viewport }).promise;
+    setPreviewDims({ w: viewport.width, h: viewport.height });
+    setPreviewCanvasUrl(canvas.toDataURL("image/png"));
+  }, []);
+
+  const clearCanvas = useCallback(() => {
+    const canvas = drawCanvasRef.current;
+    const context = drawContextRef.current;
+    if (!canvas || !context) return;
+
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    pointsRef.current = [];
+  }, []);
+
+  const redrawSpline = useCallback(
+    (pts: Point[]) => {
+      const canvas = drawCanvasRef.current;
+      const ctx = drawContextRef.current;
+      if (!ctx || !canvas) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.beginPath();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = strokeWidth;
+      if (pts.length < 3) {
+        if (pts.length > 0) ctx.moveTo(pts[0].x, pts[0].y);
+        if (pts.length === 2) ctx.lineTo(pts[1].x, pts[1].y);
+        ctx.stroke();
+        return;
+      }
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p0 = i > 0 ? pts[i - 1] : pts[0];
+        const p1 = pts[i];
+        const p2 = pts[i + 1];
+        const p3 = i !== pts.length - 2 ? pts[i + 2] : p2;
+        const cp1x = p1.x + (p2.x - p0.x) / 6;
+        const cp1y = p1.y + (p2.y - p0.y) / 6;
+        const cp2x = p2.x - (p3.x - p1.x) / 6;
+        const cp2y = p2.y - (p3.y - p1.y) / 6;
+        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+      }
+      ctx.stroke();
+    },
+    [strokeColor, strokeWidth],
+  );
+
+  const drawTypedSignature = useCallback(() => {
+    const canvas = typeCanvasRef.current;
+    const context = typeContextRef.current;
+    if (!canvas || !context) return;
+
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.font = `${fontSize}px "${fontFamily}"`;
+    context.fillStyle = strokeColor;
+    context.textBaseline = "middle";
+    context.textAlign = "center";
+    context.fillText(typedName || "Preview", canvas.width / 2, canvas.height / 2);
+  }, [fontFamily, fontSize, strokeColor, typedName]);
+
+  const renderUploadedSignature = useCallback((image: HTMLImageElement) => {
+    const sourceCanvas = document.createElement("canvas");
+    const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
+    const destinationCanvas = uploadCanvasRef.current;
+    const destinationContext = uploadContextRef.current;
+    if (!sourceContext || !destinationCanvas || !destinationContext) return;
+
+    sourceCanvas.width = image.naturalWidth || image.width;
+    sourceCanvas.height = image.naturalHeight || image.height;
+    sourceContext.fillStyle = "#ffffff";
+    sourceContext.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+    sourceContext.drawImage(image, 0, 0);
+
+    const pixels = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+    let minX = sourceCanvas.width;
+    let minY = sourceCanvas.height;
+    let maxX = -1;
+    let maxY = -1;
+
+    for (let y = 0; y < sourceCanvas.height; y += 1) {
+      for (let x = 0; x < sourceCanvas.width; x += 1) {
+        const index = (y * sourceCanvas.width + x) * 4;
+        const alpha = pixels.data[index + 3];
+        const r = pixels.data[index];
+        const g = pixels.data[index + 1];
+        const b = pixels.data[index + 2];
+        if (alpha > 10 && r + g + b < 750) {
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x);
+          maxY = Math.max(maxY, y);
+        }
+      }
+    }
+
+    const cropX = maxX >= minX ? minX : 0;
+    const cropY = maxY >= minY ? minY : 0;
+    const cropW = maxX >= minX ? maxX - minX + 1 : sourceCanvas.width;
+    const cropH = maxY >= minY ? maxY - minY + 1 : sourceCanvas.height;
+    const scale = Math.min((SIGNATURE_WIDTH - 48) / cropW, (SIGNATURE_HEIGHT - 32) / cropH);
+    const drawW = cropW * scale;
+    const drawH = cropH * scale;
+    const drawX = (SIGNATURE_WIDTH - drawW) / 2;
+    const drawY = (SIGNATURE_HEIGHT - drawH) / 2;
+
+    destinationContext.clearRect(0, 0, SIGNATURE_WIDTH, SIGNATURE_HEIGHT);
+    destinationContext.fillStyle = "#ffffff";
+    destinationContext.fillRect(0, 0, SIGNATURE_WIDTH, SIGNATURE_HEIGHT);
+    destinationContext.drawImage(sourceCanvas, cropX, cropY, cropW, cropH, drawX, drawY, drawW, drawH);
+  }, []);
+
+  const handlePdfDrop = useCallback(
+    async (acceptedFiles: File[]) => {
+      const selectedFile = acceptedFiles[0];
+      if (!selectedFile) return;
+
+      try {
+        const pdfjs = await loadPdfJs();
+        const arrayBuffer = await selectedFile.arrayBuffer();
+        const proxy = await pdfjs.getDocument({ data: arrayBuffer.slice(0) }).promise;
+        destroyPdfDocProxy();
+        pdfDocProxyRef.current = proxy;
+        setFile(selectedFile);
+        setPdfDocProxy(proxy);
+        setNumPages(proxy.numPages);
+        setCurrentPage(1);
+        setPlacement((current) => ({ ...current, pageIndex: 0 }));
+        await renderPdfPage(proxy, 1);
+      } catch (error) {
+        console.error(error);
+        toast.error("Something went wrong.");
+      }
+    },
+    [destroyPdfDocProxy, renderPdfPage],
+  );
+
+  const handleSignatureImageDrop = useCallback(
+    async (acceptedFiles: File[]) => {
+      const selectedFile = acceptedFiles[0];
+      if (!selectedFile) return;
+
+      const objectUrl = URL.createObjectURL(selectedFile);
+      const image = new Image();
+      image.onload = () => {
+        renderUploadedSignature(image);
+        URL.revokeObjectURL(objectUrl);
+      };
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        toast.error("Something went wrong.");
+      };
+      image.src = objectUrl;
+    },
+    [renderUploadedSignature],
+  );
+
+  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
+    onDrop: handlePdfDrop,
+    accept: { "application/pdf": [".pdf"] },
+    multiple: false,
+    noClick: false,
+    noKeyboard: true,
+  });
+
+  const {
+    getRootProps: getSignatureRootProps,
+    getInputProps: getSignatureInputProps,
+    isDragActive: isSignatureDragActive,
+    open: openSignaturePicker,
+  } = useDropzone({
+    onDrop: handleSignatureImageDrop,
+    accept: {
+      "image/png": [".png"],
+      "image/jpeg": [".jpg", ".jpeg"],
+      "image/svg+xml": [".svg"],
+    },
+    multiple: false,
+    noClick: false,
+    noKeyboard: true,
+  });
+
+  const goToCreateSignature = useCallback(() => {
+    if (!file) return;
+    setStep("create");
+  }, [file]);
+
+  const navigatePage = useCallback(
+    async (pageNum: number) => {
+      if (!pdfDocProxy) return;
+
+      const next = clamp(pageNum, 1, numPages);
+      setCurrentPage(next);
+      setPlacement((current) => ({ ...current, pageIndex: next - 1 }));
+      await renderPdfPage(pdfDocProxy, next);
+    },
+    [numPages, pdfDocProxy, renderPdfPage],
+  );
+
+  const handlePreviousPage = useCallback(() => {
+    void navigatePage(currentPage - 1);
+  }, [currentPage, navigatePage]);
+
+  const handleNextPage = useCallback(() => {
+    void navigatePage(currentPage + 1);
+  }, [currentPage, navigatePage]);
+
+  const handleStartDrawing = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    const canvas = drawCanvasRef.current;
+    if (!canvas) return;
+
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const rect = canvas.getBoundingClientRect();
+    pointsRef.current = [{ x: event.clientX - rect.left, y: event.clientY - rect.top }];
+    setIsDrawing(true);
+  }, []);
+
+  const handleDraw = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!isDrawing) return;
+      const canvas = drawCanvasRef.current;
+      if (!canvas) return;
+
+      const rect = canvas.getBoundingClientRect();
+      pointsRef.current = [
+        ...pointsRef.current,
+        { x: event.clientX - rect.left, y: event.clientY - rect.top },
+      ];
+      redrawSpline(pointsRef.current);
+    },
+    [isDrawing, redrawSpline],
+  );
+
+  const handleStopDrawing = useCallback((event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setIsDrawing(false);
+  }, []);
+
+  const handleSetSignatureMode = useCallback((mode: SignatureMode) => {
+    setSignatureMode(mode);
+  }, []);
+
+  const handleUseSignature = useCallback(() => {
+    let canvas: HTMLCanvasElement | null = null;
+    if (signatureMode === "draw") canvas = drawCanvasRef.current;
+    if (signatureMode === "type") canvas = typeCanvasRef.current;
+    if (signatureMode === "upload") canvas = uploadCanvasRef.current;
+    if (!canvas) return;
+
+    setSignatureDataUrl(canvas.toDataURL("image/png"));
+    setStep("place");
+  }, [signatureMode]);
+
+  const handleTypedNameChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    setTypedName(event.target.value);
+  }, []);
+
+  const handleFontFamilyChange = useCallback((event: React.ChangeEvent<HTMLSelectElement>) => {
+    setFontFamily(event.target.value as (typeof FONTS)[number]);
+  }, []);
+
+  const handleFontSizeChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    setFontSize(Number(event.target.value));
+  }, []);
+
+  const handleOpacityChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const opacity = Number(event.target.value);
+    setPlacement((current) => ({ ...current, opacity }));
+  }, []);
+
+  const handleApplyAllChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const applyAll = event.target.checked;
+    setPlacement((current) => ({ ...current, applyAll }));
+  }, []);
+
+  const handleChangeSignature = useCallback(() => {
+    setStep("create");
+  }, []);
+
+  const handlePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>, action: "drag" | "resize" | "rotate", corner?: "tl" | "tr" | "bl" | "br") => {
+      event.preventDefault();
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startPlacement = { ...placement };
+      const overlayRect = overlayRef.current?.getBoundingClientRect();
+      const centerX = overlayRect ? overlayRect.left + overlayRect.width / 2 : startX;
+      const centerY = overlayRect ? overlayRect.top + overlayRect.height / 2 : startY;
+      const startAngle = Math.atan2(startY - centerY, startX - centerX) * (180 / Math.PI);
+
+      const onMove = (moveEvent: PointerEvent) => {
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+
+        if (action === "drag") {
+          setPlacement((current) => ({
+            ...current,
+            x: clamp(startPlacement.x + dx, 0, Math.max(0, previewDims.w - startPlacement.width)),
+            y: clamp(startPlacement.y + dy, 0, Math.max(0, previewDims.h - startPlacement.height)),
+          }));
+          return;
+        }
+
+        if (action === "resize") {
+          const ratio = startPlacement.width / startPlacement.height;
+          const horizontalDelta = corner?.includes("l") ? -dx : dx;
+          const verticalDelta = corner?.includes("t") ? -dy : dy;
+          const sizeDelta = Math.abs(horizontalDelta) > Math.abs(verticalDelta) ? horizontalDelta : verticalDelta * ratio;
+          const nextWidth = clamp(startPlacement.width + sizeDelta, 50, previewDims.w);
+          const nextHeight = nextWidth / ratio;
+          const nextX = corner?.includes("l") ? startPlacement.x + (startPlacement.width - nextWidth) : startPlacement.x;
+          const nextY = corner?.includes("t") ? startPlacement.y + (startPlacement.height - nextHeight) : startPlacement.y;
+          setPlacement((current) => ({
+            ...current,
+            width: nextWidth,
+            height: nextHeight,
+            x: clamp(nextX, 0, Math.max(0, previewDims.w - nextWidth)),
+            y: clamp(nextY, 0, Math.max(0, previewDims.h - nextHeight)),
+          }));
+          return;
+        }
+
+        const currentAngle = Math.atan2(moveEvent.clientY - centerY, moveEvent.clientX - centerX) * (180 / Math.PI);
+        setPlacement((current) => ({
+          ...current,
+          rotation: startPlacement.rotation + (currentAngle - startAngle),
+        }));
+      };
+
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp, { once: true });
+    },
+    [placement, previewDims.h, previewDims.w],
+  );
+
+  const handleDragPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      handlePointerDown(event, "drag");
+    },
+    [handlePointerDown],
+  );
+
+  const handleRotatePointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      handlePointerDown(event, "rotate");
+    },
+    [handlePointerDown],
+  );
+
+  const handleResizeTopLeft = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      handlePointerDown(event, "resize", "tl");
+    },
+    [handlePointerDown],
+  );
+
+  const handleResizeTopRight = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      handlePointerDown(event, "resize", "tr");
+    },
+    [handlePointerDown],
+  );
+
+  const handleResizeBottomLeft = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      handlePointerDown(event, "resize", "bl");
+    },
+    [handlePointerDown],
+  );
+
+  const handleResizeBottomRight = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      handlePointerDown(event, "resize", "br");
+    },
+    [handlePointerDown],
+  );
+
+  const handleDownload = useCallback(async () => {
+    if (!file || !signatureDataUrl || previewDims.w === 0 || previewDims.h === 0 || isSigning) return;
+
+    setIsSigning(true);
+    toast.info("Placing signature...");
+    try {
+      const { PDFDocument, degrees } = await import("pdf-lib");
+      const originalArrayBuffer = await file.arrayBuffer();
+      const pdfDoc = await PDFDocument.load(originalArrayBuffer);
+      const pngImage = await pdfDoc.embedPng(signatureDataUrl);
+      const allPages = pdfDoc.getPages();
+      const pagesToSign = placement.applyAll ? allPages : [allPages[placement.pageIndex]];
+      const placementRatio = {
+        x: placement.x / previewDims.w,
+        y: placement.y / previewDims.h,
+        width: placement.width / previewDims.w,
+        height: placement.height / previewDims.h,
+      };
+
+      for (const page of pagesToSign) {
+        const { width: pageW, height: pageH } = page.getSize();
+        const pageRotation = normalizeRotation(page.getRotation().angle);
+        const visualSize = getVisualPageSize(pageW, pageH, pageRotation);
+        const visualX = placementRatio.x * visualSize.width;
+        const visualTopY = placementRatio.y * visualSize.height;
+        const pdfW = placementRatio.width * visualSize.width;
+        const sigH = placementRatio.height * visualSize.height;
+        const visualBottomY = visualSize.height - visualTopY - sigH;
+        const pdfPoint = mapVisualPointToPdf(visualX, visualBottomY, pageW, pageH, pageRotation);
+        page.drawImage(pngImage, {
+          x: pdfPoint.x,
+          y: pdfPoint.y,
+          width: pdfW,
+          height: sigH,
+          rotate: degrees(placement.rotation + pageRotation),
+          opacity: placement.opacity,
+        });
+      }
+
+      const bytes = await pdfDoc.save();
+      const signedBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+      const blob = new Blob([signedBuffer], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `visual-stamp-${file.name}`;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      setSignedSize(bytes.byteLength);
+      addFile({
+        filename: `visual-stamp-${file.name}`,
+        size: bytes.byteLength,
+        timestamp: Date.now(),
+        tool: "signature",
+      });
+      toast.success("Done! Visual signature stamp added.");
+      setStep("done");
+    } catch (error) {
+      console.error(error);
+      toast.error("Something went wrong.");
+    } finally {
+      setIsSigning(false);
+    }
+  }, [addFile, file, isSigning, placement, previewDims.h, previewDims.w, signatureDataUrl]);
+
+  useEffect(() => {
+    void loadPdfJs();
+    return () => {
+      destroyPdfDocProxy();
+    };
+  }, [destroyPdfDocProxy]);
+
+  useEffect(() => {
+    const link = document.createElement("link");
+    link.href = "https://fonts.googleapis.com/css2?family=Dancing+Script&family=Great+Vibes&family=Pacifico&family=Satisfy&display=swap";
+    link.rel = "stylesheet";
+    document.head.appendChild(link);
+
+    return () => {
+      link.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    drawTypedSignature();
+    return () => {};
+  }, [drawTypedSignature]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      if (key === "u") {
+        event.preventDefault();
+        if (step === "create" && signatureMode === "upload") {
+          openSignaturePicker();
+        } else {
+          open();
+        }
+      }
+
+      if (key === "c" && step === "create" && signatureMode === "draw") {
+        event.preventDefault();
+        clearCanvas();
+      }
+
+      if (key === "d" && (step === "place" || step === "done")) {
+        event.preventDefault();
+        void handleDownload();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [clearCanvas, handleDownload, open, openSignaturePicker, signatureMode, step]);
+
+  return (
+    <AppShell>
+      <main className="min-h-screen bg-background px-4 py-8 text-foreground sm:px-6 lg:px-8">
+        <div className="mx-auto max-w-6xl">
+          <Link
+            href="/tools"
+            aria-label="Back to all tools"
+            className="mb-5 inline-flex text-sm font-semibold text-muted transition hover:text-foreground"
+          >
+            &larr; Back to all tools
+          </Link>
+
+          <nav aria-label="Breadcrumb" className="mb-6 flex flex-wrap items-center gap-2 text-sm text-muted">
+            <Link href="/" className="transition hover:text-foreground" aria-label="Go to home page">
+              Home
+            </Link>
+            <ChevronRight aria-hidden="true" className="h-4 w-4" />
+            <Link href="/tools" className="transition hover:text-foreground" aria-label="Go to tools page">
+              Tools
+            </Link>
+            <ChevronRight aria-hidden="true" className="h-4 w-4" />
+            <span className="font-semibold text-foreground">Sign PDF</span>
+          </nav>
+
+          <section className="rounded-lg border border-border bg-card p-5 shadow-sm sm:p-8">
+            <div className="mb-8 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-sm font-bold uppercase tracking-[0.18em]" style={{ color: ACCENT_COLOR }}>
+                  100% private
+                </p>
+                <h1 className="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Visual PDF Signature</h1>
+                <p className="mt-2 max-w-2xl text-muted">
+                  Draw, type, or upload your signature and place it on your PDF as a visual image stamp.
+                </p>
+              </div>
+              <div className="flex gap-2 text-xs font-semibold text-muted">
+                {(["upload", "create", "place", "done"] as Step[]).map((item, index) => (
+                  <span
+                    key={item}
+                    className={`rounded-full px-3 py-1 capitalize ring-1 ring-inset ${
+                      step === item ? "bg-primary text-white ring-primary" : "bg-muted/10 ring-border"
+                    }`}
+                  >
+                    {index + 1}. {item}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {step === "upload" && (
+              <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_320px]">
+                <div>
+                  <div
+                    {...getRootProps()}
+                    className={`flex min-h-[260px] cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-8 text-center transition ${
+                      isDragActive ? "border-primary bg-primary/5" : "border-border bg-background hover:border-primary"
+                    }`}
+                    aria-label="Upload PDF dropzone"
+                  >
+                    <input {...getInputProps({ "aria-label": "Upload PDF" })} />
+                    <p className="text-xl font-bold">{isDragActive ? "Drop your PDF here" : "Drag & drop your PDF here"}</p>
+                    <p className="mt-2 text-sm text-muted">PDF only, processed locally on your device.</p>
+                    <button
+                      type="button"
+                      onClick={open}
+                      aria-label="Browse for a PDF file"
+                      className="mt-6 inline-flex items-center gap-3 rounded-md bg-primary px-5 py-3 text-sm font-bold text-white transition hover:opacity-90"
+                    >
+                      Browse PDF
+                      <ShortcutHint shortcut="U" />
+                    </button>
+                  </div>
+
+                  {previewCanvasUrl && (
+                    <div className="mt-6">
+                      <div className="overflow-auto rounded-lg border border-border bg-muted/10 p-4">
+                        <img src={previewCanvasUrl} alt="PDF page preview" className="mx-auto h-auto max-h-[520px] w-auto shadow-sm" />
+                      </div>
+                      {numPages > 1 && (
+                        <div className="mt-4 flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={handlePreviousPage}
+                            disabled={currentPage === 1}
+                            aria-label="Show previous PDF page"
+                            className="rounded-md border border-border p-2 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                          </button>
+                          <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
+                            {Array.from({ length: numPages }, (_, index) => (
+                              <button
+                                key={index}
+                                type="button"
+                                onClick={() => void navigatePage(index + 1)}
+                                aria-label={`Show PDF page ${index + 1}`}
+                                className={`h-16 min-w-12 rounded-md border px-3 text-sm font-bold ${
+                                  currentPage === index + 1 ? "border-primary bg-primary text-white" : "border-border bg-background"
+                                }`}
+                              >
+                                {index + 1}
+                              </button>
+                            ))}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleNextPage}
+                            disabled={currentPage === numPages}
+                            aria-label="Show next PDF page"
+                            className="rounded-md border border-border p-2 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <aside className="rounded-lg border border-border bg-background p-5">
+                  <h2 className="text-lg font-bold">File</h2>
+                  {file ? (
+                    <div className="mt-4 space-y-3 text-sm">
+                      <p className="break-all font-semibold">{file.name}</p>
+                      <p className="text-muted">{formatBytes(file.size)}</p>
+                      <p className="text-muted">{numPages} page{numPages === 1 ? "" : "s"}</p>
+
+                      <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-400">
+                        <strong>Visual Stamp Only:</strong> This tool adds an image of your signature. It does <strong>not</strong> apply a cryptographic digital signature or legal certificate of authenticity.
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={goToCreateSignature}
+                        aria-label="Create signature"
+                        className="mt-4 w-full rounded-md bg-primary px-5 py-3 font-bold text-white transition hover:opacity-90"
+                      >
+                        Create Signature &rarr;
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="mt-4 text-sm text-muted">Choose a PDF to begin.</p>
+                  )}
+                </aside>
+              </div>
+            )}
+
+            {step === "create" && (
+              <div>
+                <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <h2 className="text-2xl font-bold">Create Signature</h2>
+                  <div className="flex rounded-lg bg-muted/10 p-1 ring-1 ring-border">
+                    {(["draw", "type", "upload"] as SignatureMode[]).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => handleSetSignatureMode(mode)}
+                        aria-label={`Use ${mode} signature tab`}
+                        className={`rounded-md px-4 py-2 text-sm font-bold capitalize transition ${
+                          signatureMode === mode ? "bg-primary text-white" : "text-muted hover:text-foreground"
+                        }`}
+                      >
+                        {mode}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {signatureMode === "draw" && (
+                  <div className="flex flex-col items-center">
+                    <canvas
+                      ref={setDrawCanvasRef}
+                      width={SIGNATURE_WIDTH}
+                      height={SIGNATURE_HEIGHT}
+                      aria-label="Draw signature canvas"
+                      className="h-[180px] w-full max-w-[560px] touch-none rounded-lg border-2 border-dashed border-gray-300 bg-white"
+                      onPointerDown={handleStartDrawing}
+                      onPointerMove={handleDraw}
+                      onPointerUp={handleStopDrawing}
+                      onPointerCancel={handleStopDrawing}
+                    />
+                    <div className="mt-4 flex w-full max-w-[560px] flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex flex-wrap items-center gap-4">
+                        <div className="flex gap-2">
+                          {COLORS.map((color) => (
+                            <button
+                              key={color.value}
+                              type="button"
+                              onClick={() => setStrokeColor(color.value)}
+                              aria-label={`Select ${color.label} signature color`}
+                              className={`h-7 w-7 rounded-full ring-2 ring-offset-2 ring-offset-background ${
+                                strokeColor === color.value ? "ring-primary" : "ring-transparent"
+                              }`}
+                              style={{ backgroundColor: color.value }}
+                            />
+                          ))}
+                        </div>
+                        <div className="flex gap-2">
+                          {THICKNESSES.map((thickness) => (
+                            <button
+                              key={thickness.label}
+                              type="button"
+                              onClick={() => setStrokeWidth(thickness.value)}
+                              aria-label={`Use ${thickness.label} stroke thickness`}
+                              className={`rounded-md border px-3 py-2 text-sm font-bold ${
+                                strokeWidth === thickness.value ? "border-primary text-primary" : "border-border text-muted"
+                              }`}
+                            >
+                              {thickness.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={clearCanvas}
+                        aria-label="Clear signature canvas"
+                        className="inline-flex items-center justify-center gap-3 rounded-md border border-border px-4 py-2 text-sm font-bold"
+                      >
+                        Clear
+                        <ShortcutHint shortcut="C" />
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {signatureMode === "type" && (
+                  <div className="mx-auto max-w-[560px]">
+                    <input
+                      type="text"
+                      value={typedName}
+                      onChange={handleTypedNameChange}
+                      placeholder="Type your name"
+                      aria-label="Type your signature name"
+                      className="w-full rounded-md border border-border bg-background px-4 py-3"
+                    />
+                    <div className="mt-4 grid gap-4 sm:grid-cols-[1fr_1fr]">
+                      <select
+                        value={fontFamily}
+                        onChange={handleFontFamilyChange}
+                        aria-label="Select signature font"
+                        className="rounded-md border border-border bg-background px-4 py-3"
+                      >
+                        {FONTS.map((font) => (
+                          <option key={font} value={font}>
+                            {font}
+                          </option>
+                        ))}
+                      </select>
+                      <label className="flex items-center gap-3 text-sm font-semibold text-muted">
+                        Size
+                        <input
+                          type="range"
+                          min="24"
+                          max="72"
+                          value={fontSize}
+                          onChange={handleFontSizeChange}
+                          aria-label="Adjust typed signature font size"
+                          className="w-full"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-4 flex gap-2">
+                      {COLORS.map((color) => (
+                        <button
+                          key={color.value}
+                          type="button"
+                          onClick={() => setStrokeColor(color.value)}
+                          aria-label={`Select ${color.label} typed signature color`}
+                          className={`h-7 w-7 rounded-full ring-2 ring-offset-2 ring-offset-background ${
+                            strokeColor === color.value ? "ring-primary" : "ring-transparent"
+                          }`}
+                          style={{ backgroundColor: color.value }}
+                        />
+                      ))}
+                    </div>
+                    <canvas
+                      ref={setTypeCanvasRef}
+                      width={SIGNATURE_WIDTH}
+                      height={SIGNATURE_HEIGHT}
+                      aria-label="Typed signature preview canvas"
+                      className="mt-4 h-[180px] w-full rounded-lg border-2 border-dashed border-gray-300 bg-white"
+                    />
+                  </div>
+                )}
+
+                {signatureMode === "upload" && (
+                  <div className="mx-auto max-w-[560px]">
+                    <div
+                      {...getSignatureRootProps()}
+                      aria-label="Upload signature image dropzone"
+                      className={`flex min-h-32 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed p-6 text-center transition ${
+                        isSignatureDragActive ? "border-primary bg-primary/5" : "border-border bg-background hover:border-primary"
+                      }`}
+                    >
+                      <input {...getSignatureInputProps({ "aria-label": "Upload signature image" })} />
+                      <p className="font-bold">{isSignatureDragActive ? "Drop the signature image" : "Upload PNG, JPG, or SVG"}</p>
+                      <button
+                        type="button"
+                        onClick={openSignaturePicker}
+                        aria-label="Browse for a signature image"
+                        className="mt-4 rounded-md border border-border px-4 py-2 text-sm font-bold"
+                      >
+                        Browse image
+                      </button>
+                    </div>
+                    <canvas
+                      ref={setUploadCanvasRef}
+                      width={SIGNATURE_WIDTH}
+                      height={SIGNATURE_HEIGHT}
+                      aria-label="Uploaded signature preview canvas"
+                      className="mt-4 h-[180px] w-full rounded-lg border-2 border-dashed border-gray-300 bg-white"
+                    />
+                  </div>
+                )}
+
+                <div className="mt-8 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleUseSignature}
+                    aria-label="Use this signature"
+                    className="rounded-md bg-primary px-6 py-3 font-bold text-white transition hover:opacity-90"
+                  >
+                    Use This Signature &rarr;
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {step === "place" && (
+              <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
+                <div className="w-full overflow-x-auto rounded-lg border border-border bg-muted/10 p-3">
+                  <div
+                    ref={previewContainerRef}
+                    className="relative mx-auto"
+                    style={{ width: previewDims.w, height: previewDims.h, minWidth: previewDims.w }}
+                  >
+                    {previewCanvasUrl && (
+                      <img
+                        src={previewCanvasUrl}
+                        alt="PDF page preview for placing signature"
+                        className="absolute left-0 top-0 h-full w-full select-none"
+                        draggable={false}
+                      />
+                    )}
+                    {signatureDataUrl && (
+                      <div
+                        ref={overlayRef}
+                        role="button"
+                        tabIndex={0}
+                        aria-label="Drag signature overlay"
+                        className="group absolute cursor-move touch-none border border-dashed border-primary"
+                        style={{
+                          left: placement.x,
+                          top: placement.y,
+                          width: placement.width,
+                          height: placement.height,
+                          opacity: placement.opacity,
+                          transform: `rotate(${placement.rotation}deg)`,
+                          transformOrigin: "center center",
+                        }}
+                        onPointerDown={handleDragPointerDown}
+                      >
+                        <img src={signatureDataUrl} alt="Signature overlay" className="h-full w-full select-none object-contain" draggable={false} />
+                        <div
+                          aria-label="Resize signature from top left"
+                          className="absolute -left-1 -top-1 h-2 w-2 cursor-nwse-resize bg-indigo-600"
+                          onPointerDown={handleResizeTopLeft}
+                        />
+                        <div
+                          aria-label="Resize signature from top right"
+                          className="absolute -right-1 -top-1 h-2 w-2 cursor-nesw-resize bg-indigo-600"
+                          onPointerDown={handleResizeTopRight}
+                        />
+                        <div
+                          aria-label="Resize signature from bottom left"
+                          className="absolute -bottom-1 -left-1 h-2 w-2 cursor-nesw-resize bg-indigo-600"
+                          onPointerDown={handleResizeBottomLeft}
+                        />
+                        <div
+                          aria-label="Resize signature from bottom right"
+                          className="absolute -bottom-1 -right-1 h-2 w-2 cursor-nwse-resize bg-indigo-600"
+                          onPointerDown={handleResizeBottomRight}
+                        />
+                        <div
+                          aria-label="Rotate signature"
+                          className="absolute -top-9 left-1/2 flex h-7 w-7 -translate-x-1/2 cursor-grab items-center justify-center rounded-full bg-primary text-white"
+                          onPointerDown={handleRotatePointerDown}
+                        >
+                          <RotateCw className="h-4 w-4" aria-hidden="true" />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <aside className="flex flex-col gap-5 rounded-lg border border-border bg-background p-5">
+                  <label className="text-sm font-bold">
+                    Opacity ({Math.round(placement.opacity * 100)}%)
+                    <input
+                      type="range"
+                      min="0.2"
+                      max="1"
+                      step="0.05"
+                      value={placement.opacity}
+                      onChange={handleOpacityChange}
+                      aria-label="Adjust signature opacity"
+                      className="mt-2 w-full"
+                    />
+                  </label>
+
+                  <label className="flex items-center gap-3 text-sm font-bold">
+                    <input
+                      type="checkbox"
+                      checked={placement.applyAll}
+                      onChange={handleApplyAllChange}
+                      aria-label="Apply signature to all pages"
+                      className="h-4 w-4"
+                    />
+                    Apply to all pages
+                  </label>
+
+                  {numPages > 1 && (
+                    <div className="flex items-center justify-between gap-3 text-sm">
+                      <button
+                        type="button"
+                        onClick={handlePreviousPage}
+                        disabled={currentPage === 1}
+                        aria-label="Go to previous PDF page"
+                        className="rounded-md border border-border px-3 py-2 font-bold disabled:opacity-40"
+                      >
+                        Prev
+                      </button>
+                      <span className="font-semibold text-muted">
+                        Page {currentPage} of {numPages}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleNextPage}
+                        disabled={currentPage === numPages}
+                        aria-label="Go to next PDF page"
+                        className="rounded-md border border-border px-3 py-2 font-bold disabled:opacity-40"
+                      >
+                        Next
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="rounded-md bg-muted/10 p-3 font-mono text-xs text-muted">
+                    X: {Math.round(placement.x)}px Y: {Math.round(placement.y)}px<br />
+                    W: {Math.round(placement.width)}px H: {Math.round(placement.height)}px
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleChangeSignature}
+                    aria-label="Change signature"
+                    className="text-left text-sm font-bold text-primary hover:underline"
+                  >
+                    Change Signature
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={isSigning}
+                    aria-label="Sign and download PDF"
+                    className="mt-auto inline-flex items-center justify-center gap-3 rounded-md bg-primary px-5 py-3 font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isSigning ? "Stamping..." : "Stamp & Download"}
+                    <ShortcutHint shortcut="D" />
+                  </button>
+                </aside>
+              </div>
+            )}
+
+            {step === "done" && (
+              <div className="mx-auto max-w-2xl text-center">
+                <h2 className="text-2xl font-black">Visual stamp PDF ready</h2>
+                <p className="mt-2 text-muted">Your visual signature stamp file has been downloaded and added to recent files.</p>
+                {file && signedSize !== null && (
+                  <SizeComparisonBadge originalSize={file.size} compressedSize={signedSize} />
+                )}
+                <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:justify-center">
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    aria-label="Download signed PDF again"
+                    className="inline-flex items-center justify-center gap-3 rounded-md bg-primary px-5 py-3 font-bold text-white transition hover:opacity-90"
+                  >
+                    Download Again
+                    <ShortcutHint shortcut="D" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      destroyPdfDocProxy();
+                      setFile(null);
+                      setNumPages(0);
+                      setCurrentPage(1);
+                      setPreviewCanvasUrl("");
+                      setPreviewDims({ w: 0, h: 0 });
+                      setSignedSize(null);
+                      setStep("upload");
+                    }}
+                    aria-label="Stamp another PDF"
+                    className="rounded-md border border-border px-5 py-3 font-bold"
+                  >
+                    Stamp Another PDF
+                  </button>
+                </div>
+              </div>
+            )}
+          </section>
+        </div>
+      </main>
+    </AppShell>
+  );
+}
+</file>
+
+<file path="app/unlock/layout.tsx">
+import type { Metadata } from "next";
+
+export const metadata: Metadata = {
+  title: "Unlock PDF Support Check - PDFTools",
+  description:
+    "Check PDF encryption status locally. True browser-side password decryption is unsupported, and encrypted PDFs are not falsely unlocked.",
+};
+
+export default function UnlockLayout({ children }: { children: React.ReactNode }) {
+  return <>{children}</>;
+}
+</file>
+
+<file path="app/unlock/page.tsx">
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useDropzone } from "react-dropzone";
+import { toast } from "sonner";
+import Link from "next/link";
+import { ChevronRight, Unlock, Upload, Download, Home, AlertTriangle } from "lucide-react";
+import AppShell from "../components/AppShell";
+import ShortcutHint from "../components/ShortcutHint";
+import SizeComparisonBadge from "../components/SizeComparisonBadge";
+import { useFileHistory } from "../components/FileHistoryProvider";
+
+const ACCENT = "#10B981";
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+type EncryptionStatus = "unknown" | "encrypted" | "not-encrypted" | "unsupported-encryption" | "corrupted";
+type Step = "upload" | "configure" | "result";
+
+function classifyPdfOpenError(error: unknown): EncryptionStatus {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (message.includes("aes") || message.includes("unsupported encryption") || message.includes("unsupported security")) {
+    return "unsupported-encryption";
+  }
+  if (message.includes("encrypt") || message.includes("password") || message.includes("decrypt") || message.includes("security")) {
+    return "encrypted";
+  }
+  return "corrupted";
+}
+
+export default function UnlockPage() {
+  const [step, setStep] = useState<Step>("upload");
+  const [file, setFile] = useState<File | null>(null);
+  const [encryptionStatus, setEncryptionStatus] = useState<EncryptionStatus>("unknown");
+  const [processing, setProcessing] = useState(false);
+  const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
+  const uploadRef = useRef<HTMLInputElement>(null);
+  const { addFile } = useFileHistory();
+
+  const handleFile = useCallback(async (f: File) => {
+    if (!f.name.toLowerCase().endsWith(".pdf") && f.type !== "application/pdf") {
+      toast.error("Please select a valid PDF file.");
+      return;
+    }
+    setFile(f);
+    setResult(null);
+    setEncryptionStatus("unknown");
+    setStep("configure");
+
+    // Detect only. This tool does not decrypt and must not rewrite protected PDFs.
+    try {
+      const pdfjs = await import("pdfjs-dist");
+      if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+        pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+      }
+      const ab = await f.arrayBuffer();
+      const loadingTask = pdfjs.getDocument({ data: new Uint8Array(ab) });
+      let proxy: import("pdfjs-dist").PDFDocumentProxy | null = null;
+      try {
+        proxy = await loadingTask.promise;
+        setEncryptionStatus("not-encrypted");
+      } catch (e) {
+        setEncryptionStatus(classifyPdfOpenError(e));
+      } finally {
+        if (proxy) {
+          await proxy.cleanup();
+          await proxy.destroy();
+        }
+        await loadingTask.destroy();
+      }
+    } catch {
+      setEncryptionStatus("unknown");
+    }
+
+    addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "unlock" });
+    toast.success(`"${f.name}" loaded`);
+  }, [addFile]);
+
+  const onDrop = useCallback((acceptedFiles: File[]) => {
+    if (acceptedFiles[0]) handleFile(acceptedFiles[0]);
+  }, [handleFile]);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: { "application/pdf": [".pdf"] },
+    multiple: false,
+    maxFiles: 1,
+    onDropRejected: () => toast.error("Please select a valid PDF file."),
+  });
+
+  const handleUnlock = useCallback(async () => {
+    if (!file) return;
+    setProcessing(true);
+    setResult(null);
+
+    try {
+      if (encryptionStatus === "encrypted" || encryptionStatus === "unsupported-encryption") {
+        toast.error("True PDF decryption is not supported by the current browser engine. No unlocked file was created.", { id: "unlock" });
+        return;
+      }
+
+      if (encryptionStatus === "corrupted") {
+        toast.error("File is corrupted or unsupported. No output was created.", { id: "unlock" });
+        return;
+      }
+
+      if (encryptionStatus !== "not-encrypted") {
+        toast.error("Could not verify that this PDF is unencrypted. No output was created.", { id: "unlock" });
+        return;
+      }
+
+      toast.loading("Preparing unchanged download...", { id: "unlock" });
+      const pdfBytes = new Uint8Array(await file.arrayBuffer());
+      const baseName = file.name.replace(/\.pdf$/i, "");
+      setResult({ bytes: pdfBytes, name: `unchanged-${baseName}.pdf` });
+      setStep("result");
+      toast.success("This PDF was not encrypted; original file prepared unchanged.", { id: "unlock" });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Operation failed.";
+      toast.error(msg, { id: "unlock" });
+    } finally {
+      setProcessing(false);
+    }
+  }, [encryptionStatus, file]);
+
+  const handleDownload = useCallback(() => {
+    if (!result) return;
+    const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
+    const blob = new Blob([buffer], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = result.name;
+    a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    toast.success("Download started!");
+  }, [result]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
+      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleDownload, result]);
+
+  const reset = useCallback(() => {
+    setFile(null);
+    setResult(null);
+    setEncryptionStatus("unknown");
+    setStep("upload");
+  }, []);
+
+  return (
+    <AppShell>
+      <main className="mx-auto w-full max-w-4xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
+        {/* Breadcrumb */}
+        <nav className="mb-2 flex items-center gap-1.5 text-xs text-muted" aria-label="Breadcrumb">
+          <Link href="/" className="flex items-center gap-1 hover:text-foreground transition-colors">
+            <Home className="h-3 w-3" /> Home
+          </Link>
+          <ChevronRight className="h-3 w-3" />
+          <Link href="/tools" className="hover:text-foreground transition-colors">Tools</Link>
+          <ChevronRight className="h-3 w-3" />
+          <span className="text-foreground">Unlock PDF</span>
+        </nav>
+
+        <Link href="/tools" className="mb-6 inline-flex items-center gap-1.5 text-xs text-muted hover:text-foreground transition-colors">
+          ← Back to all tools
+        </Link>
+
+        {/* Header */}
+        <div className="mb-6 flex items-start gap-4">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl" style={{ background: "#0F2A1A", color: ACCENT }}>
+            <Unlock className="h-6 w-6" />
+          </div>
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Unlock PDF</h1>
+            <p className="mt-1 text-sm text-muted">Check whether a PDF can be unlocked by this browser-only engine.</p>
+          </div>
+        </div>
+
+        {/* Legal disclaimer */}
+        <div className="mb-6 flex items-start gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4">
+          <AlertTriangle className="h-5 w-5 shrink-0 text-amber-400 mt-0.5" />
+          <p className="text-sm text-amber-300">
+            Only attempt to inspect PDFs you own or have explicit permission to process. This browser tool does not bypass encryption or remove owner permissions.
+          </p>
+        </div>
+
+        {/* Step 1 — Upload */}
+        {step === "upload" && (
+          <div
+            {...getRootProps()}
+            className={`group relative flex flex-col items-center justify-center gap-5 rounded-3xl border-2 border-dashed p-12 text-center transition-all cursor-pointer ${
+              isDragActive
+                ? "border-emerald-500 bg-emerald-500/10 scale-[1.01]"
+                : "border-border bg-card hover:border-emerald-500/50 hover:bg-emerald-500/5"
+            }`}
+            style={{ minHeight: 300 }}
+          >
+            <input {...getInputProps()} ref={uploadRef} />
+            <div className="flex h-20 w-20 items-center justify-center rounded-3xl transition-transform group-hover:scale-110"
+              style={{ background: "#0F2A1A", color: ACCENT }}>
+              <Upload className="h-9 w-9" />
+            </div>
+            <div>
+              <p className="text-xl font-bold text-foreground">
+                {isDragActive ? "Drop your PDF here" : "Drag & drop your PDF"}
+              </p>
+              <p className="mt-1.5 text-sm text-muted">or click to browse — PDF files only</p>
+            </div>
+            <div className="flex items-center gap-2 rounded-2xl border border-border bg-background px-5 py-2.5">
+              <Upload className="h-4 w-4" style={{ color: ACCENT }} />
+              <span className="text-sm font-semibold text-foreground">Choose PDF</span>
+              <ShortcutHint shortcut="U" />
+            </div>
+            <p className="text-xs text-muted">100% private · files stay local</p>
+          </div>
+        )}
+
+        {/* Step 2 — Configure */}
+        {step === "configure" && file && (
+          <div className="space-y-5">
+            <div className="flex items-center gap-4 rounded-2xl border border-border bg-card p-5">
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl" style={{ background: "#0F2A1A", color: ACCENT }}>
+                <Unlock className="h-6 w-6" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate font-semibold text-foreground">{file.name}</p>
+                <p className="text-sm text-muted">{formatBytes(file.size)}</p>
+              </div>
+              <button onClick={reset} className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium text-muted hover:text-foreground transition-colors border border-border">
+                Change
+              </button>
+            </div>
+
+            {/* Not encrypted notice */}
+            {encryptionStatus === "not-encrypted" && (
+              <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                <p className="text-sm text-amber-700 dark:text-amber-400">
+                  This PDF does not require an open password. This tool will only offer the original file unchanged; it will not strip owner permissions.
+                </p>
+              </div>
+            )}
+
+            {encryptionStatus === "encrypted" && (
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <p className="text-sm text-red-700 dark:text-red-300">
+                  This PDF is encrypted. True password decryption is not supported by the current client-side engine, so no unlocked PDF will be created.
+                </p>
+              </div>
+            )}
+
+            {encryptionStatus === "unsupported-encryption" && (
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <p className="text-sm text-red-700 dark:text-red-300">
+                  This PDF uses unsupported encryption, such as an AES/security handler this browser engine cannot decrypt. No unlocked PDF will be created.
+                </p>
+              </div>
+            )}
+
+            {/* Corrupted notice */}
+            {encryptionStatus === "corrupted" && (
+              <div className="flex items-start gap-3 rounded-xl border border-red-500/30 bg-red-500/10 p-4">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+                <p className="text-sm text-red-700 dark:text-red-300">
+                  This PDF appears to be corrupted, malformed, or uses an unsupported format. It cannot be unlocked by the client-side engine.
+                </p>
+              </div>
+            )}
+
+            <button
+              onClick={handleUnlock}
+              disabled={
+                processing ||
+                encryptionStatus === "unknown" ||
+                encryptionStatus === "corrupted" ||
+                encryptionStatus === "encrypted" ||
+                encryptionStatus === "unsupported-encryption"
+              }
+              className="flex w-full items-center justify-center gap-2.5 rounded-2xl py-4 text-base font-bold text-white shadow-lg transition-all hover:opacity-90 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
+              style={{ background: ACCENT }}
+            >
+              {processing ? (
+                <>
+                  <div className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                  Processing…
+                </>
+              ) : (
+                <>
+                  <Unlock className="h-5 w-5" />
+                  {encryptionStatus === "not-encrypted" ? "Download Original Unchanged" : "Unlock Unsupported"}
+                </>
+              )}
+            </button>
+          </div>
+        )}
+
+        {/* Step 3 — Result */}
+        {step === "result" && result && file && (
+          <div className="space-y-5">
+            <div className="flex items-center gap-4 rounded-2xl border p-5" style={{ borderColor: `${ACCENT}30`, background: `${ACCENT}08` }}>
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl" style={{ background: `${ACCENT}20`, color: ACCENT }}>
+                <Unlock className="h-6 w-6" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="font-semibold text-foreground">Original PDF ready unchanged</p>
+                <p className="mt-0.5 text-sm text-muted truncate">{result.name}</p>
+              </div>
+            </div>
+
+            <SizeComparisonBadge originalSize={file.size} compressedSize={result.bytes.length} />
+
+            <button
+              id="download-btn"
+              onClick={handleDownload}
+              className="flex w-full items-center justify-center gap-2.5 rounded-2xl py-4 text-base font-bold text-white shadow-lg transition-all hover:opacity-90 hover:-translate-y-0.5"
+              style={{ background: ACCENT }}
+            >
+              <Download className="h-5 w-5" />
+              Download Original PDF
+              <ShortcutHint shortcut="D" />
+            </button>
+
+            <button
+              onClick={reset}
+              className="w-full rounded-2xl border border-border bg-card py-3 text-sm font-semibold text-foreground transition hover:bg-background"
+            >
+              Check another PDF
+            </button>
+          </div>
+        )}
+      </main>
+    </AppShell>
+  );
+}
+</file>
+
+</files>

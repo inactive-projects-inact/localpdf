@@ -11,6 +11,7 @@ import { useFileHistory } from "../components/FileHistoryProvider";
 import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { formatBytes } from "../lib/format-bytes";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
+import { useCanvasRenderer } from "../hooks/useCanvasRenderer";
 
 type RotateMode = "all" | "single";
 type RotateAngle = 90 | 180 | 270;
@@ -63,7 +64,55 @@ export default function RotatePage() {
   const worker = useProcessorWorker();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // previewTaskRef guards against stale renders when settings change rapidly.
   const previewTaskRef = useRef(0);
+  const previewJobIdRef = useRef(0);
+
+  const canvasRenderer = useCanvasRenderer({
+    onResult: useCallback((result) => {
+      // Each result carries a taskId encoded in its requestId.
+      // Only apply if this is still the active task.
+      const taskId = parseInt(result.requestId.split("-")[1] ?? "0", 10);
+      if (taskId !== previewTaskRef.current) {
+        if (result.url) URL.revokeObjectURL(result.url);
+        return;
+      }
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        if (result.url) URL.revokeObjectURL(result.url);
+        setPreviewRendering(false);
+        return;
+      }
+      if (result.url === null) {
+        // OffscreenCanvas unavailable — fall back to main-thread render.
+        // (pdfBytes and basePageRotation are captured via the renderPreview closure below)
+        setPreviewRendering(false);
+        return;
+      }
+      // Draw via an Image element to avoid keeping a canvas around.
+      const img = new Image();
+      img.onload = () => {
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+        ctx?.drawImage(img, 0, 0);
+        if (taskId === previewTaskRef.current) setPreviewRendering(false);
+      };
+      img.onerror = () => {
+        if (taskId === previewTaskRef.current) setPreviewRendering(false);
+      };
+      img.src = result.url;
+      // Revoke after the image element has loaded (or immediately on error).
+      img.addEventListener("load", () => URL.revokeObjectURL(result.url!), { once: true });
+      img.addEventListener("error", () => URL.revokeObjectURL(result.url!), { once: true });
+    }, []),
+    onError: useCallback((requestId, _pageIndex, reason) => {
+      const taskId = parseInt(requestId.split("-")[1] ?? "0", 10);
+      if (taskId === previewTaskRef.current) setPreviewRendering(false);
+      void reason; // "cancelled" is already filtered by the hook
+    }, []),
+  });
 
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
@@ -76,6 +125,9 @@ export default function RotatePage() {
     setMode("all");
     setAngle(90);
     worker.reset();
+    // Cancel any in-flight preview render.
+    canvasRenderer.cancel(previewJobIdRef.current);
+    previewJobIdRef.current += 1;
     const canvas = canvasRef.current;
     if (canvas) {
       const ctx = canvas.getContext("2d");
@@ -83,7 +135,7 @@ export default function RotatePage() {
       canvas.width = 0;
       canvas.height = 0;
     }
-  }, []);
+  }, [worker, canvasRenderer]);
 
   const loadPdf = useCallback(
     async (uploaded: File) => {
@@ -158,40 +210,27 @@ export default function RotatePage() {
     },
   });
 
-  const renderPreview = useCallback(async () => {
+  const renderPreview = useCallback(() => {
     if (!pdfBytes || !canvasRef.current) return;
 
     const extraRotation = previewRotationForPage1(mode, selectedPage, angle);
     const displayRotation = normalizeAngle(basePageRotation + extraRotation);
-    const taskId = ++previewTaskRef.current;
+    // Bump counters so the onResult callback can detect stale renders.
+    previewTaskRef.current += 1;
+    const taskId = previewTaskRef.current;
+    previewJobIdRef.current += 1;
+    const jobId = previewJobIdRef.current;
     setPreviewRendering(true);
 
-    try {
-      const { getDocument } = await getPdfjs();
-      const pdf = await getDocument({ data: pdfBytes.slice(0) }).promise;
-      const page = await pdf.getPage(1);
-      const scale = 1.25;
-      const viewport = page.getViewport({ scale, rotation: displayRotation });
-      const canvas = canvasRef.current;
-      const context = canvas.getContext("2d");
-      if (!context) return;
-
-      canvas.width = Math.ceil(viewport.width);
-      canvas.height = Math.ceil(viewport.height);
-      context.clearRect(0, 0, canvas.width, canvas.height);
-
-      await page.render({ canvasContext: context, viewport }).promise;
-      await pdf.destroy();
-
-      if (taskId !== previewTaskRef.current) return;
-    } catch {
-      if (taskId !== previewTaskRef.current) return;
-    } finally {
-      if (taskId === previewTaskRef.current) {
-        setPreviewRendering(false);
-      }
-    }
-  }, [pdfBytes, mode, selectedPage, angle, basePageRotation]);
+    canvasRenderer.request({
+      jobId,
+      requestId: `preview-${taskId}`,
+      fileBytes: pdfBytes as ArrayBuffer,
+      pageIndex: 0,
+      targetWidth: Math.ceil(400 * 1.25),
+      extraRotation: displayRotation,
+    });
+  }, [pdfBytes, mode, selectedPage, angle, basePageRotation, canvasRenderer]);
 
   useEffect(() => {
     if (!pdfBytes || pageCount === 0) return;
@@ -233,6 +272,8 @@ export default function RotatePage() {
       toast.error(worker.error || "Something went wrong.", { id: "rotate" });
     }
   }, [worker.status, worker.resultBlob, worker.resultFilename, worker.error, addFile]);
+
+  // Worker lifecycle is now fully managed by useCanvasRenderer — no manual cleanup needed here.
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

@@ -9,6 +9,7 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { usePdfPipelineWorker } from "../hooks/usePdfPipelineWorker";
 
 const ACCENT = "#3B82F6";
 
@@ -19,50 +20,52 @@ function formatBytes(bytes: number): string {
 }
 
 type Step = "upload" | "configure" | "result";
+type PipelineOperation = "idle" | "analyze" | "convert";
 
 export default function PdfToWordPage() {
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
   const [pageCount, setPageCount] = useState<number>(0);
-  const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
+  const [activeOperation, setActiveOperation] = useState<PipelineOperation>("idle");
   const uploadRef = useRef<HTMLInputElement>(null);
   const { addFile } = useFileHistory();
+  const createWordWorker = useCallback(
+    () => new Worker(new URL("../lib/pdfToWord.worker.ts", import.meta.url), { type: "module" }),
+    [],
+  );
+  const {
+    status: pipelineStatus,
+    progress: pipelineProgress,
+    memoryWarning,
+    result: pipelineResult,
+    error: pipelineError,
+    process: startPipeline,
+    cancel,
+    reset: resetPipeline,
+  } = usePdfPipelineWorker(createWordWorker);
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
-      if ((e.key === "d" || e.key === "D") && result) handleDownload();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [result]);
+  const processing = activeOperation === "convert" && pipelineStatus === "processing";
+  const analyzing = activeOperation === "analyze" && pipelineStatus === "processing";
 
   const handleFile = useCallback(async (f: File) => {
     if (!f.name.toLowerCase().endsWith(".pdf") && f.type !== "application/pdf") {
       toast.error("Please select a valid PDF file.");
       return;
     }
+    resetPipeline();
+    setActiveOperation("analyze");
     setFile(f);
     setResult(null);
+    setPageCount(0);
     setStep("configure");
-    // Count pages using pdfjs
-    try {
-      const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-      GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-      const ab = await f.arrayBuffer();
-      const doc = await getDocument({ data: ab }).promise;
-      setPageCount(doc.numPages);
-      await doc.destroy();
-    } catch {
-      setPageCount(0);
-    }
+    void startPipeline(f, {
+      tool: "pdf-to-word",
+      operation: "analyze",
+    });
     addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "pdfToWord" });
     toast.success(`"${f.name}" loaded`);
-  }, [addFile]);
+  }, [addFile, resetPipeline, startPipeline]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles[0]) handleFile(acceptedFiles[0]);
@@ -79,102 +82,59 @@ export default function PdfToWordPage() {
 
   const handleConvert = useCallback(async () => {
     if (!file) return;
-    setProcessing(true);
+    setActiveOperation("convert");
     setResult(null);
+    toast.loading("Extracting text from PDF...", { id: "pdf2word" });
+    await startPipeline(file, {
+      tool: "pdf-to-word",
+      operation: "convert",
+    });
+  }, [file, startPipeline]);
 
-    try {
-      toast.loading("Extracting text from PDF...", { id: "pdf2word" });
-
-      const { getDocument, GlobalWorkerOptions } = await import("pdfjs-dist");
-      GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-      const ab = await file.arrayBuffer();
-      const pdfDoc = await getDocument({ data: ab }).promise;
-
-      const { Document, Packer, Paragraph, TextRun, HeadingLevel, PageBreak } = await import("docx");
-
-      toast.loading("Building Word document...", { id: "pdf2word" });
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const docChildren: any[] = [];
-
-      if (pdfDoc.numPages > 100) {
-        throw new Error("Document too large. Client-side text extraction is limited to 100 pages.");
-      }
-
-      for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-        // Yield to keep UI responsive
-        await new Promise(resolve => setTimeout(resolve, 0));
-
-        const page = await pdfDoc.getPage(pageNum);
-        const textContent = await page.getTextContent();
-
-        // Group items into lines by Y position
-        interface PdfTextItem { str: string; transform: number[]; height: number }
-        const items = textContent.items
-          .filter(item => "str" in item && typeof (item as { str?: string }).str === "string")
-          .map(item => item as unknown as PdfTextItem);
-
-        // Sort by Y descending (PDF coords go bottom-up), then X
-        const sorted = [...items].sort((a, b) => {
-          const yDiff = b.transform[5] - a.transform[5];
-          if (Math.abs(yDiff) > 3) return yDiff;
-          return a.transform[4] - b.transform[4];
-        });
-
-        // Group by Y-bands (lines)
-        const lines: Array<{ text: string; maxHeight: number }> = [];
-        let currentLine: { text: string; maxHeight: number } | null = null;
-        let lastY = -Infinity;
-
-        for (const item of sorted) {
-          const y = item.transform[5];
-          if (currentLine === null || Math.abs(y - lastY) > 5) {
-            if (currentLine) lines.push(currentLine);
-            currentLine = { text: item.str, maxHeight: item.height ?? 12 };
-            lastY = y;
-          } else {
-            currentLine.text += (item.str.startsWith(" ") ? "" : " ") + item.str;
-            currentLine.maxHeight = Math.max(currentLine.maxHeight, item.height ?? 12);
-          }
-        }
-        if (currentLine) lines.push(currentLine);
-
-        for (const line of lines) {
-          const text = line.text.trim();
-          if (!text) continue;
-
-          docChildren.push(
-            new Paragraph({
-              children: [new TextRun({ text })],
-            })
-          );
-        }
-
-        // Page break between pages (not after last)
-        if (pageNum < pdfDoc.numPages) {
-          docChildren.push(new Paragraph({ children: [new PageBreak()] }));
-        }
-      }
-
-      await pdfDoc.destroy();
-
-      const doc = new Document({ sections: [{ children: docChildren }] });
-      toast.loading("Generating .docx file...", { id: "pdf2word" });
-      await new Promise(resolve => setTimeout(resolve, 50));
-      
-      const blob = await Packer.toBlob(doc);
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      const baseName = file.name.replace(/\.pdf$/i, "");
-      setResult({ bytes, name: `converted-${baseName}.docx` });
-      setStep("result");
-      toast.success("Done! Your Word file is ready.", { id: "pdf2word" });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Conversion failed.";
-      toast.error(msg, { id: "pdf2word" });
-    } finally {
-      setProcessing(false);
+  useEffect(() => {
+    if (pipelineStatus === "done" && activeOperation === "analyze" && pipelineResult.output?.kind === "pdf-to-word-analysis") {
+      const { pageCount: analyzedPageCount } = pipelineResult.output;
+      queueMicrotask(() => {
+        setPageCount(analyzedPageCount);
+        setActiveOperation("idle");
+        resetPipeline();
+      });
+      return;
     }
-  }, [file]);
+
+    if (pipelineStatus === "done" && activeOperation === "convert" && pipelineResult.output?.kind === "file") {
+      const { bytes, filename } = pipelineResult.output;
+      queueMicrotask(() => {
+        setResult({ bytes, name: filename });
+        setStep("result");
+        setActiveOperation("idle");
+        toast.success("Done! Your Word file is ready.", { id: "pdf2word" });
+      });
+      return;
+    }
+
+    if (pipelineStatus === "error" && activeOperation !== "idle" && pipelineError) {
+      const operation = activeOperation;
+      queueMicrotask(() => {
+        toast.error(pipelineError.message, { id: operation === "convert" ? "pdf2word" : undefined });
+        if (operation === "analyze") {
+          setFile(null);
+          setStep("upload");
+        }
+        setActiveOperation("idle");
+        resetPipeline();
+      });
+      return;
+    }
+
+    if (pipelineStatus === "cancelled" && activeOperation !== "idle") {
+      queueMicrotask(() => {
+        toast.info("Conversion cancelled.", { id: "pdf2word" });
+        setActiveOperation("idle");
+        resetPipeline();
+      });
+    }
+  }, [activeOperation, pipelineError, pipelineResult.output, pipelineStatus, resetPipeline]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
@@ -191,12 +151,25 @@ export default function PdfToWordPage() {
     toast.success("Download started!");
   }, [result]);
 
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.key === "u" || e.key === "U") uploadRef.current?.click();
+      if ((e.key === "d" || e.key === "D") && result) handleDownload();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [handleDownload, result]);
+
   const reset = useCallback(() => {
+    resetPipeline();
+    setActiveOperation("idle");
     setFile(null);
     setResult(null);
     setPageCount(0);
     setStep("upload");
-  }, []);
+  }, [resetPipeline]);
 
   return (
     <AppShell>
@@ -269,7 +242,7 @@ export default function PdfToWordPage() {
               <div className="min-w-0 flex-1">
                 <p className="truncate font-semibold text-foreground">{file.name}</p>
                 <p className="text-sm text-muted">
-                  {formatBytes(file.size)}{pageCount > 0 ? ` · ${pageCount} page${pageCount !== 1 ? "s" : ""}` : ""}
+                  {formatBytes(file.size)}{analyzing ? " - checking pages" : pageCount > 0 ? ` · ${pageCount} page${pageCount !== 1 ? "s" : ""}` : ""}
                 </p>
               </div>
               <button onClick={reset} className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium text-muted hover:text-foreground transition-colors border border-border hover:border-foreground/20">
@@ -290,7 +263,7 @@ export default function PdfToWordPage() {
             <div className="flex items-center justify-between gap-4">
               <button
                 onClick={handleConvert}
-                disabled={processing}
+                disabled={processing || analyzing}
                 className="flex flex-1 items-center justify-center gap-2.5 rounded-2xl py-4 text-base font-bold text-white shadow-lg transition-all hover:opacity-90 hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-60"
                 style={{ background: ACCENT }}
               >
@@ -307,6 +280,22 @@ export default function PdfToWordPage() {
                 )}
               </button>
             </div>
+            {processing && (
+              <div className="rounded-2xl border border-border bg-card p-4">
+                <p className="text-sm font-semibold text-foreground">{pipelineProgress?.message ?? "Converting..."}</p>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+                  <div className="h-full transition-all" style={{ width: `${pipelineProgress?.percent ?? 0}%`, backgroundColor: ACCENT }} />
+                </div>
+                {memoryWarning && (
+                  <p className="mt-3 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-300">
+                    Large PDF detected. Conversion may use about {formatBytes(memoryWarning.estimatedBytes)} of memory.
+                  </p>
+                )}
+                <button type="button" onClick={cancel} className="mt-4 rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-muted">
+                  Cancel
+                </button>
+              </div>
+            )}
           </div>
         )}
 

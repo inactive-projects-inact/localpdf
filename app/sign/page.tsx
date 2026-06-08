@@ -9,6 +9,9 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { usePdfDocProxy } from "../hooks/usePdfDocProxy";
+import { downloadBlob } from "../lib/pdf-utils";
+import { hasPdfHeader } from "../lib/tool-registry";
 
 type SignatureMode = "draw" | "type" | "upload";
 type Step = "upload" | "create" | "place" | "done";
@@ -28,9 +31,6 @@ type Point = {
   x: number;
   y: number;
 };
-
-type PdfJs = typeof import("pdfjs-dist");
-type PdfDocumentProxy = import("pdfjs-dist").PDFDocumentProxy;
 
 const ACCENT_COLOR = "#3B3BFF";
 const SIGNATURE_WIDTH = 560;
@@ -52,14 +52,6 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-async function loadPdfJs(): Promise<PdfJs> {
-  const pdfjs = await import("pdfjs-dist");
-  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-  }
-  return pdfjs;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -86,8 +78,6 @@ function mapVisualPointToPdf(x: number, y: number, pageWidth: number, pageHeight
 export default function SignPdfPage() {
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
-  const [pdfDocProxy, setPdfDocProxy] = useState<PdfDocumentProxy | null>(null);
-  const [numPages, setNumPages] = useState(0);
   const [currentPage, setCurrentPage] = useState(1);
   const [previewCanvasUrl, setPreviewCanvasUrl] = useState("");
   const [previewDims, setPreviewDims] = useState({ w: 0, h: 0 });
@@ -113,6 +103,7 @@ export default function SignPdfPage() {
   const [isSigning, setIsSigning] = useState(false);
 
   const { addFile } = useFileHistory();
+  const { proxyRef, numPages, loadError, load, destroy } = usePdfDocProxy();
   const drawCanvasRef = useRef<HTMLCanvasElement>(null);
   const drawContextRef = useRef<CanvasRenderingContext2D | null>(null);
   const typeCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -122,6 +113,7 @@ export default function SignPdfPage() {
   const pointsRef = useRef<Point[]>([]);
   const overlayRef = useRef<HTMLDivElement>(null);
   const previewContainerRef = useRef<HTMLDivElement>(null);
+  const previewRenderIdRef = useRef(0);
 
   const setDrawCanvasRef = useCallback((node: HTMLCanvasElement | null) => {
     drawCanvasRef.current = node;
@@ -152,7 +144,11 @@ export default function SignPdfPage() {
     }
   }, []);
 
-  const renderPdfPage = useCallback(async (proxy: PdfDocumentProxy, pageNum: number) => {
+  const renderPdfPage = useCallback(async (pageNum: number) => {
+    const proxy = proxyRef.current;
+    if (!proxy) return;
+    const renderId = previewRenderIdRef.current + 1;
+    previewRenderIdRef.current = renderId;
     const page = await proxy.getPage(pageNum);
     const viewport = page.getViewport({ scale: PAGE_SCALE });
     const canvas = document.createElement("canvas");
@@ -162,9 +158,10 @@ export default function SignPdfPage() {
     canvas.width = viewport.width;
     canvas.height = viewport.height;
     await page.render({ canvasContext: context, viewport }).promise;
+    if (proxyRef.current !== proxy || previewRenderIdRef.current !== renderId) return;
     setPreviewDims({ w: viewport.width, h: viewport.height });
     setPreviewCanvasUrl(canvas.toDataURL("image/png"));
-  }, []);
+  }, [proxyRef]);
 
   const clearCanvas = useCallback(() => {
     const canvas = drawCanvasRef.current;
@@ -281,21 +278,22 @@ export default function SignPdfPage() {
       if (!selectedFile) return;
 
       try {
-        const pdfjs = await loadPdfJs();
-        const arrayBuffer = await selectedFile.arrayBuffer();
-        const proxy = await pdfjs.getDocument({ data: arrayBuffer.slice(0) }).promise;
+        if (!(await hasPdfHeader(selectedFile))) {
+          toast.error("Please select a valid PDF file.");
+          return;
+        }
         setFile(selectedFile);
-        setPdfDocProxy(proxy);
-        setNumPages(proxy.numPages);
         setCurrentPage(1);
         setPlacement((current) => ({ ...current, pageIndex: 0 }));
-        await renderPdfPage(proxy, 1);
+        setPreviewCanvasUrl("");
+        setPreviewDims({ w: 0, h: 0 });
+        load(selectedFile);
       } catch (error) {
         console.error(error);
         toast.error("Something went wrong.");
       }
     },
-    [renderPdfPage],
+    [load],
   );
 
   const handleSignatureImageDrop = useCallback(
@@ -344,20 +342,20 @@ export default function SignPdfPage() {
   });
 
   const goToCreateSignature = useCallback(() => {
-    if (!file) return;
+    if (!file || numPages === 0) return;
     setStep("create");
-  }, [file]);
+  }, [file, numPages]);
 
   const navigatePage = useCallback(
     async (pageNum: number) => {
-      if (!pdfDocProxy) return;
+      if (!proxyRef.current) return;
 
       const next = clamp(pageNum, 1, numPages);
       setCurrentPage(next);
       setPlacement((current) => ({ ...current, pageIndex: next - 1 }));
-      await renderPdfPage(pdfDocProxy, next);
+      await renderPdfPage(next);
     },
-    [numPages, pdfDocProxy, renderPdfPage],
+    [numPages, proxyRef, renderPdfPage],
   );
 
   const handlePreviousPage = useCallback(() => {
@@ -590,12 +588,7 @@ export default function SignPdfPage() {
       const bytes = await pdfDoc.save();
       const signedBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
       const blob = new Blob([signedBuffer], { type: "application/pdf" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `visual-stamp-${file.name}`;
-      anchor.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+      downloadBlob(blob, `visual-stamp-${file.name}`);
       setSignedSize(bytes.byteLength);
       addFile({
         filename: `visual-stamp-${file.name}`,
@@ -614,11 +607,6 @@ export default function SignPdfPage() {
   }, [addFile, file, isSigning, placement, previewDims.h, previewDims.w, signatureDataUrl]);
 
   useEffect(() => {
-    void loadPdfJs();
-    return () => {};
-  }, []);
-
-  useEffect(() => {
     const link = document.createElement("link");
     link.href = "https://fonts.googleapis.com/css2?family=Dancing+Script&family=Great+Vibes&family=Pacifico&family=Satisfy&display=swap";
     link.rel = "stylesheet";
@@ -633,6 +621,20 @@ export default function SignPdfPage() {
     drawTypedSignature();
     return () => {};
   }, [drawTypedSignature]);
+
+  useEffect(() => {
+    if (!loadError) return;
+    toast.error(
+      loadError.reason === "encrypted" || loadError.reason === "unsupported-encryption"
+        ? "This PDF is encrypted or unsupported by the browser PDF engine."
+        : "Something went wrong.",
+    );
+  }, [loadError]);
+
+  useEffect(() => {
+    if (!file || numPages === 0) return;
+    void renderPdfPage(currentPage);
+  }, [currentPage, file, numPages, renderPdfPage]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -1162,7 +1164,15 @@ export default function SignPdfPage() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setStep("upload")}
+                    onClick={() => {
+                      destroy();
+                      setFile(null);
+                      setCurrentPage(1);
+                      setPreviewCanvasUrl("");
+                      setPreviewDims({ w: 0, h: 0 });
+                      setSignedSize(null);
+                      setStep("upload");
+                    }}
                     aria-label="Stamp another PDF"
                     className="rounded-md border border-border px-5 py-3 font-bold"
                   >

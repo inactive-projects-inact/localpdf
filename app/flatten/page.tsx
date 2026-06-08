@@ -10,19 +10,12 @@ import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import type { FileHistoryItem } from "../components/FileHistoryProvider";
+import { usePdfPipelineWorker } from "../hooks/usePdfPipelineWorker";
 
 type Step = "upload" | "configure" | "processing" | "result";
+type PipelineOperation = "idle" | "analyze" | "flatten";
+
 const ACCENT_COLOR = "#FF4D4D";
-
-type PdfJs = typeof import("pdfjs-dist");
-
-async function loadPdfJs(): Promise<PdfJs> {
-  const pdfjs = await import("pdfjs-dist");
-  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-  }
-  return pdfjs;
-}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -39,35 +32,46 @@ export default function FlattenPdfPage() {
   const [flattenedCount, setFlattenedCount] = useState(0);
   const [resultBytes, setResultBytes] = useState<Uint8Array | null>(null);
   const [resultName, setResultName] = useState("");
+  const [activeOperation, setActiveOperation] = useState<PipelineOperation>("idle");
 
-  const handleDrop = useCallback(async (files: File[]) => {
-    const selectedFile = files[0];
-    if (!selectedFile) return;
-    setResultBytes(null);
-    setResultName("");
-    setFlattenedCount(0);
-    let proxy: import("pdfjs-dist").PDFDocumentProxy | null = null;
-    try {
-      const pdfjs = await loadPdfJs();
-      const { PDFDocument } = await import("pdf-lib");
-      const arrayBuffer = await selectedFile.arrayBuffer();
-      proxy = await pdfjs.getDocument({ data: arrayBuffer.slice(0) }).promise;
-      setPageCount(proxy.numPages);
+  const createFlattenWorker = useCallback(
+    () => new Worker(new URL("../lib/flattenPdf.worker.ts", import.meta.url), { type: "module" }),
+    [],
+  );
+  const {
+    status: pipelineStatus,
+    progress: pipelineProgress,
+    memoryWarning,
+    result: pipelineResult,
+    error: pipelineError,
+    process: startPipeline,
+    cancel,
+    reset: resetPipeline,
+  } = usePdfPipelineWorker(createFlattenWorker);
 
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-      const pdfDoc = await PDFDocument.load(arrayBuffer);
+  const analysisInProgress = activeOperation === "analyze" && pipelineStatus === "processing";
+  const progressPercent = activeOperation === "flatten" ? pipelineProgress?.percent ?? 0 : 0;
+
+  const handleDrop = useCallback(
+    (files: File[]) => {
+      const selectedFile = files[0];
+      if (!selectedFile) return;
+      resetPipeline();
+      setActiveOperation("analyze");
       setFile(selectedFile);
-      setHasFormFields(pdfDoc.getForm().getFields().length > 0);
-    } catch (error) {
-      console.error(error);
-      toast.error("Something went wrong.");
-    } finally {
-      if (proxy) {
-        await proxy.cleanup();
-        await proxy.destroy();
-      }
-    }
-  }, []);
+      setPageCount(0);
+      setHasFormFields(false);
+      setFlattenedCount(0);
+      setResultBytes(null);
+      setResultName("");
+      setStep("upload");
+      void startPipeline(selectedFile, {
+        tool: "flatten-pdf",
+        operation: "analyze",
+      });
+    },
+    [resetPipeline, startPipeline],
+  );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
@@ -77,7 +81,10 @@ export default function FlattenPdfPage() {
   });
 
   const goConfigure = useCallback(() => setStep("configure"), []);
+
   const resetAll = useCallback(() => {
+    resetPipeline();
+    setActiveOperation("idle");
     setStep("upload");
     setFile(null);
     setPageCount(0);
@@ -85,48 +92,61 @@ export default function FlattenPdfPage() {
     setResultName("");
     setFlattenedCount(0);
     setHasFormFields(false);
-  }, []);
+  }, [resetPipeline]);
 
   const flattenPdf = useCallback(async () => {
     if (!file) return;
-
-    setStep("processing");
-    toast.info("Flattening PDF...");
-    // Yield to the browser to allow painting the processing state
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
-    try {
-      const { PDFDocument } = await import("pdf-lib");
-      const originalBuffer = await file.arrayBuffer();
-      const pdfDoc = await PDFDocument.load(originalBuffer);
-
-      const form = pdfDoc.getForm();
-      const fieldCount = form.getFields().length;
-      if (fieldCount === 0) {
-        setFlattenedCount(0);
-        setResultBytes(new Uint8Array(originalBuffer));
-        setResultName(`unchanged-${file.name}`);
-        setStep("result");
-        toast.success("No AcroForm fields found. Original PDF prepared unchanged.");
-        return;
-      }
-
-      form.flatten();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-
-      setFlattenedCount(fieldCount);
-
-      const bytes = await pdfDoc.save();
-      setResultBytes(bytes);
-      setResultName(`flattened-${file.name}`);
-      setStep("result");
-      toast.success("Done! AcroForm fields flattened successfully.");
-    } catch (error) {
-      console.error(error);
-      toast.error("Something went wrong.");
-      setStep("configure");
+    if (!hasFormFields) {
+      toast.error("No AcroForm fields found. This tool only flattens AcroForm fields.");
+      return;
     }
-  }, [file]);
+
+    setActiveOperation("flatten");
+    setStep("processing");
+    setFlattenedCount(0);
+    setResultBytes(null);
+    setResultName("");
+    toast.info("Flattening PDF...");
+    await startPipeline(file, {
+      tool: "flatten-pdf",
+      operation: "convert",
+    });
+  }, [file, hasFormFields, startPipeline]);
+
+  useEffect(() => {
+    if (pipelineStatus === "done" && activeOperation === "analyze" && pipelineResult.output?.kind === "flatten-pdf-analysis") {
+      setPageCount(pipelineResult.output.pageCount);
+      setHasFormFields(pipelineResult.output.fieldCount > 0);
+      setActiveOperation("idle");
+      resetPipeline();
+      return;
+    }
+
+    if (pipelineStatus === "done" && activeOperation === "flatten" && pipelineResult.output?.kind === "file") {
+      setResultBytes(pipelineResult.output.bytes);
+      setResultName(pipelineResult.output.filename);
+      setFlattenedCount(pipelineResult.output.validation.contentUnits);
+      setStep("result");
+      setActiveOperation("idle");
+      toast.success("Done! AcroForm fields flattened successfully.");
+      return;
+    }
+
+    if (pipelineStatus === "error" && activeOperation !== "idle" && pipelineError) {
+      toast.error(pipelineError.message);
+      if (activeOperation === "flatten") setStep("configure");
+      setActiveOperation("idle");
+      resetPipeline();
+      return;
+    }
+
+    if (pipelineStatus === "cancelled" && activeOperation !== "idle") {
+      toast.info("Flattening cancelled.");
+      if (activeOperation === "flatten") setStep("configure");
+      setActiveOperation("idle");
+      resetPipeline();
+    }
+  }, [activeOperation, pipelineError, pipelineResult.output, pipelineStatus, resetPipeline]);
 
   const downloadResult = useCallback(() => {
     if (!resultBytes || !file) return;
@@ -197,13 +217,25 @@ export default function FlattenPdfPage() {
                   {file ? (
                     <div className="mt-4 space-y-3 text-sm">
                       <p className="break-all font-semibold">{file.name}</p>
-                      <p className="text-muted">{pageCount} pages</p>
-                      <p className="text-muted">{formatBytes(file.size)}</p>
-                      <div className={`rounded-md p-3 ${hasFormFields ? "bg-green-500/10 text-green-700 dark:text-green-300" : "bg-muted/10 text-muted"}`}>
-                        {hasFormFields ? "AcroForm fields detected - these will be flattened." : "No AcroForm fields detected - output will be unchanged."}
-                      </div>
-                      <button type="button" onClick={goConfigure} aria-label="Configure flatten settings" className="w-full rounded-md bg-red-500 px-5 py-3 font-bold text-white hover:bg-red-600">
-                        Configure &rarr;
+                      {analysisInProgress ? (
+                        <p className="text-muted">Checking AcroForm fields...</p>
+                      ) : (
+                        <>
+                          <p className="text-muted">{pageCount} pages</p>
+                          <p className="text-muted">{formatBytes(file.size)}</p>
+                          <div className={`rounded-md p-3 ${hasFormFields ? "bg-green-500/10 text-green-700 dark:text-green-300" : "bg-muted/10 text-muted"}`}>
+                            {hasFormFields ? "AcroForm fields detected - these will be flattened." : "No AcroForm fields detected - there is nothing this tool can flatten."}
+                          </div>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        onClick={goConfigure}
+                        disabled={!hasFormFields || analysisInProgress}
+                        aria-label="Configure flatten settings"
+                        className="w-full rounded-md bg-red-500 px-5 py-3 font-bold text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {hasFormFields ? "Configure ->" : "No flattenable fields"}
                       </button>
                     </div>
                   ) : (
@@ -230,7 +262,7 @@ export default function FlattenPdfPage() {
                     <strong>Note:</strong> Annotations, highlights, sticky notes, layers, signatures, scripts, and XFA forms are NOT flattened by this tool.
                   </p>
                 </div>
-                <button type="button" onClick={() => void flattenPdf()} aria-label="Flatten PDF" className="w-full rounded-md bg-red-500 px-5 py-4 text-lg font-bold text-white hover:bg-red-600">Flatten PDF &rarr;</button>
+                <button type="button" onClick={() => void flattenPdf()} aria-label="Flatten PDF" className="w-full rounded-md bg-red-500 px-5 py-4 text-lg font-bold text-white hover:bg-red-600">Flatten PDF -&gt;</button>
               </div>
             )}
 
@@ -238,16 +270,24 @@ export default function FlattenPdfPage() {
               <div className="mx-auto max-w-3xl py-4 text-center">
                 <Loader2 aria-hidden="true" className="mx-auto mb-4 h-10 w-10 animate-spin text-red-500" />
                 <h2 className="text-xl font-bold">Flattening PDF...</h2>
+                <p className="mt-2 text-sm text-muted">{pipelineProgress?.message ?? "Working..."}</p>
+                <div className="mt-5 h-2 overflow-hidden rounded-full bg-muted">
+                  <div className="h-full bg-red-500 transition-all" style={{ width: `${progressPercent}%` }} />
+                </div>
+                {memoryWarning && (
+                  <p className="mt-4 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-300">
+                    Large PDF detected. Flattening may use about {formatBytes(memoryWarning.estimatedBytes)} of memory.
+                  </p>
+                )}
+                <button type="button" onClick={cancel} className="mt-4 rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-muted">Cancel</button>
               </div>
             )}
 
             {step === "result" && file && resultBytes && (
               <div className="mx-auto max-w-2xl py-8 text-center">
                 <CheckCircle aria-hidden="true" className="mx-auto mb-5 h-14 w-14 text-red-500" />
-                <h2 className="text-2xl font-black">{flattenedCount > 0 ? "AcroForm fields flattened" : "No AcroForm fields found"}</h2>
-                <p className="mt-2 text-muted">
-                  {flattenedCount > 0 ? `${flattenedCount} AcroForm fields flattened into static page content` : "Original PDF prepared unchanged"}
-                </p>
+                <h2 className="text-2xl font-black">AcroForm fields flattened</h2>
+                <p className="mt-2 text-muted">{flattenedCount} AcroForm fields flattened into static page content</p>
                 <SizeComparisonBadge originalSize={file.size} compressedSize={resultBytes.byteLength} />
                 <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:justify-center">
                   <button type="button" onClick={downloadResult} aria-label="Download flattened PDF" className="inline-flex items-center justify-center gap-3 rounded-md bg-red-500 px-5 py-3 font-bold text-white hover:bg-red-600">Download PDF <ShortcutHint shortcut="D" /></button>

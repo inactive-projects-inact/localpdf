@@ -16,6 +16,7 @@ import {
 import { useProcessorWorker } from "../hooks/useProcessorWorker";
 
 const ACCENT = "#3B3BFF";
+const MAX_TEXT_CHARS = 200000;
 
 const FONT_OPTIONS: TextFontFamily[] = ["Helvetica", "Times Roman", "Courier"];
 const SIZE_OPTIONS = [8, 10, 12, 14, 16, 18, 24, 32];
@@ -47,6 +48,10 @@ export default function TextToPdfPage() {
   const handleGenerate = () => {
     if (!text.trim()) {
       toast.error("Please enter some text first.", { id: "text2pdf" });
+      return;
+    }
+    if (text.length > MAX_TEXT_CHARS) {
+      toast.error("Text is too large. Please limit input to 200,000 characters.", { id: "text2pdf" });
       return;
     }
 
@@ -106,8 +111,9 @@ export default function TextToPdfPage() {
             id="text-input"
             ref={textareaRef}
             value={text}
+            maxLength={MAX_TEXT_CHARS}
             onChange={(e) => {
-              setText(e.target.value);
+              setText(e.target.value.slice(0, MAX_TEXT_CHARS));
               worker.reset();
             }}
             rows={12}
@@ -115,7 +121,7 @@ export default function TextToPdfPage() {
             className="mt-2 w-full resize-y rounded-xl border border-border bg-background px-4 py-3 text-sm leading-relaxed text-foreground outline-none transition focus:border-[#3B3BFF] focus:ring-2 focus:ring-[#3B3BFF]/20"
           />
           <p className="mt-2 text-xs text-muted">
-            {charCount.toLocaleString()} characters · {wordCount.toLocaleString()} words
+            {charCount.toLocaleString()} / {MAX_TEXT_CHARS.toLocaleString()} characters · {wordCount.toLocaleString()} words
           </p>
         </div>
 

@@ -73,6 +73,7 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" })
         .map((row) => row.map((cell) => String(cell ?? "")));
       if (rows.length === 0) continue;
+      if (!rows.some((row) => row.some((cell) => cell.trim().length > 0))) continue;
 
       const colCount = Math.max(...rows.map((row) => row.length));
       if (colCount === 0) continue;

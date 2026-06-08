@@ -9,6 +9,9 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { usePdfDocProxy } from "../hooks/usePdfDocProxy";
+import { downloadBlob } from "../lib/pdf-utils";
+import { hasPdfHeader } from "../lib/tool-registry";
 
 const ACCENT = "#10B981";
 
@@ -21,17 +24,6 @@ function formatBytes(bytes: number): string {
 type EncryptionStatus = "unknown" | "encrypted" | "not-encrypted" | "unsupported-encryption" | "corrupted";
 type Step = "upload" | "configure" | "result";
 
-function classifyPdfOpenError(error: unknown): EncryptionStatus {
-  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
-  if (message.includes("aes") || message.includes("unsupported encryption") || message.includes("unsupported security")) {
-    return "unsupported-encryption";
-  }
-  if (message.includes("encrypt") || message.includes("password") || message.includes("decrypt") || message.includes("security")) {
-    return "encrypted";
-  }
-  return "corrupted";
-}
-
 export default function UnlockPage() {
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
@@ -39,46 +31,29 @@ export default function UnlockPage() {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
+  const fileJobRef = useRef(0);
   const { addFile } = useFileHistory();
+  const { isLoading, numPages, loadError, load, destroy } = usePdfDocProxy();
 
   const handleFile = useCallback(async (f: File) => {
-    if (!f.name.toLowerCase().endsWith(".pdf") && f.type !== "application/pdf") {
-      toast.error("Please select a valid PDF file.");
+    const jobId = fileJobRef.current + 1;
+    fileJobRef.current = jobId;
+
+    if (!(await hasPdfHeader(f))) {
+      if (fileJobRef.current === jobId) toast.error("Please select a valid PDF file.");
       return;
     }
+
+    if (fileJobRef.current !== jobId) return;
     setFile(f);
     setResult(null);
     setEncryptionStatus("unknown");
     setStep("configure");
-
-    // Detect only. This tool does not decrypt and must not rewrite protected PDFs.
-    try {
-      const pdfjs = await import("pdfjs-dist");
-      if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-        pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-      }
-      const ab = await f.arrayBuffer();
-      const loadingTask = pdfjs.getDocument({ data: new Uint8Array(ab) });
-      let proxy: import("pdfjs-dist").PDFDocumentProxy | null = null;
-      try {
-        proxy = await loadingTask.promise;
-        setEncryptionStatus("not-encrypted");
-      } catch (e) {
-        setEncryptionStatus(classifyPdfOpenError(e));
-      } finally {
-        if (proxy) {
-          await proxy.cleanup();
-          await proxy.destroy();
-        }
-        await loadingTask.destroy();
-      }
-    } catch {
-      setEncryptionStatus("unknown");
-    }
+    load(f);
 
     addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "unlock" });
     toast.success(`"${f.name}" loaded`);
-  }, [addFile]);
+  }, [addFile, load]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles[0]) handleFile(acceptedFiles[0]);
@@ -131,14 +106,20 @@ export default function UnlockPage() {
     if (!result) return;
     const buffer = result.bytes.buffer.slice(result.bytes.byteOffset, result.bytes.byteOffset + result.bytes.byteLength) as ArrayBuffer;
     const blob = new Blob([buffer], { type: "application/pdf" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = result.name;
-    a.click();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    downloadBlob(blob, result.name);
     toast.success("Download started!");
   }, [result]);
+
+  useEffect(() => {
+    if (!file || isLoading) return;
+    if (loadError) {
+      setEncryptionStatus(loadError.reason === "unknown" ? "unknown" : loadError.reason);
+      return;
+    }
+    if (numPages > 0) {
+      setEncryptionStatus("not-encrypted");
+    }
+  }, [file, isLoading, loadError, numPages]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -151,11 +132,13 @@ export default function UnlockPage() {
   }, [handleDownload, result]);
 
   const reset = useCallback(() => {
+    fileJobRef.current += 1;
+    destroy();
     setFile(null);
     setResult(null);
     setEncryptionStatus("unknown");
     setStep("upload");
-  }, []);
+  }, [destroy]);
 
   return (
     <AppShell>

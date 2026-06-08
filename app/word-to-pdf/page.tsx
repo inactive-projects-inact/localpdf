@@ -9,6 +9,7 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
+import { usePdfPipelineWorker } from "../hooks/usePdfPipelineWorker";
 
 const ACCENT = "#3B3BFF";
 const MAX_DOCX_BYTES = 20 * 1024 * 1024;
@@ -23,24 +24,7 @@ type PageSize = "A4" | "Letter" | "Legal";
 type FontScale = "small" | "medium" | "large";
 type MarginSize = "narrow" | "normal" | "wide";
 type Step = "upload" | "configure" | "result";
-
-const PAGE_SIZES: Record<PageSize, { width: number; height: number }> = {
-  A4: { width: 595, height: 842 },
-  Letter: { width: 612, height: 792 },
-  Legal: { width: 612, height: 1008 },
-};
-
-const FONT_SCALES: Record<FontScale, number> = {
-  small: 10,
-  medium: 12,
-  large: 14,
-};
-
-const MARGINS: Record<MarginSize, number> = {
-  narrow: 30,
-  normal: 50,
-  wide: 72,
-};
+type PipelineOperation = "idle" | "convert";
 
 export default function WordToPdfPage() {
   const [step, setStep] = useState<Step>("upload");
@@ -48,11 +32,26 @@ export default function WordToPdfPage() {
   const [pageSize, setPageSize] = useState<PageSize>("A4");
   const [fontScale, setFontScale] = useState<FontScale>("medium");
   const [marginSize, setMarginSize] = useState<MarginSize>("normal");
-  const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<{ bytes: Uint8Array; name: string } | null>(null);
+  const [activeOperation, setActiveOperation] = useState<PipelineOperation>("idle");
   const uploadRef = useRef<HTMLInputElement>(null);
-  const runIdRef = useRef(0);
   const { addFile } = useFileHistory();
+  const createWordToPdfWorker = useCallback(
+    () => new Worker(new URL("../lib/wordToPdf.worker.ts", import.meta.url), { type: "module" }),
+    [],
+  );
+  const {
+    status: pipelineStatus,
+    progress: pipelineProgress,
+    memoryWarning,
+    result: pipelineResult,
+    error: pipelineError,
+    process: startPipeline,
+    cancel,
+    reset: resetPipeline,
+  } = usePdfPipelineWorker(createWordToPdfWorker);
+
+  const processing = activeOperation === "convert" && pipelineStatus === "processing";
 
   const handleFile = useCallback((f: File) => {
     if (!f.name.toLowerCase().endsWith(".docx")) {
@@ -63,13 +62,14 @@ export default function WordToPdfPage() {
       toast.error("File too large. Maximum size is 20MB for browser conversion.");
       return;
     }
-    runIdRef.current += 1;
+    resetPipeline();
+    setActiveOperation("idle");
     setFile(f);
     setResult(null);
     setStep("configure");
     addFile({ filename: f.name, size: f.size, timestamp: Date.now(), tool: "wordToPdf" });
     toast.success(`"${f.name}" loaded`);
-  }, [addFile]);
+  }, [addFile, resetPipeline]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles[0]) handleFile(acceptedFiles[0]);
@@ -88,184 +88,49 @@ export default function WordToPdfPage() {
 
   const handleConvert = useCallback(async () => {
     if (!file) return;
-    const runId = runIdRef.current + 1;
-    runIdRef.current = runId;
-    setProcessing(true);
     setResult(null);
-
-    try {
-      if (file.size > MAX_DOCX_BYTES) {
-        throw new Error("File too large. Maximum size is 20MB for browser conversion.");
-      }
-
-      toast.loading("Reading Word document...", { id: "word2pdf" });
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const mammoth = await import("mammoth") as any;
-      const ab = await file.arrayBuffer();
-      // Yield to prevent UI freeze during mammoth load
-      await new Promise(resolve => setTimeout(resolve, 50));
-      const { value: html } = await mammoth.convertToHtml(
-        { arrayBuffer: ab },
-        {
-          convertImage: mammoth.images.imgElement(async (image: { contentType: string; read: (encoding: "base64") => Promise<string> }) => ({
-            src: `data:${image.contentType};base64,${await image.read("base64")}`,
-          })),
-        },
-      );
-      if (runIdRef.current !== runId) return;
-
-      toast.loading("Building PDF...", { id: "word2pdf" });
-
-      const { PDFDocument, StandardFonts, rgb } = await import("pdf-lib");
-      const pdfDoc = await PDFDocument.create();
-
-      const { width, height } = PAGE_SIZES[pageSize];
-      const margin = MARGINS[marginSize];
-      const baseSize = FONT_SCALES[fontScale];
-      const contentWidth = width - margin * 2;
-
-      const regularFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-      const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-      let page = pdfDoc.addPage([width, height]);
-      let y = height - margin;
-
-      function addPage() {
-        page = pdfDoc.addPage([width, height]);
-        y = height - margin;
-      }
-
-      function ensureSpace(needed: number) {
-        if (y - needed < margin) {
-          addPage();
-        }
-      }
-
-      function drawText(text: string, font: typeof regularFont, size: number, color = rgb(0, 0, 0), x = margin, maxWidth = contentWidth) {
-        if (!text.trim()) return;
-
-        // Word-wrap
-        const words = text.split(" ");
-        let line = "";
-        const lines: string[] = [];
-        for (const word of words) {
-          const testLine = line ? `${line} ${word}` : word;
-          const w = font.widthOfTextAtSize(testLine, size);
-          if (w > maxWidth && line) {
-            lines.push(line);
-            line = word;
-          } else {
-            line = testLine;
-          }
-        }
-        if (line) lines.push(line);
-
-        for (const l of lines) {
-          ensureSpace(size + 4);
-          page.drawText(l, { x, y, size, font, color });
-          y -= size + 4;
-        }
-      }
-
-      async function drawImage(src: string) {
-        const match = /^data:(image\/(?:png|jpeg|jpg));base64,(.+)$/i.exec(src);
-        if (!match) return;
-        const binary = atob(match[2]);
-        const imageBytes = new Uint8Array(binary.length);
-        for (let index = 0; index < binary.length; index += 1) imageBytes[index] = binary.charCodeAt(index);
-        const image = match[1].includes("png") ? await pdfDoc.embedPng(imageBytes) : await pdfDoc.embedJpg(imageBytes);
-        const scale = Math.min(contentWidth / image.width, (height - margin * 2) / image.height, 1);
-        const imageWidth = image.width * scale;
-        const imageHeight = image.height * scale;
-        ensureSpace(imageHeight + 8);
-        page.drawImage(image, { x: margin, y: y - imageHeight, width: imageWidth, height: imageHeight });
-        y -= imageHeight + 8;
-      }
-
-      async function drawElement(node: Element): Promise<void> {
-        const tag = node.tagName.toLowerCase();
-        const text = (node.textContent ?? "").replace(/\s+/g, " ").trim();
-        const style = node.getAttribute("style") ?? "";
-        if (/page-break-before:\s*always|break-before:\s*page/i.test(style)) addPage();
-
-        if (tag === "h1") {
-          ensureSpace(baseSize * 2 + 8);
-          y -= 6;
-          drawText(text, boldFont, baseSize * 1.7, rgb(0.05, 0.05, 0.05));
-          y -= 4;
-        } else if (tag === "h2") {
-          ensureSpace(baseSize * 1.5 + 8);
-          y -= 4;
-          drawText(text, boldFont, baseSize * 1.4, rgb(0.1, 0.1, 0.1));
-          y -= 3;
-        } else if (tag === "h3") {
-          drawText(text, boldFont, baseSize * 1.2);
-          y -= 2;
-        } else if (tag === "p") {
-          drawText(text, regularFont, baseSize);
-          y -= 3;
-        } else if (tag === "ul" || tag === "ol") {
-          Array.from(node.children)
-            .filter((child) => child.tagName.toLowerCase() === "li")
-            .forEach((li, index) => {
-              const prefix = tag === "ol" ? `${index + 1}. ` : "- ";
-              drawText(`${prefix}${li.textContent ?? ""}`, regularFont, baseSize, rgb(0, 0, 0), margin + 12, contentWidth - 12);
-              y -= 1;
-            });
-          y -= 2;
-        } else if (tag === "table") {
-          const rows = Array.from(node.querySelectorAll("tr"));
-          for (const row of rows) {
-            const cells = Array.from(row.children).filter((cell) => ["td", "th"].includes(cell.tagName.toLowerCase()));
-            const cellWidth = contentWidth / Math.max(1, cells.length);
-            ensureSpace(baseSize + 8);
-            cells.forEach((cell, index) => {
-              const cellFont = cell.tagName.toLowerCase() === "th" ? boldFont : regularFont;
-              drawText((cell.textContent ?? "").replace(/\s+/g, " ").trim(), cellFont, baseSize - 1, rgb(0, 0, 0), margin + index * cellWidth, cellWidth - 6);
-            });
-            y -= 2;
-          }
-          y -= 4;
-        } else if (tag === "img") {
-          await drawImage(node.getAttribute("src") ?? "");
-        } else if (text) {
-          drawText(text, regularFont, baseSize);
-        }
-
-        if (/page-break-after:\s*always|break-after:\s*page/i.test(style)) addPage();
-      }
-
-      // Parse HTML into blocks
-      const parser = new DOMParser();
-      const dom = parser.parseFromString(html, "text/html");
-      const body = dom.body;
-
-      for (let i = 0; i < body.childNodes.length; i++) {
-        if (i % 10 === 0) await new Promise(resolve => setTimeout(resolve, 0));
-
-        const node = body.childNodes[i];
-        if (!(node instanceof Element)) continue;
-        if (runIdRef.current !== runId) return;
-        await drawElement(node);
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 0));
-      if (runIdRef.current !== runId) return;
-      const pdfBytes = await pdfDoc.save();
-      if (runIdRef.current !== runId) return;
-      const baseName = file.name.replace(/\.docx$/i, "");
-      setResult({ bytes: pdfBytes, name: `converted-${baseName}.pdf` });
-      setStep("result");
-      toast.success("Done! Your PDF is ready.", { id: "word2pdf" });
-    } catch (err) {
-      if (runIdRef.current !== runId) return;
-      const msg = err instanceof Error ? err.message : "Conversion failed.";
-      toast.error(msg, { id: "word2pdf" });
-    } finally {
-      if (runIdRef.current === runId) setProcessing(false);
+    if (file.size > MAX_DOCX_BYTES) {
+      toast.error("File too large. Maximum size is 20MB for browser conversion.", { id: "word2pdf" });
+      return;
     }
-  }, [file, pageSize, fontScale, marginSize]);
+    setActiveOperation("convert");
+    toast.loading("Reading Word document...", { id: "word2pdf" });
+    await startPipeline(file, {
+      tool: "word-to-pdf",
+      operation: "convert",
+      options: { pageSize, fontScale, marginSize },
+    });
+  }, [file, fontScale, marginSize, pageSize, startPipeline]);
+
+  useEffect(() => {
+    if (pipelineStatus === "done" && activeOperation === "convert" && pipelineResult.output?.kind === "file") {
+      const { bytes, filename } = pipelineResult.output;
+      queueMicrotask(() => {
+        setResult({ bytes, name: filename });
+        setStep("result");
+        setActiveOperation("idle");
+        toast.success("Done! Your PDF is ready.", { id: "word2pdf" });
+      });
+      return;
+    }
+
+    if (pipelineStatus === "error" && activeOperation === "convert" && pipelineError) {
+      queueMicrotask(() => {
+        toast.error(pipelineError.message, { id: "word2pdf" });
+        setActiveOperation("idle");
+        resetPipeline();
+      });
+      return;
+    }
+
+    if (pipelineStatus === "cancelled" && activeOperation === "convert") {
+      queueMicrotask(() => {
+        toast.info("Conversion cancelled.", { id: "word2pdf" });
+        setActiveOperation("idle");
+        resetPipeline();
+      });
+    }
+  }, [activeOperation, pipelineError, pipelineResult.output, pipelineStatus, resetPipeline]);
 
   const handleDownload = useCallback(() => {
     if (!result) return;
@@ -281,11 +146,12 @@ export default function WordToPdfPage() {
   }, [result]);
 
   const reset = useCallback(() => {
-    runIdRef.current += 1;
+    resetPipeline();
+    setActiveOperation("idle");
     setFile(null);
     setResult(null);
     setStep("upload");
-  }, []);
+  }, [resetPipeline]);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -443,6 +309,22 @@ export default function WordToPdfPage() {
                 </>
               )}
             </button>
+            {processing && (
+              <div className="rounded-2xl border border-border bg-card p-4">
+                <p className="text-sm font-semibold text-foreground">{pipelineProgress?.message ?? "Converting..."}</p>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+                  <div className="h-full transition-all" style={{ width: `${pipelineProgress?.percent ?? 0}%`, backgroundColor: ACCENT }} />
+                </div>
+                {memoryWarning && (
+                  <p className="mt-3 rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-3 text-sm text-yellow-700 dark:text-yellow-300">
+                    Large DOCX detected. Conversion may use about {formatBytes(memoryWarning.estimatedBytes)} of memory.
+                  </p>
+                )}
+                <button type="button" onClick={cancel} className="mt-4 rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-muted">
+                  Cancel
+                </button>
+              </div>
+            )}
           </div>
         )}
 

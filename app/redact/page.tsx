@@ -24,9 +24,9 @@ import ShortcutHint from "../components/ShortcutHint";
 import SizeComparisonBadge from "../components/SizeComparisonBadge";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
-import { downloadBlob, getPdfjs } from "../lib/pdf-utils";
+import { downloadBlob } from "../lib/pdf-utils";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import { usePdfDocProxy } from "../hooks/usePdfDocProxy";
 
 type RedactionBox = {
   id: string;
@@ -151,9 +151,9 @@ function statusLabel(status: ProcessingStatus) {
 
 export default function RedactPdfPage() {
   const { addFile } = useFileHistory();
+  const { proxyRef, numPages, loadError, load, destroy } = usePdfDocProxy();
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
-  const [pdfJsDoc, setPdfJsDoc] = useState<PDFDocumentProxy | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
   const [redactions, setRedactions] = useState<RedactionBox[]>([]);
@@ -242,9 +242,9 @@ export default function RedactPdfPage() {
   );
 
   const resetAll = useCallback(() => {
+    destroy();
     setStep("upload");
     setFile(null);
-    setPdfJsDoc(null);
     setPageCount(0);
     setCurrentPage(0);
     setRedactions([]);
@@ -275,36 +275,27 @@ export default function RedactPdfPage() {
     setResultName("");
     historyRef.current = [];
     textCacheRef.current.clear();
-  }, []);
+  }, [destroy]);
 
   const handleDrop = useCallback(async (files: File[]) => {
     const selectedFile = files[0];
     if (!selectedFile) return;
-    try {
-      if (!(await hasPdfHeader(selectedFile))) {
-        toast.error("Please select a valid PDF file.");
-        return;
-      }
-      const pdfjs = await getPdfjs();
-      const buffer = await selectedFile.arrayBuffer();
-      const doc = await pdfjs.getDocument({ data: buffer.slice(0) }).promise;
-      pdfJsDoc?.destroy();
-      setFile(selectedFile);
-      setPdfJsDoc(doc);
-      setPageCount(doc.numPages);
-      setCurrentPage(0);
-      setRedactions([]);
-      setStep("upload");
-      setResultBytes(null);
-      setResultName("");
-      setThumbnails({});
-      textCacheRef.current.clear();
-      toast.success("PDF loaded. Start drawing redaction boxes.");
-    } catch (error) {
-      console.error(error);
-      toast.error("Something went wrong. Please try again.");
+    if (!(await hasPdfHeader(selectedFile))) {
+      toast.error("Please select a valid PDF file.");
+      return;
     }
-  }, [pdfJsDoc]);
+    setFile(selectedFile);
+    setCurrentPage(0);
+    setRedactions([]);
+    setStep("upload");
+    setResultBytes(null);
+    setResultName("");
+    setThumbnails({});
+    thumbnailsRef.current = {};
+    textCacheRef.current.clear();
+    historyRef.current = [];
+    load(selectedFile);
+  }, [load]);
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
@@ -324,8 +315,9 @@ export default function RedactPdfPage() {
     async (pageIndex: number) => {
       const cached = textCacheRef.current.get(pageIndex);
       if (cached) return cached;
-      if (!pdfJsDoc) return [];
-      const page = await pdfJsDoc.getPage(pageIndex + 1);
+      const proxy = proxyRef.current;
+      if (!proxy) return [];
+      const page = await proxy.getPage(pageIndex + 1);
       const viewport = page.getViewport({ scale: 1 });
       const pageWidth = viewport.width;
       const pageHeight = viewport.height;
@@ -354,11 +346,11 @@ export default function RedactPdfPage() {
       textCacheRef.current.set(pageIndex, mapped);
       return mapped;
     },
-    [pdfJsDoc],
+    [proxyRef],
   );
 
   const runSearch = useCallback(async () => {
-    if (!pdfJsDoc) return;
+    if (!proxyRef.current) return;
     const term = normalizeSearchTerm(searchTerm);
     if (!term) {
       toast.error("Enter text to search.");
@@ -422,7 +414,7 @@ export default function RedactPdfPage() {
     };
     setPendingSearch(pending);
     setPendingHighlights(boxes);
-  }, [currentPage, getTextItemsForPage, pageCount, pdfJsDoc, searchCaseSensitive, searchScope, searchTerm, searchWholeWord]);
+  }, [currentPage, getTextItemsForPage, pageCount, proxyRef, searchCaseSensitive, searchScope, searchTerm, searchWholeWord]);
 
   const confirmSearch = useCallback(() => {
     if (!pendingSearch) return;
@@ -438,7 +430,7 @@ export default function RedactPdfPage() {
   }, []);
 
   const runPatternDetection = useCallback(async () => {
-    if (!pdfJsDoc) return;
+    if (!proxyRef.current) return;
     const selected = PATTERNS.filter((pattern) => patternSelections[pattern.type]);
     if (selected.length === 0) {
       toast.error("Select at least one pattern.");
@@ -502,7 +494,7 @@ export default function RedactPdfPage() {
     }
     setPatternSummary({ boxes, counts });
     setPendingHighlights(boxes);
-  }, [getTextItemsForPage, pageCount, patternSelections, pdfJsDoc]);
+  }, [getTextItemsForPage, pageCount, patternSelections, proxyRef]);
 
   const confirmPatterns = useCallback(() => {
     if (!patternSummary) return;
@@ -720,10 +712,11 @@ export default function RedactPdfPage() {
   }, []);
 
   const renderPreview = useCallback(async () => {
-    if (!pdfJsDoc || !previewCanvasRef.current || !containerRef.current) return;
+    const proxy = proxyRef.current;
+    if (!proxy || !previewCanvasRef.current || !containerRef.current) return;
     const taskId = ++renderTaskRef.current;
     setIsRendering(true);
-    const page = await pdfJsDoc.getPage(currentPage + 1);
+    const page = await proxy.getPage(currentPage + 1);
     const viewport = page.getViewport({ scale: 1 });
     const containerWidth = Math.max(320, containerRef.current.clientWidth);
     const scale = containerWidth / viewport.width;
@@ -738,19 +731,22 @@ export default function RedactPdfPage() {
     context.fillStyle = "#FFFFFF";
     context.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: context, viewport: scaled }).promise;
+    if (taskId !== renderTaskRef.current) return;
     if (overlay) {
       overlay.width = canvas.width;
       overlay.height = canvas.height;
     }
     drawOverlay();
     setIsRendering(false);
-  }, [currentPage, drawOverlay, pdfJsDoc]);
+  }, [currentPage, drawOverlay, proxyRef]);
 
   const ensureThumbnail = useCallback(
     async (pageIndex: number) => {
-      if (!pdfJsDoc) return;
+      const proxy = proxyRef.current;
+      if (!proxy) return;
       if (thumbnailsRef.current[pageIndex]) return;
-      const page = await pdfJsDoc.getPage(pageIndex + 1);
+      const page = await proxy.getPage(pageIndex + 1);
+      if (thumbnailsRef.current[pageIndex]) return;
       const viewport = page.getViewport({ scale: 0.2 });
       const canvas = document.createElement("canvas");
       canvas.width = Math.ceil(viewport.width);
@@ -765,7 +761,7 @@ export default function RedactPdfPage() {
       canvas.height = 0;
       updateThumbnails({ ...thumbnailsRef.current, [pageIndex]: url });
     },
-    [pdfJsDoc, updateThumbnails],
+    [proxyRef, updateThumbnails],
   );
 
   const downloadResult = useCallback(() => {
@@ -783,7 +779,7 @@ export default function RedactPdfPage() {
   }, [addFile, file, resultBytes, resultName]);
 
   const applyRedactions = useCallback(async () => {
-    if (!file || !pdfJsDoc) return;
+    if (!file || !proxyRef.current) return;
     try {
       setStep("processing");
       toast.info("Applying redactions permanently...");
@@ -809,7 +805,7 @@ export default function RedactPdfPage() {
           setProcessingStatuses((prev) => ({ ...prev, [i]: "copied" }));
         } else {
           setProcessingStatuses((prev) => ({ ...prev, [i]: "redacting" }));
-          const pdfJsPage = await pdfJsDoc.getPage(i + 1);
+          const pdfJsPage = await proxyRef.current!.getPage(i + 1);
           const viewport = pdfJsPage.getViewport({ scale: 2.0 });
           const canvas = document.createElement("canvas");
           canvas.width = viewport.width;
@@ -861,7 +857,7 @@ export default function RedactPdfPage() {
       toast.error("Something went wrong. Please try again.");
       setStep("review");
     }
-  }, [file, pageCount, pageRedactions, pdfJsDoc, redactionStyle, showLabel]);
+  }, [file, pageCount, pageRedactions, proxyRef, redactionStyle, showLabel]);
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(max-width: 1024px)");
@@ -871,14 +867,22 @@ export default function RedactPdfPage() {
     return () => mediaQuery.removeEventListener("change", update);
   }, []);
 
+  // Drive pageCount from the hook's numPages.
   useEffect(() => {
-    return () => {
-      pdfJsDoc?.destroy();
-    };
-  }, [pdfJsDoc]);
+    if (numPages > 0) {
+      setPageCount(numPages);
+      toast.success("PDF loaded. Start drawing redaction boxes.");
+    }
+  }, [numPages]);
+
+  // Show error toast from hook.
+  useEffect(() => {
+    if (!loadError) return;
+    toast.error("Something went wrong loading the PDF. Please try again.");
+  }, [loadError]);
 
   useEffect(() => {
-    if (!pdfJsDoc || step !== "editor") return;
+    if (numPages === 0 || step !== "editor") return;
     let cancelled = false;
     const run = async () => {
       for (let i = 0; i < pageCount; i += 1) {
@@ -893,20 +897,20 @@ export default function RedactPdfPage() {
     return () => {
       cancelled = true;
     };
-  }, [ensureThumbnail, pageCount, pdfJsDoc, step]);
+  }, [ensureThumbnail, pageCount, numPages, step]);
 
   useEffect(() => {
-    if (!pdfJsDoc || step !== "editor") return;
+    if (numPages === 0 || step !== "editor") return;
     const observer = new ResizeObserver(() => {
       void renderPreview();
     });
     if (containerRef.current) observer.observe(containerRef.current);
     return () => observer.disconnect();
-  }, [pdfJsDoc, renderPreview, step]);
+  }, [numPages, renderPreview, step]);
 
   useEffect(() => {
     if (step === "editor") void renderPreview();
-  }, [renderPreview, step, currentPage, pdfJsDoc]);
+  }, [renderPreview, step, currentPage, numPages]);
 
   useEffect(() => {
     if (step === "editor") drawOverlay();

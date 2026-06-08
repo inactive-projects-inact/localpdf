@@ -17,6 +17,7 @@ import {
 import { SortableContext, rectSortingStrategy, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import { useCanvasRenderer } from "../hooks/useCanvasRenderer";
 import {
   ArrowLeftRight,
   Check,
@@ -264,11 +265,69 @@ export default function OrganizePage() {
   const pdfBytesRef = useRef<Uint8Array | null>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
   const thumbnailCacheRef = useRef<Map<number, string>>(new Map());
-  const renderQueueRef = useRef<PageEntry[]>([]);
-  const activeRendersRef = useRef(0);
-  const cancelledRenderIdsRef = useRef<Set<string>>(new Set());
   const openFileRef = useRef<(() => void) | null>(null);
+  const thumbnailJobIdRef = useRef(0);
+  // Tracks which requestIds are still wanted; cleared on cancel.
+  const pendingRequestsRef = useRef<Set<string>>(new Set());
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
+
+  const canvasRenderer = useCanvasRenderer({
+    onResult: useCallback((result) => {
+      const { requestId, pageIndex, url } = result;
+      // pendingRequestsRef is still used to allow the cancel cleanup fn to remove IDs.
+      if (!pendingRequestsRef.current.has(requestId)) {
+        if (url) URL.revokeObjectURL(url);
+        return;
+      }
+      pendingRequestsRef.current.delete(requestId);
+
+      if (!url) {
+        // OffscreenCanvas unavailable — fall back to main-thread render.
+        void (async () => {
+          const pdf = pdfDocRef.current;
+          if (!pdf) return;
+          try {
+            const pdfPage = await pdf.getPage(pageIndex + 1);
+            const viewport1 = pdfPage.getViewport({ scale: 1 });
+            const scale = 150 / viewport1.width;
+            const viewport = pdfPage.getViewport({ scale });
+            const canvas = document.createElement("canvas");
+            canvas.width = Math.ceil(viewport.width);
+            canvas.height = Math.ceil(viewport.height);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
+            ctx.fillStyle = "#FFFFFF";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+            pdfPage.cleanup();
+            const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+            canvas.width = 0;
+            canvas.height = 0;
+            thumbnailCacheRef.current.set(pageIndex, dataUrl);
+            setPages((current) =>
+              current.map((page) =>
+                page.originalIndex === pageIndex ? { ...page, thumbnailUrl: dataUrl } : page,
+              ),
+            );
+          } catch {
+            // Silently skip — not critical.
+          }
+        })();
+        return;
+      }
+
+      thumbnailCacheRef.current.set(pageIndex, url);
+      setPages((current) =>
+        current.map((page) =>
+          page.originalIndex === pageIndex ? { ...page, thumbnailUrl: url } : page,
+        ),
+      );
+    }, []),
+    onError: useCallback((requestId, _pageIndex, _reason) => {
+      pendingRequestsRef.current.delete(requestId);
+      // Errors (non-cancellation) are silently degraded — thumbnail stays as skeleton.
+    }, []),
+  });
 
   const selectedCount = selectedIds.size;
   const activePage = pages.find((page) => page.id === activeId) ?? null;
@@ -291,81 +350,38 @@ export default function OrganizePage() {
     });
   }, [pushHistory]);
 
-  const processRenderQueue = useCallback(() => {
-    while (activeRendersRef.current < 3 && renderQueueRef.current.length > 0) {
-      const entry = renderQueueRef.current.shift();
-      if (!entry || entry.originalIndex === null || cancelledRenderIdsRef.current.has(entry.id)) continue;
-      const cached = thumbnailCacheRef.current.get(entry.originalIndex);
-      if (cached) {
-        setPages((current) => current.map((page) => (page.id === entry.id ? { ...page, thumbnailUrl: cached } : page)));
-        continue;
-      }
-
-      activeRendersRef.current += 1;
-      void (async () => {
-        let canvas: HTMLCanvasElement | null = null;
-        let renderTask: { promise: Promise<unknown>; cancel: () => void } | null = null;
-        try {
-          const pdf = pdfDocRef.current;
-          if (!pdf) return;
-          const pageIndex = entry.originalIndex;
-          if (pageIndex === null) return;
-          const pdfPage = await pdf.getPage(pageIndex + 1);
-          const viewport1 = pdfPage.getViewport({ scale: 1 });
-          const scale = 150 / viewport1.width;
-          const viewport = pdfPage.getViewport({ scale });
-          canvas = document.createElement("canvas");
-          canvas.width = Math.ceil(viewport.width);
-          canvas.height = Math.ceil(viewport.height);
-          const context = canvas.getContext("2d");
-          if (!context) return;
-          renderTask = pdfPage.render({ canvasContext: context, viewport });
-          await renderTask.promise;
-          if (cancelledRenderIdsRef.current.has(entry.id)) return;
-          const dataUrl = canvas.toDataURL("image/png");
-          thumbnailCacheRef.current.set(pageIndex, dataUrl);
-          setPages((current) => current.map((page) => {
-            if (page.originalIndex === pageIndex) return { ...page, thumbnailUrl: dataUrl };
-            return page;
-          }));
-        } catch {
-          if (!cancelledRenderIdsRef.current.has(entry.id)) {
-            toast.error("Could not render a page thumbnail.");
-          }
-        } finally {
-          renderTask?.cancel?.();
-          if (canvas) {
-            canvas.width = 0;
-            canvas.height = 0;
-            canvas.remove();
-          }
-          activeRendersRef.current -= 1;
-          processRenderQueue();
-        }
-      })();
-    }
-  }, []);
-
   const requestThumbnailRender = useCallback((entry: PageEntry) => {
     if (entry.isBlank || entry.originalIndex === null || entry.thumbnailUrl) return undefined;
-    const cached = thumbnailCacheRef.current.get(entry.originalIndex);
+    const pageIndex = entry.originalIndex;
+    const cached = thumbnailCacheRef.current.get(pageIndex);
     if (cached) {
-      setPages((current) => current.map((page) => {
-        if (page.originalIndex === entry.originalIndex) return { ...page, thumbnailUrl: cached };
-        return page;
-      }));
+      setPages((current) =>
+        current.map((page) =>
+          page.originalIndex === pageIndex ? { ...page, thumbnailUrl: cached } : page,
+        ),
+      );
       return undefined;
     }
-    cancelledRenderIdsRef.current.delete(entry.id);
-    if (!renderQueueRef.current.some((queued) => queued.id === entry.id)) {
-      renderQueueRef.current.push(entry);
-      processRenderQueue();
-    }
+
+    const bytes = pdfBytesRef.current;
+    if (!bytes) return undefined;
+
+    const requestId = `${thumbnailJobIdRef.current}-${pageIndex}-${entry.id}`;
+    pendingRequestsRef.current.add(requestId);
+
+    canvasRenderer.request({
+      jobId: thumbnailJobIdRef.current,
+      requestId,
+      fileBytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      pageIndex,
+      targetWidth: 150,
+      extraRotation: 0,
+    });
+
     return () => {
-      cancelledRenderIdsRef.current.add(entry.id);
-      renderQueueRef.current = renderQueueRef.current.filter((queued) => queued.id !== entry.id);
+      pendingRequestsRef.current.delete(requestId);
     };
-  }, [processRenderQueue]);
+  }, [canvasRenderer]);
 
   const loadPdf = useCallback(async (incoming: File) => {
     setIsLoadingPdf(true);
@@ -374,6 +390,13 @@ export default function OrganizePage() {
         toast.error("Please choose a valid PDF file.");
         return;
       }
+
+      // Cancel in-flight thumbnails from any previous file.
+      canvasRenderer.cancel(thumbnailJobIdRef.current);
+      // Bump jobId so stale results are discarded.
+      thumbnailJobIdRef.current += 1;
+      pendingRequestsRef.current.clear();
+
       const [{ PDFDocument }, { getDocument, GlobalWorkerOptions }] = await Promise.all([import("pdf-lib"), import("pdfjs-dist")]);
       GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
       const bytes = new Uint8Array(await incoming.arrayBuffer());
@@ -382,8 +405,6 @@ export default function OrganizePage() {
       pdfDocRef.current = await getDocument({ data: bytes.slice(0) }).promise;
       pdfBytesRef.current = bytes;
       thumbnailCacheRef.current.clear();
-      renderQueueRef.current = [];
-      cancelledRenderIdsRef.current.clear();
       const nextPages: PageEntry[] = Array.from({ length: pdfLibDoc.getPageCount() }, (_, index) => ({
         id: `page-${index}`,
         originalIndex: index,
@@ -407,7 +428,7 @@ export default function OrganizePage() {
     } finally {
       setIsLoadingPdf(false);
     }
-  }, [requestThumbnailRender]);
+  }, [requestThumbnailRender, canvasRenderer]);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const incoming = acceptedFiles[0];
@@ -625,10 +646,11 @@ export default function OrganizePage() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [clearSelection, deleteSelected, downloadPdf, pages, redo, selectedIds.size, undo]);
 
+  // Worker lifecycle and URL cleanup are fully managed by useCanvasRenderer.
+  // pdfDocRef still needs explicit cleanup on unmount.
   useEffect(() => {
     return () => {
-      renderQueueRef.current = [];
-      cancelledRenderIdsRef.current = new Set(["__unmounted__"]);
+      pendingRequestsRef.current.clear();
       void pdfDocRef.current?.cleanup?.();
       void pdfDocRef.current?.destroy?.();
     };

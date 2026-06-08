@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { ChevronRight, Copy, Download, FileText, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -9,37 +9,16 @@ import AppShell from "../components/AppShell";
 import ShortcutHint from "../components/ShortcutHint";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import type { FileHistoryItem } from "../components/FileHistoryProvider";
-import type { PDFPageProxy, TextItem as PdfTextItem } from "pdfjs-dist/types/src/display/api";
+import { usePdfPipelineWorker } from "../hooks/usePdfPipelineWorker";
+import type { PdfToMarkdownOptions } from "../lib/pdf-pipeline-protocol";
 
-type PdfJs = typeof import("pdfjs-dist");
-type PdfDocumentProxy = import("pdfjs-dist").PDFDocumentProxy;
 type Step = "upload" | "configure" | "processing" | "result";
 type PageScope = "all" | "range";
+type PipelineOperation = "idle" | "analyze" | "convert";
 
-type Options = {
-  headings: boolean;
-  separators: boolean;
-  lists: boolean;
-  cleanWhitespace: boolean;
-};
-
-type Line = {
-  text: string;
-  x: number;
-  y: number;
-  height: number;
-  width: number;
-};
+type MarkdownOptions = Omit<PdfToMarkdownOptions, "startPage" | "endPage">;
 
 const ACCENT_COLOR = "#3B3BFF";
-
-async function loadPdfJs(): Promise<PdfJs> {
-  const pdfjs = await import("pdfjs-dist");
-  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
-    pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-  }
-  return pdfjs;
-}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -49,12 +28,6 @@ function formatBytes(bytes: number): string {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
-}
-
-function getMedian(values: number[]): number {
-  if (values.length === 0) return 12;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)] || 12;
 }
 
 function escapeHtml(value: string): string {
@@ -73,113 +46,6 @@ function renderMarkdown(md: string): string {
     .replace(/---/g, "<hr/>");
 }
 
-function normalizeListLine(text: string): string {
-  if (/^\d+\.\s+/.test(text)) return text;
-  return text.replace(/^[•*–-]\s*/, "- ");
-}
-
-async function pageToMarkdown(page: PDFPageProxy, options: Options): Promise<string> {
-  const content = await page.getTextContent({ includeMarkedContent: true });
-  const items = content.items.filter((item): item is PdfTextItem => "str" in item && item.str.trim().length > 0);
-  const fontSizes = items.map((item) => item.height).filter((height) => height > 0);
-  const medianSize = getMedian(fontSizes);
-  const viewport = page.getViewport({ scale: 1 });
-  const sorted = [...items].sort((a, b) => Number(b.transform[5]) - Number(a.transform[5]) || Number(a.transform[4]) - Number(b.transform[4]));
-  const lines: Line[] = [];
-
-  for (const item of sorted) {
-    const y = Number(item.transform[5]);
-    const x = Number(item.transform[4]);
-    const width = Math.max(0, Number(item.width) || 0);
-    const existing = lines.find((line) => Math.abs(line.y - y) <= Math.max(2, medianSize * 0.35));
-    if (existing) {
-      const gap = x - (existing.x + existing.width);
-      const separator = gap > medianSize * 1.8 ? "\t" : " ";
-      existing.text = `${existing.text}${separator}${item.str}`.replace(/ {2,}/g, " ").trim();
-      existing.height = Math.max(existing.height, item.height);
-      existing.x = Math.min(existing.x, x);
-      existing.width = Math.max(existing.width, x + width - existing.x);
-    } else {
-      lines.push({ text: item.str.trim(), x, y, height: item.height, width });
-    }
-  }
-
-  const leftColumn = lines.filter((line) => line.x < viewport.width * 0.55);
-  const rightColumn = lines.filter((line) => line.x >= viewport.width * 0.55);
-  const orderedLines =
-    leftColumn.length > 2 && rightColumn.length > 2
-      ? [...leftColumn.sort((a, b) => b.y - a.y), ...rightColumn.sort((a, b) => b.y - a.y)]
-      : lines;
-  const blocks: string[] = [];
-  let paragraph: string[] = [];
-  let lastIndent: number | null = null;
-  const tableRows: string[] = [];
-
-  const flushParagraph = () => {
-    if (paragraph.length > 0) {
-      blocks.push(paragraph.join(" ").replace(/\s+/g, " ").trim());
-      paragraph = [];
-    }
-  };
-
-  const flushTable = () => {
-    if (tableRows.length === 0) return;
-    if (tableRows.length < 2) {
-      blocks.push(...tableRows.map((row) => row.replace(/\t/g, " ")));
-      tableRows.length = 0;
-      return;
-    }
-    const columnCount = Math.max(...tableRows.map((row) => row.split("\t").length));
-    const rows = tableRows.map((row) => {
-      const cells = row.split("\t").map((cell) => cell.trim());
-      while (cells.length < columnCount) cells.push("");
-      return `| ${cells.join(" | ")} |`;
-    });
-    blocks.push(rows[0], `| ${Array.from({ length: columnCount }, () => "---").join(" | ")} |`, ...rows.slice(1));
-    tableRows.length = 0;
-  };
-
-  for (const line of orderedLines) {
-    const text = line.text.trim();
-    if (!text) continue;
-    const isList = options.lists && (/^[•*–-]\s+/.test(text) || /^\d+\.\s+/.test(text));
-    const headingPrefix =
-      options.headings && line.height >= medianSize * 2.0
-        ? "# "
-        : options.headings && line.height >= medianSize * 1.5
-          ? "## "
-          : options.headings && line.height >= medianSize * 1.2
-            ? "### "
-            : "";
-
-    if (headingPrefix || isList) {
-      flushParagraph();
-      flushTable();
-      blocks.push(isList ? normalizeListLine(text) : `${headingPrefix}${text}`);
-      lastIndent = null;
-      continue;
-    }
-
-    if (text.includes("\t")) {
-      flushParagraph();
-      tableRows.push(text);
-      lastIndent = null;
-      continue;
-    }
-
-    flushTable();
-    if (lastIndent !== null && Math.abs(line.x - lastIndent) > 8) {
-      flushParagraph();
-    }
-    paragraph.push(text);
-    lastIndent = line.x;
-  }
-
-  flushParagraph();
-  flushTable();
-  return blocks.join("\n\n");
-}
-
 function filenameBase(fileName: string): string {
   return fileName.replace(/\.pdf$/i, "");
 }
@@ -188,56 +54,69 @@ export default function PdfToMarkdownPage() {
   const { addFile } = useFileHistory();
   const [step, setStep] = useState<Step>("upload");
   const [file, setFile] = useState<File | null>(null);
-  const [pdfDoc, setPdfDoc] = useState<PdfDocumentProxy | null>(null);
   const [pageCount, setPageCount] = useState(0);
   const [textBased, setTextBased] = useState<boolean | null>(null);
   const [pageScope, setPageScope] = useState<PageScope>("all");
   const [startPage, setStartPage] = useState(1);
   const [endPage, setEndPage] = useState(1);
-  const [options, setOptions] = useState<Options>({ headings: true, separators: true, lists: true, cleanWhitespace: true });
-  const [currentPage, setCurrentPage] = useState(0);
-  const [completedPages, setCompletedPages] = useState(0);
+  const [options, setOptions] = useState<MarkdownOptions>({ headings: true, separators: true, lists: true, cleanWhitespace: true });
   const [markdown, setMarkdown] = useState("");
-  const runIdRef = useRef(0);
+  const [convertedPages, setConvertedPages] = useState(0);
+  const [activeOperation, setActiveOperation] = useState<PipelineOperation>("idle");
+
+  const createMarkdownWorker = useCallback(
+    () => new Worker(new URL("../lib/pdfToMarkdown.worker.ts", import.meta.url), { type: "module" }),
+    [],
+  );
+  const {
+    status: pipelineStatus,
+    progress: pipelineProgress,
+    memoryWarning,
+    result: pipelineResult,
+    error: pipelineError,
+    process: startPipeline,
+    cancel,
+    reset: resetPipeline,
+  } = usePdfPipelineWorker(createMarkdownWorker);
 
   const actualStart = pageScope === "all" ? 1 : clamp(startPage, 1, pageCount || 1);
   const actualEnd = pageScope === "all" ? pageCount : clamp(endPage, actualStart, pageCount || actualStart);
   const totalPages = Math.max(0, actualEnd - actualStart + 1);
-  const progress = totalPages > 0 ? (completedPages / totalPages) * 100 : 0;
+  const progress = pipelineStatus === "processing" && activeOperation === "convert" ? pipelineProgress?.percent ?? 0 : 0;
+  const currentPage = pipelineProgress?.page?.current ?? actualStart;
+  const completedPages = pipelineProgress?.unitsDone ?? 0;
   const words = markdown.trim() ? markdown.trim().split(/\s+/).length : 0;
   const htmlPreview = useMemo(() => renderMarkdown(markdown), [markdown]);
 
-  const handleDrop = useCallback(async (files: File[]) => {
-    const selectedFile = files[0];
-    if (!selectedFile) return;
-    runIdRef.current += 1;
-    await pdfDoc?.destroy();
-    setPdfDoc(null);
-    setMarkdown("");
-    setCompletedPages(0);
-    let proxy: PdfDocumentProxy | null = null;
-    let firstPage: PDFPageProxy | null = null;
-    try {
-      const pdfjs = await loadPdfJs();
-      const arrayBuffer = await selectedFile.arrayBuffer();
-      proxy = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-      firstPage = await proxy.getPage(1);
-      const content = await firstPage.getTextContent({ includeMarkedContent: true });
-      const hasText = content.items.some((item) => "str" in item && item.str.trim().length > 0);
+  const buildPipelineOptions = useCallback(
+    (): PdfToMarkdownOptions => ({
+      ...options,
+      startPage: actualStart,
+      endPage: actualEnd,
+    }),
+    [actualEnd, actualStart, options],
+  );
+
+  const handleDrop = useCallback(
+    (files: File[]) => {
+      const selectedFile = files[0];
+      if (!selectedFile) return;
+      resetPipeline();
+      setActiveOperation("analyze");
       setFile(selectedFile);
-      setPdfDoc(proxy);
-      setPageCount(proxy.numPages);
-      setStartPage(1);
-      setEndPage(proxy.numPages);
-      setTextBased(hasText);
-    } catch (error) {
-      await proxy?.destroy();
-      console.error(error);
-      toast.error("Something went wrong.");
-    } finally {
-      await firstPage?.cleanup();
-    }
-  }, [pdfDoc]);
+      setMarkdown("");
+      setConvertedPages(0);
+      setPageCount(0);
+      setTextBased(null);
+      setStep("upload");
+      void startPipeline(selectedFile, {
+        tool: "pdf-to-markdown",
+        operation: "analyze",
+        options: { ...options, startPage: 1, endPage: 1 },
+      });
+    },
+    [options, resetPipeline, startPipeline],
+  );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
@@ -249,55 +128,66 @@ export default function PdfToMarkdownPage() {
   const goConfigure = useCallback(() => setStep("configure"), []);
 
   const convertMarkdown = useCallback(async () => {
-    if (!pdfDoc) return;
-    const runId = runIdRef.current + 1;
-    runIdRef.current = runId;
+    if (!file) return;
+    if (actualEnd - actualStart > 100) {
+      toast.error("Document too large. Extraction is limited to 100 pages at a time.");
+      return;
+    }
+    setActiveOperation("convert");
     setStep("processing");
-    setCompletedPages(0);
+    setConvertedPages(0);
     setMarkdown("");
     toast.info("Extracting text...");
-    try {
-      if (actualEnd - actualStart > 100) {
-        throw new Error("Document too large. Extraction is limited to 100 pages at a time.");
-      }
+    await startPipeline(file, {
+      tool: "pdf-to-markdown",
+      operation: "convert",
+      options: buildPipelineOptions(),
+    });
+  }, [actualEnd, actualStart, buildPipelineOptions, file, startPipeline]);
 
-      const pages: string[] = [];
-      let converted = 0;
-      for (let pageNum = actualStart; pageNum <= actualEnd; pageNum += 1) {
-        setCurrentPage(pageNum);
-        // Yield to browser to prevent UI freeze
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        
-        let page: PDFPageProxy | null = null;
-        try {
-          page = await pdfDoc.getPage(pageNum);
-          pages.push(await pageToMarkdown(page, options));
-        } finally {
-          await page?.cleanup();
-        }
-        if (runIdRef.current !== runId) return;
-        converted += 1;
-        setCompletedPages(converted);
-      }
-      let output = options.separators ? pages.join("\n\n---\n\n") : pages.join("\n\n");
-      if (options.cleanWhitespace) {
-        output = output.replace(/\n{3,}/g, "\n\n").trim();
-      }
-      if (runIdRef.current !== runId) return;
-      setMarkdown(output);
-      setStep("result");
-      if (output.trim().length < 30) {
-        toast.warning("This PDF appears to be scanned. Results may be limited.");
-      }
-      toast.success(`Done! ${converted} pages converted to Markdown.`);
-    } catch (error) {
-      if (runIdRef.current !== runId) return;
-      console.error(error);
-      const msg = error instanceof Error ? error.message : "Something went wrong.";
-      toast.error(msg);
-      setStep("configure");
+  useEffect(() => {
+    if (pipelineStatus === "done" && activeOperation === "analyze" && pipelineResult.output?.kind === "pdf-to-markdown-analysis") {
+      setPageCount(pipelineResult.output.pageCount);
+      setStartPage(1);
+      setEndPage(pipelineResult.output.pageCount);
+      setTextBased(pipelineResult.output.textBased);
+      setActiveOperation("idle");
+      resetPipeline();
+      return;
     }
-  }, [actualEnd, actualStart, options, pdfDoc]);
+
+    if (pipelineStatus === "done" && activeOperation === "convert" && pipelineResult.output?.kind === "text") {
+      setMarkdown(pipelineResult.text ?? "");
+      setConvertedPages(totalPages);
+      setStep("result");
+      setActiveOperation("idle");
+      toast.success(`Done! ${totalPages} pages converted to Markdown.`);
+      return;
+    }
+
+    if (pipelineStatus === "error" && activeOperation !== "idle" && pipelineError) {
+      toast.error(pipelineError.message);
+      if (activeOperation === "convert") setStep("configure");
+      setActiveOperation("idle");
+      resetPipeline();
+      return;
+    }
+
+    if (pipelineStatus === "cancelled" && activeOperation !== "idle") {
+      toast.info("Conversion cancelled.");
+      if (activeOperation === "convert") setStep("configure");
+      setActiveOperation("idle");
+      resetPipeline();
+    }
+  }, [
+    activeOperation,
+    pipelineError,
+    pipelineResult.output,
+    pipelineResult.text,
+    pipelineStatus,
+    resetPipeline,
+    totalPages,
+  ]);
 
   const copyMarkdown = useCallback(async () => {
     await navigator.clipboard.writeText(markdown);
@@ -327,23 +217,15 @@ export default function PdfToMarkdownPage() {
   );
 
   const resetAll = useCallback(() => {
-    runIdRef.current += 1;
-    void pdfDoc?.destroy();
+    resetPipeline();
+    setActiveOperation("idle");
     setStep("upload");
     setFile(null);
-    setPdfDoc(null);
     setPageCount(0);
     setTextBased(null);
     setMarkdown("");
-    setCompletedPages(0);
-  }, [pdfDoc]);
-
-  useEffect(() => {
-    return () => {
-      runIdRef.current += 1;
-      void pdfDoc?.destroy();
-    };
-  }, [pdfDoc]);
+    setConvertedPages(0);
+  }, [resetPipeline]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -398,11 +280,17 @@ export default function PdfToMarkdownPage() {
                   {file ? (
                     <div className="mt-4 space-y-3 text-sm">
                       <p className="break-all font-semibold">{file.name}</p>
-                      <p className="text-muted">{pageCount} pages</p>
-                      <p className="text-muted">{formatBytes(file.size)}</p>
-                      {textBased === true && <div className="rounded-md bg-green-500/10 p-3 text-green-700 dark:text-green-300">Selectable text detected. Extraction quality depends on the PDF&apos;s internal text order.</div>}
-                      {textBased === false && <div className="rounded-md bg-amber-500/10 p-3 text-amber-700 dark:text-amber-300">Scanned PDF detected. Text extraction may be limited. Consider using OCR first.</div>}
-                      <button type="button" onClick={goConfigure} aria-label="Configure Markdown extraction" className="w-full rounded-md bg-indigo-600 px-5 py-3 font-bold text-white hover:bg-indigo-700">Extract &rarr;</button>
+                      {activeOperation === "analyze" && pipelineStatus === "processing" ? (
+                        <p className="text-muted">{pipelineProgress?.message ?? "Reading PDF..."}</p>
+                      ) : (
+                        <>
+                          <p className="text-muted">{pageCount} pages</p>
+                          <p className="text-muted">{formatBytes(file.size)}</p>
+                          {textBased === true && <div className="rounded-md bg-green-500/10 p-3 text-green-700 dark:text-green-300">Selectable text detected. Extraction quality depends on the PDF&apos;s internal text order.</div>}
+                          {textBased === false && <div className="rounded-md bg-amber-500/10 p-3 text-amber-700 dark:text-amber-300">Scanned PDF detected. Text extraction may be limited. Consider using OCR first.</div>}
+                          <button type="button" onClick={goConfigure} disabled={pageCount === 0} aria-label="Configure Markdown extraction" className="w-full rounded-md bg-indigo-600 px-5 py-3 font-bold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50">Extract &rarr;</button>
+                        </>
+                      )}
                     </div>
                   ) : <p className="mt-4 text-sm text-muted">Choose a PDF to begin.</p>}
                 </aside>
@@ -426,7 +314,13 @@ export default function PdfToMarkdownPage() {
                     )}
                   </div>
                 </fieldset>
-                
+
+                {memoryWarning && (
+                  <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-700 dark:text-amber-400">
+                    This PDF may need substantial memory. Close other heavy tabs if conversion fails.
+                  </div>
+                )}
+
                 <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-700 dark:text-amber-400">
                   <strong>Limited Text Extraction:</strong> This client-side tool uses selectable PDF text and layout heuristics for reading order, columns, headings, lists, and simple tables. It <strong>cannot</strong> reliably reconstruct complex tables, footnotes, rotated text, images, or true document structure.
                 </div>
@@ -449,7 +343,9 @@ export default function PdfToMarkdownPage() {
                 <Loader2 aria-hidden="true" className="mx-auto mb-5 h-12 w-12 animate-spin text-indigo-600" />
                 <h2 className="text-xl font-bold">Extracting page {currentPage} of {actualEnd}...</h2>
                 <div className="mt-6 h-3 overflow-hidden rounded-full bg-muted/20"><div className="h-full rounded-full bg-indigo-600 transition-all" style={{ width: `${progress}%` }} /></div>
-                <p className="mt-4 text-sm font-semibold text-muted">✓ {completedPages} pages extracted</p>
+                <p className="mt-4 text-sm font-semibold text-muted">Done: {completedPages} pages extracted</p>
+                {memoryWarning && <p className="mt-3 text-sm font-semibold text-amber-500">High memory use possible for this PDF.</p>}
+                <button type="button" onClick={cancel} className="mt-4 rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold transition-colors hover:bg-muted">Cancel</button>
               </div>
             )}
 
@@ -465,11 +361,11 @@ export default function PdfToMarkdownPage() {
                   <div>
                     <h2 className="mb-3 text-lg font-bold">Edit Markdown</h2>
                     <textarea value={markdown} onChange={(e) => setMarkdown(e.target.value)} aria-label="Edit raw Markdown" className="min-h-[560px] w-full resize-y rounded-lg border border-border bg-gray-950 p-4 font-mono text-sm text-gray-100" />
-                    <p className="mt-2 text-sm text-muted">{markdown.length} characters · {words} words</p>
+                    <p className="mt-2 text-sm text-muted">{markdown.length} characters - {words} words</p>
                   </div>
                 </div>
                 <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-sm font-semibold text-muted">~{words} words · {completedPages} pages extracted</p>
+                  <p className="text-sm font-semibold text-muted">~{words} words - {convertedPages} pages extracted</p>
                   <div className="flex flex-col gap-3 sm:flex-row">
                     <button type="button" onClick={() => void copyMarkdown()} aria-label="Copy Markdown to clipboard" className="inline-flex items-center justify-center gap-2 rounded-md border border-border px-4 py-3 font-bold"><Copy aria-hidden="true" className="h-4 w-4" />Copy <ShortcutHint shortcut="C" /></button>
                     <button type="button" onClick={() => downloadFile("md")} aria-label="Download Markdown file" className="inline-flex items-center justify-center gap-2 rounded-md bg-indigo-600 px-4 py-3 font-bold text-white hover:bg-indigo-700"><Download aria-hidden="true" className="h-4 w-4" />Download .md <ShortcutHint shortcut="D" /></button>

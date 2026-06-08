@@ -93,6 +93,11 @@ export default function PdfToPptxPage() {
     workerRef.current = null;
   }, []);
 
+  const releasePresentationRefs = useCallback(() => {
+    activePresRef.current = null;
+    setResultPres(null);
+  }, []);
+
   const actualStart = pageScope === "all" ? 1 : clamp(startPage, 1, pageCount || 1);
   const actualEnd = pageScope === "all" ? pageCount : clamp(endPage, actualStart, pageCount || actualStart);
   const totalToProcess = Math.max(0, actualEnd - actualStart + 1);
@@ -109,10 +114,27 @@ export default function PdfToPptxPage() {
 
     const fileName = `converted-${file.name.replace(/\.pdf$/i, "")}.pptx`;
     try {
-      await resultPres.writeFile({ fileName });
+      const output = await resultPres.write({ outputType: "blob" });
+      let blob: Blob;
+      if (output instanceof Blob) {
+        blob = output;
+      } else if (output instanceof ArrayBuffer) {
+        blob = new Blob([output], { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" });
+      } else if (output instanceof Uint8Array) {
+        const buffer = output.buffer.slice(output.byteOffset, output.byteOffset + output.byteLength) as ArrayBuffer;
+        blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" });
+      } else {
+        blob = new Blob([output], { type: "application/vnd.openxmlformats-officedocument.presentationml.presentation" });
+      }
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = fileName;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
       addFile({
         filename: fileName,
-        size: Math.round(estimatedPptxSize),
+        size: blob.size,
         timestamp: Date.now(),
         tool: "PDF to PPTX" as unknown as FileHistoryItem["tool"],
       });
@@ -120,7 +142,7 @@ export default function PdfToPptxPage() {
       console.error(error);
       toast.error("Something went wrong.");
     }
-  }, [addFile, estimatedPptxSize, file, resultPres]);
+  }, [addFile, file, resultPres]);
 
   const handleDrop = useCallback(async (acceptedFiles: File[]) => {
     const selectedFile = acceptedFiles[0];
@@ -133,6 +155,7 @@ export default function PdfToPptxPage() {
     const runId = runIdRef.current + 1;
     runIdRef.current = runId;
     cleanupWorker();
+    releasePresentationRefs();
     let proxy: import("pdfjs-dist").PDFDocumentProxy | null = null;
     let firstPage: { getViewport: (options: { scale: number }) => { width: number; height: number }; cleanup?: () => void } | null = null;
     try {
@@ -149,7 +172,6 @@ export default function PdfToPptxPage() {
       setStartPage(1);
       setEndPage(proxy.numPages);
       setFirstPageDims({ w: viewport.width, h: viewport.height });
-      setResultPres(null);
     } catch (error) {
       console.error(error);
       toast.error(error instanceof Error ? error.message : "Something went wrong.");
@@ -158,7 +180,7 @@ export default function PdfToPptxPage() {
       await proxy?.cleanup?.();
       await proxy?.destroy?.();
     }
-  }, [cleanupWorker]);
+  }, [cleanupWorker, releasePresentationRefs]);
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
     onDrop: handleDrop,
@@ -175,6 +197,7 @@ export default function PdfToPptxPage() {
     const runId = runIdRef.current + 1;
     runIdRef.current = runId;
     cleanupWorker();
+    releasePresentationRefs();
     setStep("process");
     setCancelled(false);
     cancelRef.current = false;
@@ -241,6 +264,7 @@ export default function PdfToPptxPage() {
         activePresRef.current = null;
         if (message.type === "DONE") {
           if (localCreated === 0) {
+            releasePresentationRefs();
             toast.error("No slides were created.");
             setStep("configure");
             return;
@@ -249,6 +273,7 @@ export default function PdfToPptxPage() {
           setStep("result");
           toast.success(`Done! ${localCreated} slides created.`);
         } else {
+          releasePresentationRefs();
           toast.error(message.error || "PowerPoint conversion failed.");
           setStep("configure");
         }
@@ -256,17 +281,18 @@ export default function PdfToPptxPage() {
       worker.onerror = (event) => {
         if (runIdRef.current !== runId) return;
         cleanupWorker();
-        activePresRef.current = null;
+        releasePresentationRefs();
         toast.error(`Worker error: ${event.message}`);
         setStep("configure");
       };
       worker.postMessage({ type: "RENDER", jobId: runId, fileBytes: arrayBuffer, startPage: actualStart, endPage: actualEnd, scale: 2, quality: 0.85 }, [arrayBuffer]);
     } catch (error) {
       console.error(error);
+      releasePresentationRefs();
       toast.error("Something went wrong.");
       setStep("configure");
     }
-  }, [actualEnd, actualStart, cleanupWorker, file, firstPageDims.h, firstPageDims.w, totalToProcess]);
+  }, [actualEnd, actualStart, cleanupWorker, file, firstPageDims.h, firstPageDims.w, releasePresentationRefs, totalToProcess]);
 
   const cancelConversion = useCallback(() => {
     runIdRef.current += 1;
@@ -280,26 +306,27 @@ export default function PdfToPptxPage() {
       setStep("result");
       toast.info("Conversion stopped - partial file ready.");
     } else {
+      releasePresentationRefs();
       setStep("configure");
       toast.info("Conversion cancelled.");
     }
-  }, [cleanupWorker]);
+  }, [cleanupWorker, releasePresentationRefs]);
   const goToConfigure = useCallback(() => {
+    releasePresentationRefs();
     setStep("configure");
-  }, []);
+  }, [releasePresentationRefs]);
 
   const goToUpload = useCallback(() => {
     runIdRef.current += 1;
     cancelRef.current = true;
     cleanupWorker();
-    activePresRef.current = null;
+    releasePresentationRefs();
     createdSlidesRef.current = 0;
     setFile(null);
-    setResultPres(null);
     setPageCount(0);
     setFirstPageDims({ w: 0, h: 0 });
     setStep("upload");
-  }, [cleanupWorker]);
+  }, [cleanupWorker, releasePresentationRefs]);
 
   const selectAllPages = useCallback(() => {
     setPageScope("all");
@@ -331,9 +358,9 @@ export default function PdfToPptxPage() {
       runIdRef.current += 1;
       cancelRef.current = true;
       cleanupWorker();
-      activePresRef.current = null;
+      releasePresentationRefs();
     };
-  }, [cleanupWorker]);
+  }, [cleanupWorker, releasePresentationRefs]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {

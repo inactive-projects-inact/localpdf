@@ -15,8 +15,9 @@ import {
   type CropMarginsMm,
   type CropScopeMode,
 } from "../lib/pdf-crop";
-import { downloadBlob, renderPdfPageToCanvas, getPdfjs } from "../lib/pdf-utils";
+import { downloadBlob, getPdfjs } from "../lib/pdf-utils";
 import { useProcessorWorker } from "../hooks/useProcessorWorker";
+import { useCanvasRenderer } from "../hooks/useCanvasRenderer";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
 
 const TOOL = getToolDefinition("crop");
@@ -73,8 +74,50 @@ export default function CropPage() {
   const worker = useProcessorWorker();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // offscreenCanvasRef holds the base page render for compositing the crop overlay.
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const previewJobIdRef = useRef(0);
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
+
+  const canvasRenderer = useCanvasRenderer({
+    onResult: useCallback((result) => {
+      if (!result.url) {
+        // OffscreenCanvas unavailable — fall back: offscreenCanvasRef stays null,
+        // preview stays blank (margin overlay still draws on an empty canvas).
+        return;
+      }
+      // Draw the bitmap URL into offscreenCanvasRef for overlay compositing.
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          URL.revokeObjectURL(result.url!);
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        offscreenCanvasRef.current = canvas;
+        URL.revokeObjectURL(result.url!);
+        // Trigger overlay repaint now that the base image is ready.
+        // updatePreview reads from offscreenCanvasRef — we call it directly.
+        const base = offscreenCanvasRef.current;
+        const visCanvas = canvasRef.current;
+        if (!base || !visCanvas) return;
+        visCanvas.width = base.width;
+        visCanvas.height = base.height;
+        const vCtx = visCanvas.getContext("2d");
+        if (!vCtx) return;
+        vCtx.drawImage(base, 0, 0);
+      };
+      img.onerror = () => URL.revokeObjectURL(result.url!);
+      img.src = result.url;
+    }, []),
+    onError: useCallback(() => {
+      // Silently degrade — preview stays blank.
+    }, []),
+  });
 
   const validateRange = useCallback((): string | null => {
     if (mode === "single" && (singlePage < 1 || singlePage > pageCount)) return `Page must be 1–${pageCount}.`;
@@ -109,14 +152,22 @@ export default function CropPage() {
       setPageWidth(viewport.width);
       setPageHeight(viewport.height);
       setRangeEnd(count);
-      
-      const canvas = document.createElement("canvas");
-      await renderPdfPageToCanvas(bytes, 1, canvas);
-      offscreenCanvasRef.current = canvas;
+      offscreenCanvasRef.current = null;
+
+      // Request the page render via the worker (OffscreenCanvas path).
+      const jobId = ++previewJobIdRef.current;
+      canvasRenderer.request({
+        jobId,
+        requestId: `crop-preview-${jobId}`,
+        fileBytes: bytes,
+        pageIndex: 0,
+        targetWidth: Math.ceil(400 * 1.25),
+        extraRotation: 0,
+      });
     } catch {
       toast.error("Could not read PDF.");
     }
-  }, [worker]);
+  }, [worker, canvasRenderer]);
 
   useEffect(() => {
     if (pendingFiles.length > 0 && !file && (!pendingTool || pendingTool === "crop")) {

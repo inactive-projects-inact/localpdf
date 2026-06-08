@@ -12,6 +12,7 @@ import { useFileHistory } from "../components/FileHistoryProvider";
 
 const ACCENT = "#F59E0B";
 const MAX_EXCEL_BYTES = 50 * 1024 * 1024;
+const MIN_MEANINGFUL_OUTPUT_BYTES = 500;
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -72,6 +73,11 @@ export default function ExcelToPdfPage() {
       } else if (message.type === "DONE") {
         const loadedFile = fileRef.current;
         if (!loadedFile) return;
+        if (!(message.result instanceof ArrayBuffer) || message.result.byteLength < MIN_MEANINGFUL_OUTPUT_BYTES) {
+          setProcessing(false);
+          toast.error("Conversion produced an empty PDF.", { id: "excel2pdf" });
+          return;
+        }
         const pdfBytes = new Uint8Array(message.result);
         const baseName = loadedFile.name.replace(/\.(xlsx|xls)$/i, "");
         setResult({ bytes: pdfBytes, name: `converted-${baseName}.pdf` });
