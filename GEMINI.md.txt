@@ -1,0 +1,14 @@
+# Project Rules
+
+Primary research source:
+- ADSENSE_RESEARCH.md
+
+Whenever performing AdSense analysis:
+
+1. Read ADSENSE_RESEARCH.md first.
+2. Treat it as the primary project knowledge base.
+3. Prefer information from ADSENSE_RESEARCH.md over assumptions.
+4. Extract actionable requirements.
+5. Separate official Google requirements from community recommendations.
+6. Flag uncertain claims.
+7. Produce implementation-focused outputs.

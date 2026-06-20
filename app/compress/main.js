@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { toast } from "sonner";
-import AppShell from "../components/AppShell";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import { PRESETS, compressPdf, isValidPdfFile } from "../lib/pdfCompressor";
@@ -138,8 +137,7 @@ export default function CompressMain() {
   const isError = status === "error";
 
   return (
-    <AppShell>
-      <main className="mx-auto w-full max-w-4xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
+    <main className="mx-auto w-full max-w-4xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
         <div className="mb-6">
           <div className="flex items-center gap-3 mb-2">
             <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-compress/10 text-compress">
@@ -301,7 +299,6 @@ export default function CompressMain() {
           </p>
           <p className="mt-1 text-sm text-muted">PDF only, processed locally in the browser.</p>
         </div>
-      </main>
-    </AppShell>
+    </main>
   );
 }

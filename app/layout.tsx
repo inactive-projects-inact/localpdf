@@ -1,10 +1,10 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import "./globals.css";
 import ThemeProvider from "./components/ThemeProvider";
 import FileHistoryProvider from "./components/FileHistoryProvider";
 import ToastManager from "./components/ToastManager";
-import CookieConsent from "./components/CookieConsent";
-import AdsterraSocialBar from "./components/AdsterraSocialBar";
+import { ADSENSE_PUBLISHER_NUM } from "./lib/adsense-config";
 
 export const metadata: Metadata = {
   title: {
@@ -85,6 +85,28 @@ export default function RootLayout({
             `,
           }}
         />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              window.dataLayer = window.dataLayer || [];
+              function gtag(){dataLayer.push(arguments);}
+              gtag('consent', 'default', {
+                'ad_storage': 'denied',
+                'ad_user_data': 'denied',
+                'ad_personalization': 'denied',
+                'analytics_storage': 'denied',
+                'wait_for_update': 500
+              });
+              window.adsbygoogle = window.adsbygoogle || [];
+              adsbygoogle.pauseAdRequests = 1;
+            `,
+          }}
+        />
+        <Script
+          id="google-privacy-messaging-cmp"
+          src={`https://fundingchoicesmessages.google.com/i/pub-${ADSENSE_PUBLISHER_NUM}?ers=1`}
+          strategy="beforeInteractive"
+        />
       </head>
       <body className="min-h-full flex flex-col font-sans">
         <ThemeProvider>
@@ -93,8 +115,6 @@ export default function RootLayout({
             <ToastManager />
           </FileHistoryProvider>
         </ThemeProvider>
-        <CookieConsent />
-        <AdsterraSocialBar />
       </body>
     </html>
   );

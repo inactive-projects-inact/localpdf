@@ -12,12 +12,7 @@ import {
   validatePipelineOutput,
 } from "./pdf-worker-utils";
 
-type TextContentItem = {
-  str: string;
-  transform: number[];
-  height: number;
-  width: number;
-};
+type TextContentItem = Extract<Awaited<ReturnType<pdfjsLib.PDFPageProxy["getTextContent"]>>["items"][number], { str: string }>;
 
 type Line = {
   text: string;
@@ -156,7 +151,7 @@ async function analyzePdf(message: Extract<PdfPipelineRequest, { type: "START" }
   let firstPage: pdfjsLib.PDFPageProxy | null = null;
   try {
     postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 20, message: "Reading PDF..." });
-    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(message.input.fileBytes), disableWorker: true }).promise;
+    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(message.input.fileBytes) }).promise;
     assertActiveJob(message.jobId, activeJobId);
     if (pdf.numPages < 1) throw new PdfPipelineWorkerError("Could not read any pages from this PDF.", "corrupted", true);
 
@@ -185,13 +180,16 @@ async function analyzePdf(message: Extract<PdfPipelineRequest, { type: "START" }
 
 async function convertPdf(message: Extract<PdfPipelineRequest, { type: "START" }>): Promise<void> {
   let pdf: pdfjsLib.PDFDocumentProxy | null = null;
+  if (message.task.tool !== "pdf-to-markdown" || message.task.operation !== "convert") {
+    throw new Error("Invalid task for convertPdf");
+  }
   const options = message.task.options;
   try {
     const memoryWarning = buildMemoryWarning(message.jobId, message.input.fileSize);
     if (memoryWarning) postPipelineMessage(memoryWarning);
 
     postPipelineMessage({ type: "PROGRESS", jobId: message.jobId, phase: "loading", percent: 10, message: "Loading PDF..." });
-    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(message.input.fileBytes), disableWorker: true }).promise;
+    pdf = await pdfjsLib.getDocument({ data: new Uint8Array(message.input.fileBytes) }).promise;
     assertActiveJob(message.jobId, activeJobId);
     if (pdf.numPages < 1) throw new PdfPipelineWorkerError("Could not read any pages from this PDF.", "corrupted", true);
 

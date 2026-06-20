@@ -14,7 +14,11 @@ export const colors = {
 } as const;
 
 export const toolAccents = {
-  compress: { color: colors.green, bg: "#0F2A1A", label: "Compress" },
+  compress: {
+    color: "#00E676",
+    bg: "#001A0D",
+    label: "Compress",
+  },
   merge: { color: "#9B59B6", bg: "#1A0F2A", label: "Merge" },
   split: { color: "#3498DB", bg: "#0F1A2A", label: "Split" },
   rotate: { color: "#10B981", bg: "#0F2A1A", label: "Rotate" },

@@ -15,3 +15,17 @@ if (!existsSync(src)) {
 mkdirSync(destDir, { recursive: true });
 copyFileSync(src, dest);
 console.log("Copied pdf.worker.min.mjs to public/");
+
+// Copy Ghostscript WASM binary
+const gsSrc = join(root, "node_modules/@jspawn/ghostscript-wasm/gs.wasm");
+const gsDestDir = join(destDir, "assets/wasm");
+const gsDest = join(gsDestDir, "gs.wasm");
+
+if (existsSync(gsSrc)) {
+  mkdirSync(gsDestDir, { recursive: true });
+  copyFileSync(gsSrc, gsDest);
+  console.log("Copied gs.wasm to public/assets/wasm/");
+} else {
+  console.warn("Ghostscript WASM binary not found, skipping copy");
+}
+

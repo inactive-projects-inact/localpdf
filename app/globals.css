@@ -49,6 +49,7 @@
   --color-accent-light: var(--accent-light);
   --color-success: var(--success);
   --color-compress: var(--compress);
+  --color-compress-color: #00e676;
   --color-merge: var(--merge);
   --color-split: var(--split);
   --color-rotate: var(--rotate);

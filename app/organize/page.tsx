@@ -323,7 +323,7 @@ export default function OrganizePage() {
         ),
       );
     }, []),
-    onError: useCallback((requestId, _pageIndex, _reason) => {
+    onError: useCallback((requestId: string, _pageIndex: number, _reason: string) => {
       pendingRequestsRef.current.delete(requestId);
       // Errors (non-cancellation) are silently degraded — thumbnail stays as skeleton.
     }, []),
@@ -372,7 +372,7 @@ export default function OrganizePage() {
     canvasRenderer.request({
       jobId: thumbnailJobIdRef.current,
       requestId,
-      fileBytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      fileBytes: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
       pageIndex,
       targetWidth: 150,
       extraRotation: 0,

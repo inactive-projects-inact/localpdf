@@ -107,7 +107,7 @@ export default function RotatePage() {
       img.addEventListener("load", () => URL.revokeObjectURL(result.url!), { once: true });
       img.addEventListener("error", () => URL.revokeObjectURL(result.url!), { once: true });
     }, []),
-    onError: useCallback((requestId, _pageIndex, reason) => {
+    onError: useCallback((requestId: string, _pageIndex: number, reason: string) => {
       const taskId = parseInt(requestId.split("-")[1] ?? "0", 10);
       if (taskId === previewTaskRef.current) setPreviewRendering(false);
       void reason; // "cancelled" is already filtered by the hook
