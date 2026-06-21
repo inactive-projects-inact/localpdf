@@ -5,8 +5,13 @@ import { useDropzone } from "react-dropzone";
 import { RotateCw } from "lucide-react";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
-import SizeComparisonBadge from "../components/SizeComparisonBadge";
-import ShortcutHint from "../components/ShortcutHint";
+import ToolPageHeader from "../components/ToolPageHeader";
+import ToolTrustIndicators from "../components/ToolTrustIndicators";
+import ToolUploadZone from "../components/ToolUploadZone";
+import ToolProcessingPanel from "../components/ToolProcessingPanel";
+import ToolSuccessPanel from "../components/ToolSuccessPanel";
+import ToolErrorPanel from "../components/ToolErrorPanel";
+import ToolSizeResult from "../components/ToolSizeResult";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { useProcessorWorker } from "../hooks/useProcessorWorker";
 import { formatBytes } from "../lib/format-bytes";
@@ -306,56 +311,24 @@ export default function RotatePage() {
 
   return (
     <AppShell>
-      <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
-        <div className="mb-8">
-          <div className="mb-2 flex items-center gap-3">
-            <div
-              className="flex h-10 w-10 items-center justify-center rounded-xl"
-              style={{ backgroundColor: `${ACCENT}1A`, color: ACCENT }}
-            >
-              <RotateCw className="h-6 w-6" aria-hidden />
-            </div>
-            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Rotate PDF</h1>
-          </div>
-          <p className="text-muted">Rotate every page or a single page — processed entirely in your browser.</p>
-        </div>
+      <main className="container-tool flex-1 py-8 sm:py-10">
+        <ToolPageHeader
+          title="Rotate PDF"
+          description="Rotate every page or a single page — processed entirely in your browser."
+          category="Organize"
+        />
+        <ToolTrustIndicators />
 
         {!hasFile && (
-          <div
-            {...getRootProps()}
-            className={`relative rounded-2xl border-2 border-dashed px-4 py-10 text-center transition sm:py-14 ${
-              isDragActive
-                ? "border-[#10B981] bg-[#10B981]/5"
-                : "border-border bg-card hover:border-[#10B981]/40 hover:bg-[#10B981]/5"
-            }`}
-          >
-            <input {...getInputProps()} aria-label="Upload PDF file" />
-            <div
-              className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl text-white shadow-lg"
-              style={{ backgroundColor: ACCENT, boxShadow: `0 10px 15px -3px ${ACCENT}40` }}
-            >
-              <RotateCw className="h-7 w-7" aria-hidden />
-            </div>
-            <p className="mt-4 text-base font-semibold text-foreground">
-              {isDragActive ? "Drop your PDF here" : "Drag & drop a PDF file"}
-            </p>
-            <p className="mt-1 text-sm text-muted">or</p>
-            <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:flex-row">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  open();
-                }}
-                className="inline-flex items-center justify-center rounded-xl px-6 py-2.5 text-sm font-semibold text-white shadow-md transition-transform hover:scale-105 active:scale-95"
-                style={{ backgroundColor: ACCENT }}
-              >
-                Browse files
-              </button>
-              <ShortcutHint shortcut="U" label="Press" />
-            </div>
-            <p className="mt-4 text-xs text-muted">PDF only. Files stay on your device.</p>
-          </div>
+          <ToolUploadZone
+            accept={TOOL.input.accept}
+            multiple={false}
+            maxSize={TOOL.input.maxSizeBytes}
+            emptyTitle="Drop your PDF here"
+            dragTitle="Drop to rotate"
+            helperText="PDF only · Files stay on your device"
+            onDrop={onDrop}
+          />
         )}
 
         {isLoading && (
@@ -510,87 +483,55 @@ export default function RotatePage() {
         )}
 
         {isRotating && (
-          <div className="mt-8 flex items-center justify-center gap-3 rounded-2xl border border-border bg-card p-6">
-            <div
-              className="h-5 w-5 animate-spin rounded-full border-2 border-t-transparent"
-              style={{ borderColor: `${ACCENT}4D`, borderTopColor: ACCENT }}
-              aria-hidden
-            />
-            <p className="text-sm font-medium text-foreground">{worker.message || "Rotating PDF…"} {worker.progress}%</p>
-          </div>
+          <ToolProcessingPanel
+            fileName={file?.name}
+            statusLine={worker.message || `Rotating PDF — ${worker.progress}%`}
+            progress={worker.progress}
+          />
         )}
 
         {isError && (
-          <div className="mt-8 rounded-2xl border border-red-500/30 bg-red-500/5 p-5 shadow-sm">
-            <p className="font-semibold text-foreground">Something went wrong</p>
-            <p className="mt-1 text-sm text-muted">Please try another PDF or a different rotation setting.</p>
-            <button
-              type="button"
-              onClick={resetAll}
-              className="mt-4 inline-flex items-center gap-2 rounded-xl border border-border bg-card px-5 py-2.5 text-sm font-semibold text-foreground transition hover:bg-background"
-            >
-              Try another file
-            </button>
-          </div>
+          <ToolErrorPanel
+            title="Rotation failed"
+            message={worker.error || "Please try another PDF or a different rotation setting."}
+            onTryAgain={() => {
+              worker.reset();
+              void applyRotation();
+            }}
+            onChooseAnother={resetAll}
+          />
         )}
 
         {isDone && worker.resultBlob && file && (
-          <SizeComparisonBadge originalSize={file.size} compressedSize={worker.resultBlob.size} />
+          <ToolSuccessPanel
+            title="Rotation complete!"
+            fileName={worker.resultFilename ?? "rotated.pdf"}
+            message="Your PDF was rotated on your device."
+            downloadLabel="Download PDF"
+            onDownload={() => downloadBlob(worker.resultBlob!, worker.resultFilename!)}
+            onTryAgain={() => worker.reset()}
+            onChooseAnother={resetAll}
+            nextActions={[
+              { href: "/split", label: "Split PDF" },
+              { href: "/compress", label: "Compress PDF" },
+            ]}
+          >
+            <ToolSizeResult originalSize={file.size} newSize={worker.resultBlob.size} />
+          </ToolSuccessPanel>
         )}
 
-        {hasFile && (
+        {hasFile && !isDone && (
           <div className="mt-8 flex w-full flex-col gap-3 pb-20 sm:flex-row sm:justify-end sm:pb-0">
-            {isDone ? (
-              <>
-                <div className="flex w-full items-center gap-2 sm:w-auto">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (worker.resultBlob) downloadBlob(worker.resultBlob, worker.resultFilename!);
-                    }}
-                    className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-8 py-3.5 text-base font-semibold text-white shadow-lg transition hover:opacity-90 sm:w-auto"
-                    style={{ backgroundColor: ACCENT }}
-                  >
-                    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12M12 16.5V3"
-                      />
-                    </svg>
-                    Download PDF
-                  </button>
-                  <ShortcutHint shortcut="D" />
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    worker.reset();
-                  }}
-                  className="inline-flex w-full items-center justify-center rounded-xl border border-border bg-card px-8 py-3.5 text-base font-semibold text-foreground transition hover:bg-accent-light hover:text-accent sm:w-auto"
-                >
-                  Rotate again
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={() => void applyRotation()}
-                disabled={!canRotate}
-                className="inline-flex w-full items-center justify-center gap-2 rounded-xl px-8 py-3.5 text-base font-semibold text-white shadow-lg transition enabled:hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
-                style={{ backgroundColor: ACCENT }}
-              >
-                <RotateCw className="h-5 w-5" aria-hidden />
-                Rotate PDF
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => void applyRotation()}
+              disabled={!canRotate}
+              className="btn-primary inline-flex w-full gap-2 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+            >
+              <RotateCw className="h-5 w-5" aria-hidden />
+              Rotate PDF
+            </button>
           </div>
-        )}
-
-        {isDone && (
-          <p className="mt-4 text-center text-sm text-muted">
-            Ready: <span className="font-medium text-foreground">{worker.resultFilename}</span>
-          </p>
         )}
       </main>
     </AppShell>

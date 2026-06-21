@@ -5,6 +5,7 @@ import ThemeProvider from "./components/ThemeProvider";
 import FileHistoryProvider from "./components/FileHistoryProvider";
 import ToastManager from "./components/ToastManager";
 import { ADSENSE_PUBLISHER_NUM } from "./lib/adsense-config";
+import { spaceGrotesk, inter, ibmPlexMono } from "./lib/fonts";
 
 export const metadata: Metadata = {
   title: {
@@ -32,10 +33,6 @@ export const metadata: Metadata = {
   metadataBase: new URL("https://localpdf.dev"),
   alternates: { canonical: "https://localpdf.dev" },
   manifest: "/manifest.json",
-  // verification: {
-  //   google: "REPLACE_WITH_REAL_TOKEN_FROM_GOOGLE_SEARCH_CONSOLE",
-  //   // Go to search.google.com/search-console → Add Property → HTML tag method
-  // },
   openGraph: {
     type: "website",
     siteName: "LocalPDF",
@@ -68,19 +65,30 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className="h-full scroll-smooth antialiased"
+      className={`${spaceGrotesk.variable} ${inter.variable} ${ibmPlexMono.variable} h-full scroll-smooth antialiased`}
       suppressHydrationWarning
     >
       <head>
+        {/* --- GOOGLE ANALYTICS INTEGRATION --- */}
+        <Script
+          src="https://www.googletagmanager.com/gtag/js?id=G-WP7JP34538"
+          strategy="afterInteractive"
+        />
+        <Script id="google-analytics" strategy="afterInteractive">
+          {`
+            window.dataLayer = window.dataLayer || [];
+            function gtag(){dataLayer.push(arguments);}
+            gtag('js', new Date());
+            gtag('config', 'G-WP7JP34538');
+          `}
+        </Script>
+        {/* ------------------------------------ */}
+
         <script
           dangerouslySetInnerHTML={{
             __html: `
               try {
-                if (localStorage.theme === 'light') {
-                  document.documentElement.classList.add('light')
-                } else {
-                  document.documentElement.classList.remove('light')
-                }
+                document.documentElement.classList.add('light')
               } catch (_) {}
             `,
           }}
@@ -108,7 +116,7 @@ export default function RootLayout({
           strategy="beforeInteractive"
         />
       </head>
-      <body className="min-h-full flex flex-col font-sans">
+      <body className="min-h-full flex flex-col font-body">
         <ThemeProvider>
           <FileHistoryProvider>
             {children}

@@ -1,81 +1,118 @@
 import Link from "next/link";
+import { ChevronRight } from "lucide-react";
 import Logo from "./Logo";
+import { NAV_TOOLS } from "../lib/nav-config";
+
+const COMPANY_LINKS = [
+  { label: "About", href: "/about" },
+  { label: "Blog", href: "/blog" },
+  { label: "Contact", href: "/contact" },
+];
+
+const LEGAL_LINKS = [
+  { label: "Privacy Policy", href: "/privacy-policy" },
+  { label: "Terms & Conditions", href: "/terms" },
+  { label: "Disclaimer", href: "/disclaimer" },
+];
+
+const PRODUCT_LINKS = [
+  { label: "How it works", href: "/#how-it-works" },
+  { label: "All tools", href: "/tools" },
+  { label: "Compress PDF", href: "/compress" },
+  { label: "Merge PDF", href: "/merge" },
+  { label: "Split PDF", href: "/split" },
+];
+
+function FooterColumn({ title, links }: { title: string; links: { label: string; href: string }[] }) {
+  return (
+    <div>
+      <h3 className="text-caption text-paper-0/70">{title}</h3>
+      <ul className="mt-4 flex flex-col gap-2.5">
+        {links.map((link) => (
+          <li key={link.href}>
+            <Link
+              href={link.href}
+              className="text-[13px] text-paper-0/70 transition hover:text-paper-0"
+            >
+              {link.label}
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function FooterAccordion({ title, links }: { title: string; links: { label: string; href: string }[] }) {
+  return (
+    <details className="border-b border-ink-700 sm:hidden">
+      <summary className="flex h-11 cursor-pointer list-none items-center justify-between text-caption text-paper-0/70 marker:content-none [&::-webkit-details-marker]:hidden">
+        {title}
+        <ChevronRight className="h-4 w-4" aria-hidden />
+      </summary>
+      <ul className="mb-4 flex flex-col gap-2.5 pl-1">
+        {links.map((link) => (
+          <li key={link.href}>
+            <Link href={link.href} className="text-[13px] text-paper-0/70 hover:text-paper-0">
+              {link.label}
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
 
 export default function Footer() {
+  const sortedTools = [...NAV_TOOLS].sort((a, b) => a.label.localeCompare(b.label));
+
   return (
-    <footer className="border-t border-border bg-background px-4 pb-20 pt-12 sm:pb-8">
-      <div className="container-lp grid gap-10 sm:grid-cols-2 lg:grid-cols-[2fr_1fr_1fr]">
-        <div>
+    <footer className="bg-ink-900 px-4 pb-8 pt-16">
+      <div className="container-content">
+        <div className="hidden gap-8 sm:grid sm:grid-cols-2 lg:grid-cols-5">
+          <div className="lg:col-span-1">
+            <Logo footer />
+            <p className="mt-3 text-[13px] text-paper-0/70">
+              Free PDF tools that never leave your device.
+            </p>
+          </div>
+          <FooterColumn title="Product" links={PRODUCT_LINKS} />
+          <div>
+            <h3 className="text-caption text-paper-0/70">Tools</h3>
+            <ul className="mt-4 flex max-h-48 flex-col gap-2 overflow-y-auto">
+              {sortedTools.map((tool) => (
+                <li key={tool.href}>
+                  <Link
+                    href={tool.href}
+                    className="text-[13px] text-paper-0/70 transition hover:text-paper-0"
+                  >
+                    {tool.label}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <FooterColumn title="Company" links={COMPANY_LINKS} />
+          <FooterColumn title="Legal" links={LEGAL_LINKS} />
+        </div>
+
+        <div className="sm:hidden">
           <Logo footer />
-          <p className="mt-2 text-[13px] text-muted">Your PDFs. Private. Fast. Done.</p>
+          <FooterAccordion title="Product" links={PRODUCT_LINKS} />
+          <FooterAccordion
+            title="Tools"
+            links={sortedTools.slice(0, 8).map((t) => ({ label: t.label, href: t.href }))}
+          />
+          <FooterAccordion title="Company" links={COMPANY_LINKS} />
+          <FooterAccordion title="Legal" links={LEGAL_LINKS} />
         </div>
 
-        <div>
-          <h3 className="mb-4 text-[13px] font-semibold uppercase tracking-wider text-foreground">Product</h3>
-          <ul className="flex flex-col gap-2.5">
-            <li>
-              <Link href="/#features" className="text-[13px] text-muted transition hover:text-accent">
-                Features
-              </Link>
-            </li>
-            <li>
-              <Link href="/#pricing" className="text-[13px] text-muted transition hover:text-accent">
-                Pricing
-              </Link>
-            </li>
-            <li>
-              <Link href="/compress" className="text-[13px] text-muted transition hover:text-accent">
-                Compress
-              </Link>
-            </li>
-            <li>
-              <Link href="/merge" className="text-[13px] text-muted transition hover:text-accent">
-                Merge
-              </Link>
-            </li>
-            <li>
-              <Link href="/split" className="text-[13px] text-muted transition hover:text-accent">
-                Split
-              </Link>
-            </li>
-            <li>
-              <Link href="/signature" className="text-[13px] text-muted transition hover:text-accent">
-                Signature
-              </Link>
-            </li>
-          </ul>
-        </div>
-
-        <div>
-          <h3 className="mb-4 text-[13px] font-semibold uppercase tracking-wider text-foreground">Company</h3>
-          <ul className="flex flex-col gap-2.5">
-            <li>
-              <Link href="/about" className="text-[13px] text-muted transition hover:text-accent">
-                About
-              </Link>
-            </li>
-            <li>
-              <Link href="/privacy-policy" className="text-[13px] text-muted transition hover:text-accent">
-                Privacy Policy
-              </Link>
-            </li>
-            <li>
-              <Link href="/terms" className="text-[13px] text-muted transition hover:text-accent">
-                Terms &amp; Conditions
-              </Link>
-            </li>
-            <li>
-              <Link href="/contact" className="text-[13px] text-muted transition hover:text-accent">
-                Contact
-              </Link>
-            </li>
-          </ul>
+        <div className="mt-8 flex flex-col items-center justify-between gap-4 border-t border-ink-700 pt-6 sm:flex-row">
+          <p className="text-caption text-paper-0/60">
+            © {new Date().getFullYear()} Localpdf. All rights reserved.
+          </p>
         </div>
       </div>
-
-      <p className="container-lp mt-8 border-t border-border pt-6 text-center text-[13px] text-muted">
-        © {new Date().getFullYear()} Localpdf. All rights reserved.
-      </p>
     </footer>
   );
 }

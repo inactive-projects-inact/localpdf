@@ -47,7 +47,7 @@ function normalizePreset(presetKey) {
   return PRESETS[presetKey] ?? PRESETS.medium;
 }
 
-function downloadPdfBytes(pdfBytes, originalName) {
+export function downloadPdfBytes(pdfBytes, originalName) {
   const blob = new Blob([pdfBytes], { type: "application/pdf" });
   const objectUrl = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -128,7 +128,7 @@ export async function compressPdf(pdfFile, presetKey = "medium", onProgress = nu
         const result = message.result;
         const pdfBytes = transferOrClone(message.pdfBytes);
         downloadPdfBytes(pdfBytes, pdfFile.name);
-        resolve(result);
+        resolve({ ...result, pdfBytes });
       }
     };
 

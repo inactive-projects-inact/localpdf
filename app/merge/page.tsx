@@ -1,11 +1,16 @@
 "use client";
 
 import { useCallback, useRef, useState, useEffect } from "react";
-import { useDropzone } from "react-dropzone";
+import { useDropzone, type FileRejection } from "react-dropzone";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
-import SizeComparisonBadge from "../components/SizeComparisonBadge";
-import ShortcutHint from "../components/ShortcutHint";
+import ToolPageHeader from "../components/ToolPageHeader";
+import ToolTrustIndicators from "../components/ToolTrustIndicators";
+import ToolUploadZone from "../components/ToolUploadZone";
+import ToolProcessingPanel from "../components/ToolProcessingPanel";
+import ToolSuccessPanel from "../components/ToolSuccessPanel";
+import ToolErrorPanel from "../components/ToolErrorPanel";
+import ToolSizeResult from "../components/ToolSizeResult";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import { getToolDefinition, hasPdfHeader } from "../lib/tool-registry";
@@ -53,20 +58,23 @@ export default function MergePage() {
     [clearMerged],
   );
 
-  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
+  const onDropRejected = useCallback((rejections: FileRejection[]) => {
+    const err = rejections[0]?.errors[0];
+    if (err?.code === "file-too-large") {
+      toast.error(`"${rejections[0].file.name}" exceeds the 500 MB limit.`);
+    } else {
+      toast.error(`Only PDF files are accepted. Got: ${rejections[0]?.file.name ?? "unknown"}`);
+    }
+  }, []);
+
+  const { getInputProps, open } = useDropzone({
     onDrop,
     accept: TOOL.input.accept,
     multiple: true,
     maxSize: TOOL.input.maxSizeBytes,
-    noClick: items.length > 0,
-    onDropRejected: (rejections) => {
-      const err = rejections[0]?.errors[0];
-      if (err?.code === "file-too-large") {
-        toast.error(`"${rejections[0].file.name}" exceeds the 500 MB limit.`);
-      } else {
-        toast.error(`Only PDF files are accepted. Got: ${rejections[0]?.file.name ?? "unknown"}`);
-      }
-    },
+    noClick: true,
+    noKeyboard: true,
+    onDropRejected,
   });
 
   // Auto-load files dropped on HeroDropzone
@@ -150,7 +158,7 @@ export default function MergePage() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      if (e.key.toLowerCase() === "u") {
+      if (e.key.toLowerCase() === "u" && items.length > 0) {
         e.preventDefault();
         open();
       } else if (e.key.toLowerCase() === "d" && workerState.phase === "done" && workerState.resultBytes) {
@@ -160,7 +168,7 @@ export default function MergePage() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [workerState.phase, workerState.resultBytes, open, handleDownload]);
+  }, [workerState.phase, workerState.resultBytes, items.length, open, handleDownload]);
 
   const isMerging = workerState.phase === "merging" || workerState.phase === "saving";
   const isDone = workerState.phase === "done" && workerState.resultBytes !== null;
@@ -168,55 +176,48 @@ export default function MergePage() {
   const canMerge = items.length >= 2 && !isMerging;
   const originalSizeSum = items.reduce((sum, item) => sum + item.file.size, 0);
 
+  const mergeProgress =
+    workerState.phase === "saving"
+      ? 95
+      : workerState.completedFiles > 0
+        ? Math.round((workerState.completedFiles / workerState.totalFiles) * 90)
+        : 5;
+
+  const mergeStatusLine =
+    workerState.phase === "saving"
+      ? "Saving final PDF…"
+      : workerState.currentFile
+        ? workerState.currentFile.stage === "loading"
+          ? `Loading file ${workerState.currentFile.fileIndex}/${workerState.currentFile.totalFiles}`
+          : `Copying pages from file ${workerState.currentFile.fileIndex}/${workerState.currentFile.totalFiles}`
+        : "Starting merge…";
+
   return (
     <AppShell>
-      <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
-        <div className="mb-8">
-          <div className="flex items-center gap-3 mb-2">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-merge/10 text-merge">
-              <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 15L12 18.75 15.75 15m-7.5-6L12 5.25 15.75 9" />
-              </svg>
-            </div>
-            <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">Merge PDFs</h1>
-          </div>
-          <p className="text-muted">Add files, drag to reorder, then merge — all on your device.</p>
-        </div>
+      <main className="container-tool flex-1 py-8 sm:py-10">
+        <ToolPageHeader
+          title="Merge PDF"
+          description="Add files, drag to reorder, then merge — all on your device."
+          category="Organize"
+        />
+        <ToolTrustIndicators />
 
-        {/* Upload zone */}
-        <div
-          {...getRootProps()}
-          className={`relative rounded-2xl border-2 border-dashed px-4 py-10 text-center transition sm:py-14 ${
-            isDragActive
-              ? "border-merge bg-merge/5"
-              : "border-border bg-card hover:border-merge/40 hover:bg-merge/5"
-          }`}
-        >
-          <input {...getInputProps()} aria-label="Upload PDF files" />
-          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-merge text-white shadow-lg shadow-merge/25">
-            <svg className="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m0 0l7.5-7.5m0 0L7.5 16.5M12 3v13.5" />
-            </svg>
-          </div>
-          <p className="mt-4 text-base font-semibold text-foreground">
-            {isDragActive ? "Drop your PDFs here" : "Drag & drop PDF files"}
-          </p>
-          <p className="mt-1 text-sm text-muted">or</p>
-          <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:flex-row">
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); open(); }}
-              className="inline-flex items-center justify-center rounded-xl bg-merge px-6 py-2.5 text-sm font-semibold text-white shadow-md transition-transform hover:scale-105 active:scale-95"
-            >
-              Browse files
-            </button>
-            <ShortcutHint shortcut="U" label="Press" />
-          </div>
-          <p className="mt-4 text-xs text-muted">Add at least 2 PDFs to merge. Files stay on your device.</p>
-        </div>
+        {items.length > 0 && <input {...getInputProps()} className="sr-only" tabIndex={-1} aria-hidden />}
 
-        {/* File list */}
-        {items.length > 0 && (
+        {items.length === 0 && (
+          <ToolUploadZone
+            accept={TOOL.input.accept}
+            multiple
+            maxSize={TOOL.input.maxSizeBytes}
+            emptyTitle="Drag & drop PDF files"
+            dragTitle="Drop your PDFs here"
+            helperText="Add at least 2 PDFs to merge. Files stay on your device."
+            onDrop={onDrop}
+            onDropRejected={onDropRejected}
+          />
+        )}
+
+        {!isDone && items.length > 0 && (
           <div className="mt-6 space-y-3">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-foreground">
@@ -290,70 +291,27 @@ export default function MergePage() {
         )}
 
         {isMerging && (
-          <div className="mt-8 rounded-2xl border border-border bg-card p-5 shadow-sm">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className="h-5 w-5 animate-spin rounded-full border-2 border-merge/30 border-t-merge" aria-hidden />
-                <div>
-                  {workerState.phase === "saving" ? (
-                    <p className="text-sm font-semibold text-foreground">Saving final PDF…</p>
-                  ) : workerState.currentFile ? (
-                    <>
-                      <p className="text-sm font-semibold text-foreground">
-                        {workerState.currentFile.stage === "loading" ? "Loading" : "Copying pages from"} file{" "}
-                        {workerState.currentFile.fileIndex}/{workerState.currentFile.totalFiles}
-                      </p>
-                      <p className="text-xs text-muted truncate max-w-xs">{workerState.currentFile.fileName}</p>
-                    </>
-                  ) : (
-                    <p className="text-sm font-semibold text-foreground">Starting merge…</p>
-                  )}
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={cancel}
-                className="text-xs font-medium text-muted transition hover:text-red-500"
-              >
-                Cancel
-              </button>
-            </div>
-            <div className="mt-4 h-2 overflow-hidden rounded-full bg-border">
-              <div
-                className="h-full rounded-full bg-merge transition-all duration-500"
-                style={{
-                  width: workerState.phase === "saving"
-                    ? "95%"
-                    : workerState.completedFiles > 0
-                      ? `${Math.round((workerState.completedFiles / workerState.totalFiles) * 90)}%`
-                      : "5%",
-                }}
-              />
-            </div>
-            {workerState.totalFiles > 1 && (
-              <p className="mt-2 text-xs text-muted">
-                {workerState.completedFiles} of {workerState.totalFiles} files merged
-              </p>
-            )}
-          </div>
+          <ToolProcessingPanel
+            fileName={workerState.currentFile?.fileName}
+            statusLine={mergeStatusLine}
+            progress={mergeProgress}
+            onCancel={cancel}
+          />
         )}
 
         {isError && (
-          <div className="mt-8 rounded-2xl border border-red-500/30 bg-red-500/5 p-5 shadow-sm">
-            <div className="flex items-start gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-500/10 text-red-500">
-                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-                </svg>
-              </div>
-              <div>
-                <p className="font-semibold text-foreground">Merge failed</p>
-                <p className="mt-1 text-sm text-muted">
-                  {workerState.errorMessage ?? "One or more PDFs may be encrypted or corrupted."}
-                </p>
-              </div>
-            </div>
-          </div>
+          <ToolErrorPanel
+            title="Merge failed"
+            message={workerState.errorMessage ?? "One or more PDFs may be encrypted or corrupted."}
+            onTryAgain={() => {
+              clearMerged();
+              handleMerge();
+            }}
+            onChooseAnother={() => {
+              setItems([]);
+              clearMerged();
+            }}
+          />
         )}
 
         {workerState.skippedFiles.length > 0 && (isDone || isError) && (
@@ -377,45 +335,39 @@ export default function MergePage() {
         )}
 
         {isDone && workerState.resultBytes && (
-          <SizeComparisonBadge originalSize={originalSizeSum} compressedSize={workerState.resultBytes.byteLength} />
+          <ToolSuccessPanel
+            title="Merge complete!"
+            fileName="merged.pdf"
+            message="Your PDFs were combined into one file."
+            downloadLabel="Download merged PDF"
+            onDownload={handleDownload}
+            onTryAgain={clearMerged}
+            onChooseAnother={() => {
+              setItems([]);
+              clearMerged();
+            }}
+            nextActions={[
+              { href: "/merge", label: "Merge PDF" },
+              { href: "/split", label: "Split PDF" },
+              { href: "/compress", label: "Compress PDF" },
+            ]}
+          >
+            <ToolSizeResult originalSize={originalSizeSum} newSize={workerState.resultBytes.byteLength} />
+          </ToolSuccessPanel>
         )}
 
-        {/* Actions */}
-        <div className="mt-8 flex w-full flex-col items-center gap-3 pb-20 sm:flex-row sm:justify-end sm:pb-0">
-          {isDone ? (
-            <>
-              <div className="flex w-full items-center gap-2 sm:w-auto">
-                <button
-                  type="button"
-                  onClick={handleDownload}
-                  className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-merge px-8 py-3.5 text-base font-semibold text-white shadow-lg transition hover:bg-merge/90 sm:w-auto"
-                >
-                  <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12M12 16.5V3" />
-                  </svg>
-                  Download merged PDF
-                </button>
-                <ShortcutHint shortcut="D" />
-              </div>
-              <button
-                type="button"
-                onClick={clearMerged}
-                className="inline-flex w-full items-center justify-center rounded-xl border border-border bg-card px-8 py-3.5 text-base font-semibold text-foreground transition hover:bg-accent-light hover:text-accent sm:w-auto"
-              >
-                Merge again
-              </button>
-            </>
-          ) : (
+        {!isDone && items.length > 0 && (
+          <div className="mt-8 flex w-full flex-col items-center gap-3 pb-20 sm:flex-row sm:justify-end sm:pb-0">
             <button
               type="button"
               onClick={handleMerge}
               disabled={!canMerge}
-              className="inline-flex w-full items-center justify-center rounded-xl bg-merge px-8 py-3.5 text-base font-semibold text-white shadow-lg transition enabled:hover:bg-merge/90 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+              className="btn-primary w-full disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
             >
               {isMerging ? "Merging…" : items.length < 2 ? "Add at least 2 PDFs to merge" : "Merge PDFs"}
             </button>
-          )}
-        </div>
+          </div>
+        )}
 
         {/* SEO CONTENT & JSON-LD SCHEMAS */}
         <script

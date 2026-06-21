@@ -1,35 +1,49 @@
-import Reveal from "./Reveal";
+import { Lock, UserX, EyeOff } from "lucide-react";
+import Link from "next/link";
 
 const items = [
-  { label: "No Install", delay: 0 },
-  { label: "No Account", delay: 100 },
-  { label: "No File Uploads", delay: 200 },
-  { label: "AES-256", delay: 300 },
-  { label: "Free", delay: 400 },
+  {
+    icon: Lock,
+    title: "Files processed in your browser",
+    description: "Nothing is sent to a server.",
+  },
+  {
+    icon: UserX,
+    title: "No sign-up, no email required",
+    description: "Start immediately, no account.",
+  },
+  {
+    icon: EyeOff,
+    title: "We never see your files",
+    description: "Your documents stay on your device.",
+  },
 ];
 
 export default function TrustBar() {
   return (
-    <Reveal className="bar-card trust-bar mx-auto mt-8 flex flex-wrap items-stretch justify-around gap-4">
-      {items.map((item) => (
-        <Reveal
-          key={item.label}
-          delay={item.delay}
-          className="relative flex min-w-[100px] flex-1 flex-col items-center px-3 py-2 text-center"
-        >
-          <svg className="h-7 w-7 text-accent" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-            <circle cx="14" cy="14" r="10" stroke="currentColor" strokeWidth="2" />
-            <path
-              d="M9 14l3 3 7-7"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          <span className="mt-2 text-[13px] font-medium text-body">{item.label}</span>
-        </Reveal>
-      ))}
-    </Reveal>
+    <section aria-label="Trust and privacy" className="bg-paper-100 py-12 sm:py-16">
+      <div className="container-content">
+        <div className="grid gap-8 sm:grid-cols-3 sm:gap-12">
+          {items.map((item) => {
+            const Icon = item.icon;
+            return (
+              <div key={item.title} className="flex flex-col items-center text-center">
+                <Icon className="h-8 w-8 text-local-500" strokeWidth={1.5} aria-hidden />
+                <p className="mt-3 text-body-m font-medium text-ink-900">{item.title}</p>
+                <p className="mt-1 text-body-s text-ink-500">{item.description}</p>
+              </div>
+            );
+          })}
+        </div>
+        <p className="mt-8 text-center">
+          <Link
+            href="/privacy-policy"
+            className="text-body-s font-semibold text-ink-700 underline-offset-3 hover:underline"
+          >
+            How we handle your files
+          </Link>
+        </p>
+      </div>
+    </section>
   );
 }

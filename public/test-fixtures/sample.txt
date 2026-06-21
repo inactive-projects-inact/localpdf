@@ -1,0 +1,2 @@
+LocalPDF text fixture.
+This supports the text-to-PDF flow.

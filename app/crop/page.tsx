@@ -5,8 +5,13 @@ import { useDropzone } from "react-dropzone";
 import { Crop } from "lucide-react";
 import { toast } from "sonner";
 import AppShell from "../components/AppShell";
-import SizeComparisonBadge from "../components/SizeComparisonBadge";
-import ShortcutHint from "../components/ShortcutHint";
+import ToolPageHeader from "../components/ToolPageHeader";
+import ToolTrustIndicators from "../components/ToolTrustIndicators";
+import ToolUploadZone from "../components/ToolUploadZone";
+import ToolProcessingPanel from "../components/ToolProcessingPanel";
+import ToolSuccessPanel from "../components/ToolSuccessPanel";
+import ToolErrorPanel from "../components/ToolErrorPanel";
+import ToolSizeResult from "../components/ToolSizeResult";
 import { useFileHistory } from "../components/FileHistoryProvider";
 import { formatBytes } from "../lib/format-bytes";
 import {
@@ -129,6 +134,20 @@ export default function CropPage() {
     }
     return null;
   }, [mode, singlePage, rangeStart, rangeEnd, pageCount, pageWidth, pageHeight, margins]);
+
+  const resetAll = useCallback(() => {
+    worker.reset();
+    setFile(null);
+    setPdfBytes(null);
+    setPageCount(0);
+    setPageWidth(0);
+    setPageHeight(0);
+    setRangeEnd(1);
+    setSinglePage(1);
+    setMode("all");
+    setMargins({ top: 0, bottom: 0, left: 0, right: 0 });
+    offscreenCanvasRef.current = null;
+  }, [worker]);
 
   const loadPdf = useCallback(async (uploaded: File) => {
     worker.reset();
@@ -271,32 +290,26 @@ export default function CropPage() {
 
   return (
     <AppShell>
-      <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8 sm:px-6 sm:py-10">
-        <div className="mb-8 flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl" style={{ backgroundColor: `${ACCENT}1A`, color: ACCENT }}>
-            <Crop className="h-6 w-6" />
-          </div>
-          <div>
-            <h1 className="text-2xl font-bold text-foreground sm:text-3xl">Crop PDF</h1>
-            <p className="text-muted">Trim margins from all or selected pages.</p>
-          </div>
-        </div>
+      <main className="container-tool flex-1 py-8 sm:py-10">
+        <ToolPageHeader
+          title="Crop PDF"
+          description="Trim margins from all or selected pages."
+          category="Edit"
+        />
+        <ToolTrustIndicators />
 
         {!hasFile && (
-          <div
-            {...getRootProps()}
-            className={`rounded-2xl border-2 border-dashed py-12 text-center ${!isDragActive && "border-border bg-card"}`}
-            style={isDragActive ? { borderColor: ACCENT, backgroundColor: `${ACCENT}0D` } : undefined}
-          >
-            <input {...getInputProps()} />
-            <p className="font-semibold">Drag & drop a PDF</p>
-            <button type="button" onClick={() => open()} className="mt-4 rounded-xl px-6 py-2 text-sm font-semibold text-white" style={{ backgroundColor: ACCENT }}>
-              Browse
-            </button>
-            <div className="mt-3 flex justify-center">
-              <ShortcutHint shortcut="U" />
-            </div>
-          </div>
+          <ToolUploadZone
+            accept={TOOL.input.accept}
+            multiple={false}
+            maxSize={TOOL.input.maxSizeBytes}
+            emptyTitle="Drop your PDF here"
+            dragTitle="Drop to crop"
+            helperText="PDF only · Files stay on your device"
+            onDrop={(files) => {
+              if (files[0]) void loadPdf(files[0]);
+            }}
+          />
         )}
 
         {hasFile && (
@@ -392,20 +405,54 @@ export default function CropPage() {
           </>
         )}
 
-        {isDone && file && worker.resultBlob && <SizeComparisonBadge originalSize={file.size} compressedSize={worker.resultBlob.size} />}
+        {worker.status === "processing" && (
+          <ToolProcessingPanel
+            fileName={file?.name}
+            statusLine={worker.message || `Cropping — ${worker.progress}%`}
+            progress={worker.progress}
+          />
+        )}
 
-        {hasFile && (
+        {worker.status === "error" && (
+          <ToolErrorPanel
+            title="Crop failed"
+            message={worker.error || "Something went wrong. Check your crop settings and try again."}
+            onTryAgain={() => {
+              worker.reset();
+              void handleCrop();
+            }}
+            onChooseAnother={resetAll}
+          />
+        )}
+
+        {isDone && file && worker.resultBlob && (
+          <ToolSuccessPanel
+            title="Crop complete!"
+            fileName={worker.resultFilename ?? "cropped.pdf"}
+            message="Your PDF was cropped on your device."
+            downloadLabel="Download PDF"
+            onDownload={() => downloadBlob(worker.resultBlob!, worker.resultFilename!)}
+            onTryAgain={() => worker.reset()}
+            onChooseAnother={resetAll}
+            nextActions={[
+              { href: "/compress", label: "Compress PDF" },
+              { href: "/merge", label: "Merge PDF" },
+            ]}
+          >
+            <ToolSizeResult originalSize={file.size} newSize={worker.resultBlob.size} />
+          </ToolSuccessPanel>
+        )}
+
+        {hasFile && !isDone && (
           <div className="mt-8 flex items-center gap-2 pb-20 sm:justify-end sm:pb-0">
             <button
               type="button"
               disabled={worker.status === "processing"}
-              onClick={() => (isDone && worker.resultBlob ? downloadBlob(worker.resultBlob, worker.resultFilename!) : void handleCrop())}
-              className="rounded-xl px-8 py-3.5 font-semibold text-white disabled:opacity-50"
-              style={{ backgroundColor: ACCENT }}
+              onClick={() => void handleCrop()}
+              className="btn-primary disabled:opacity-50"
             >
-              {worker.status === "processing" ? `${worker.message || "Cropping"} ${worker.progress}%` : isDone ? "Download PDF" : "Crop PDF"}
+              Crop PDF
             </button>
-            <ShortcutHint shortcut={isDone ? "D" : "U"} />
           </div>
         )}
       </main>

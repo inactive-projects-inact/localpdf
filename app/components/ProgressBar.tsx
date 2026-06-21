@@ -3,19 +3,25 @@
 interface ProgressBarProps {
   progress: number;
   label?: string;
+  mode?: "local" | "cloud";
 }
 
-export default function ProgressBar({ progress, label }: ProgressBarProps) {
+export default function ProgressBar({ progress, label, mode = "local" }: ProgressBarProps) {
+  const clamped = Math.min(Math.max(progress, 0), 100);
+
   return (
-    <div className="flex flex-col gap-2 w-full">
-      <div className="flex items-center justify-between text-xs font-medium text-zinc-400">
-        <span className="truncate text-zinc-400">{label || "Processing..."}</span>
-        <span className="tabular-nums font-semibold text-zinc-200">{Math.round(progress)}%</span>
-      </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+    <div className="flex w-full flex-col gap-2">
+      {label && (
+        <p className="truncate font-mono text-[13px] font-medium text-ink-500">{label}</p>
+      )}
+      <div className="progress-track">
         <div
-          className="h-full rounded-full bg-[#00E676] transition-all duration-300 ease-out"
-          style={{ width: `${Math.min(Math.max(progress, 0), 100)}%` }}
+          className={`progress-fill ${mode === "cloud" ? "is-cloud" : ""}`}
+          style={{ width: `${clamped}%` }}
+          role="progressbar"
+          aria-valuenow={clamped}
+          aria-valuemin={0}
+          aria-valuemax={100}
         />
       </div>
     </div>

@@ -11,21 +11,17 @@ export default function ToolGuide({ steps }: ToolGuideProps) {
 
   return (
     <section aria-labelledby="tool-guide-heading" className="mb-16">
-      <h2 id="tool-guide-heading" className="mb-6 text-2xl font-bold text-foreground">
-        How to Use This Tool
+      <h2 id="tool-guide-heading" className="text-heading-s text-ink-900">
+        How it works
       </h2>
-      <ol className="grid list-none gap-4 sm:grid-cols-2">
+      <ol className="mt-8 grid list-none gap-6 sm:grid-cols-3 sm:gap-8">
         {steps.map((step, index) => (
-          <li
-            key={`${step.title}-${index}`}
-            id={`guide-step-${index + 1}`}
-            className="rounded-2xl border border-border bg-card p-5"
-          >
-            <div className="mb-4 flex h-8 w-8 items-center justify-center rounded-full bg-accent-light text-sm font-bold text-accent">
+          <li key={`${step.title}-${index}`} id={`guide-step-${index + 1}`} className="flex flex-col items-start">
+            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-paper-100 font-mono text-[13px] font-medium text-ink-900">
               {index + 1}
-            </div>
-            <h3 className="mb-2 font-semibold text-foreground">{step.title}</h3>
-            <p className="text-sm leading-relaxed text-muted">{step.description}</p>
+            </span>
+            <h3 className="mt-3 text-body-m font-medium text-ink-900">{step.title}</h3>
+            <p className="mt-1 text-body-s text-ink-500">{step.description}</p>
           </li>
         ))}
       </ol>
