@@ -69,12 +69,12 @@ export default function HomePage() {
 
       {/* Hero + upload dropzone */}
       <section id="top" className="container-content flex flex-col items-center py-12 text-center sm:min-h-[640px] sm:justify-center sm:py-16">
-        <p className="text-caption text-local-500">Free · Private · No sign-up</p>
-        <h1 className="mt-3 max-w-[640px] text-display-xl text-ink-900">
-          Compress your PDF without uploading it
+        <p className="text-caption text-trust">Free · Private · No sign-up</p>
+        <h1 className="mt-3 max-w-[640px] text-display-xl">
+          PDF tools that run entirely in your browser
         </h1>
-        <p className="mt-4 max-w-[540px] text-body-l text-ink-700">
-          {totalTools} free tools. Drop a file below — done in seconds. Nothing leaves your device.
+        <p className="mt-4 max-w-[540px] text-body-l text-text-secondary">
+          {totalTools} tools — drop a file, done in seconds. Everything stays on your device.
         </p>
         <div className="mt-10 w-full">
           <HeroDropzone selectedTool={selectedTool} id="heroDropzone" />
@@ -83,7 +83,7 @@ export default function HomePage() {
 
       {/* Most-used tools */}
       <section aria-labelledby="most-used-heading" className="container-content py-12 sm:py-24">
-        <h2 id="most-used-heading" className="text-center font-display text-[40px] font-semibold leading-[48px] tracking-[-0.01em] text-ink-900">
+        <h2 id="most-used-heading" className="text-center text-display-l">
           Most-used tools
         </h2>
         <div className="mt-10 grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-6 lg:grid-cols-4">

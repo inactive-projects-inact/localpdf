@@ -26,8 +26,8 @@ export default function ToolCard({
           />
         )}
       </div>
-      <h3 className="mt-3 font-display text-base font-semibold leading-6 text-ink-900">{title}</h3>
-      <p className="mt-1 line-clamp-1 text-body-s text-ink-500">{description}</p>
+      <h3 className="mt-3 font-display text-base font-semibold leading-6 text-text-primary">{title}</h3>
+      <p className="mt-1 line-clamp-1 text-body-s text-text-muted">{description}</p>
     </Link>
   );
 }

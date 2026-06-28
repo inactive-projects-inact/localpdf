@@ -51,8 +51,8 @@ export default function ToolUploadZone({
       aria-busy={disabled}
     >
       <input {...getInputProps()} aria-label={emptyTitle} />
-      <Upload className="h-10 w-10 text-ink-500" strokeWidth={1.5} aria-hidden />
-      <p className="text-heading-s text-ink-900">{isDragActive ? dragTitle : emptyTitle}</p>
+      <Upload className="h-10 w-10 text-text-muted" strokeWidth={1.5} aria-hidden />
+      <p className="text-heading-s text-text-primary">{isDragActive ? dragTitle : emptyTitle}</p>
       {!disabled && (
         <button
           type="button"
@@ -60,12 +60,17 @@ export default function ToolUploadZone({
             e.stopPropagation();
             open();
           }}
-          className="text-body-s text-ink-500 underline-offset-2 hover:underline"
+          className="text-body-s text-text-muted underline-offset-2 transition hover:text-brand-primary hover:underline"
         >
           or click to browse
         </button>
       )}
-      {helperText && <p className="text-body-s text-ink-500">{helperText}</p>}
+      {helperText && <p className="text-body-s text-text-muted">{helperText}</p>}
+      <span className="shortcut-hint mt-1">
+        <kbd>Ctrl</kbd>
+        <span>+</span>
+        <kbd>O</kbd>
+      </span>
       <ModeBadge mode="local" />
     </div>
   );

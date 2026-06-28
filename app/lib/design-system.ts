@@ -1,25 +1,52 @@
 /** LocalPDF design tokens — spec §0 */
 
 export const colors = {
-  ink900: "#13151A",
-  ink700: "#3A3D46",
-  ink500: "#6B6E78",
-  ink300: "#B4B2AC",
-  paper0: "#FFFFFF",
-  paper50: "#FAFAF9",
-  paper100: "#F1F0ED",
-  border: "#E3E1DC",
-  borderStrong: "#C9C7C0",
-  local50: "#E3F6EF",
-  local500: "#0E8F6B",
-  local700: "#0B6B51",
+  /* Semantic surface */
+  bgPage: "#F7F8FB",
+  bgSurface: "#FFFFFF",
+  bgSurfaceMuted: "#F1F3F7",
+  /* Semantic text */
+  textPrimary: "#061B31",
+  textSecondary: "#3C4F69",
+  textMuted: "#64748D",
+  /* Brand (indigo — CTAs, actions) */
+  brandPrimary: "#533AFD",
+  brandPrimaryHover: "#6350FE",
+  brandPrimaryActive: "#4530D4",
+  /* Trust (green — privacy, local processing) */
+  trust: "#0E8F6B",
+  trustHover: "#0B6B51",
+  trustTint: "#E3F6EF",
+  /* Semantic accents */
+  success: "#3ECF8E",
+  successTint: "#E6FAF0",
+  warning: "#F5A623",
+  warningTint: "#FFF4E0",
+  destructive: "#E24A4A",
+  destructiveTint: "#FBE7E9",
+  /* Borders */
+  borderSubtle: "#DFE3EB",
+  borderStrong: "#BCC5D3",
+  /* Cloud */
   cloud50: "#ECF0FF",
   cloud500: "#4C6FFF",
   cloud700: "#2F49C9",
+  /* Legacy aliases */
+  ink900: "#061B31",
+  ink700: "#3C4F69",
+  ink500: "#64748D",
+  ink300: "#B4B2AC",
+  paper0: "#FFFFFF",
+  paper50: "#F7F8FB",
+  paper100: "#F1F3F7",
+  border: "#DFE3EB",
+  local50: "#E3F6EF",
+  local500: "#0E8F6B",
+  local700: "#0B6B51",
   error50: "#FBE7E9",
-  error500: "#D7263D",
+  error500: "#E24A4A",
   warning50: "#FFF4E0",
-  warning500: "#B66A00",
+  warning500: "#F5A623",
 } as const;
 
 export type ProcessingMode = "local" | "cloud";

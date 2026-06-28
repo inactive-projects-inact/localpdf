@@ -25,10 +25,10 @@ export default function ToolPageHeader({
         ]}
       />
       <div className="flex flex-wrap items-baseline gap-3">
-        <h1 className="text-display-m text-ink-900">{title}</h1>
+        <h1 className="text-display-m text-text-primary">{title}</h1>
         <ModeBadge mode={mode} compact />
       </div>
-      <p className="mt-2 text-body-m text-ink-700">{description}</p>
+      <p className="mt-2 text-body-m text-text-secondary">{description}</p>
     </header>
   );
 }

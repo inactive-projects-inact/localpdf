@@ -23,6 +23,8 @@ const TOOL = getToolDefinition("merge");
 export default function MergePage() {
   const [items, setItems] = useState<PdfItem[]>([]);
   const { state: workerState, merge, cancel, reset } = useMergeWorker();
+  const mergeStartTime = useRef<number>(0);
+  const [processingTimeMs, setProcessingTimeMs] = useState<number | undefined>(undefined);
 
   const { addFile, pendingFiles, pendingTool, clearPendingFiles } = useFileHistory();
 
@@ -121,6 +123,8 @@ export default function MergePage() {
 
   const handleMerge = () => {
     if (items.length < 2) return;
+    mergeStartTime.current = performance.now();
+    setProcessingTimeMs(undefined);
     toast.loading("Merging PDFs…", { id: "merge" });
     merge(items.map((item) => ({ id: item.id, file: item.file })));
   };
@@ -140,6 +144,10 @@ export default function MergePage() {
   // Wire up addFile to history when merge completes
   useEffect(() => {
     if (workerState.phase === "done" && workerState.resultBytes) {
+      const elapsed = mergeStartTime.current > 0
+        ? Math.round(performance.now() - mergeStartTime.current)
+        : undefined;
+      setProcessingTimeMs(elapsed);
       toast.success("Merge complete!", { id: "merge" });
       addFile({
         filename: "merged.pdf",
@@ -185,12 +193,12 @@ export default function MergePage() {
 
   const mergeStatusLine =
     workerState.phase === "saving"
-      ? "Saving final PDF…"
+      ? "Preparing download…"
       : workerState.currentFile
         ? workerState.currentFile.stage === "loading"
-          ? `Loading file ${workerState.currentFile.fileIndex}/${workerState.currentFile.totalFiles}`
-          : `Copying pages from file ${workerState.currentFile.fileIndex}/${workerState.currentFile.totalFiles}`
-        : "Starting merge…";
+          ? `Reading file ${workerState.currentFile.fileIndex} of ${workerState.currentFile.totalFiles}`
+          : `Merging pages from file ${workerState.currentFile.fileIndex} of ${workerState.currentFile.totalFiles}`
+        : "Analyzing files…";
 
   return (
     <AppShell>
@@ -220,13 +228,13 @@ export default function MergePage() {
         {!isDone && items.length > 0 && (
           <div className="mt-6 space-y-3">
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-foreground">
+              <h2 className="text-sm font-semibold text-text-primary">
                 {items.length} file{items.length !== 1 ? "s" : ""} — drag to reorder
               </h2>
               <button
                 type="button"
                 onClick={() => { setItems([]); clearMerged(); }}
-                className="text-sm font-medium text-muted transition hover:text-foreground"
+                className="text-sm font-medium text-text-muted transition hover:text-text-primary"
               >
                 Clear all
               </button>
@@ -241,29 +249,29 @@ export default function MergePage() {
                   onDragEnter={() => handleDragEnter(index)}
                   onDragEnd={handleDragEnd}
                   onDragOver={(e) => e.preventDefault()}
-                  className="flex cursor-grab items-center gap-3 rounded-xl border border-border bg-card p-3 shadow-sm active:cursor-grabbing sm:gap-4 sm:p-4"
+                  className="flex cursor-grab items-center gap-3 rounded-lg border border-border-subtle bg-bg-surface p-3 shadow-sm transition-all duration-[180ms] active:cursor-grabbing active:scale-[0.99] active:shadow-none sm:gap-4 sm:p-4 hover:shadow-md hover:border-border-strong"
                 >
-                  <span className="flex shrink-0 text-muted" aria-hidden title="Drag to reorder">
+                  <span className="flex shrink-0 text-text-muted" aria-hidden title="Drag to reorder">
                     <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M4 8h16M4 16h16" />
                     </svg>
                   </span>
-                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-merge/10 text-merge">
+                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md bg-brand-primary-muted text-brand-primary">
                     <svg className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
                     </svg>
                   </div>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold text-foreground sm:text-base">{item.file.name}</p>
-                    <p className="text-xs text-muted sm:text-sm">{formatBytes(item.file.size)}</p>
+                    <p className="truncate text-sm font-semibold text-text-primary sm:text-base">{item.file.name}</p>
+                    <p className="font-mono text-xs text-text-muted sm:text-sm">{formatBytes(item.file.size)}</p>
                   </div>
-                  <span className="hidden shrink-0 rounded-full bg-background px-2.5 py-0.5 text-xs font-medium text-muted sm:inline">
+                  <span className="hidden shrink-0 rounded-md bg-bg-surface-muted px-2.5 py-0.5 font-mono text-xs font-medium text-text-muted sm:inline">
                     {index + 1}
                   </span>
                   <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); removeItem(item.id); }}
-                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted transition hover:bg-red-500/10 hover:text-red-500"
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-text-muted transition hover:bg-destructive-tint hover:text-destructive"
                     aria-label={`Remove ${item.file.name}`}
                   >
                     <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -336,9 +344,9 @@ export default function MergePage() {
 
         {isDone && workerState.resultBytes && (
           <ToolSuccessPanel
-            title="Merge complete!"
+            title="Merge complete"
             fileName="merged.pdf"
-            message="Your PDFs were combined into one file."
+            message="Your PDFs were combined into a single document."
             downloadLabel="Download merged PDF"
             onDownload={handleDownload}
             onTryAgain={clearMerged}
@@ -346,6 +354,7 @@ export default function MergePage() {
               setItems([]);
               clearMerged();
             }}
+            processingTimeMs={processingTimeMs}
             nextActions={[
               { href: "/merge", label: "Merge PDF" },
               { href: "/split", label: "Split PDF" },
@@ -475,41 +484,41 @@ export default function MergePage() {
 
         <div className="mt-24 border-t border-border pt-16">
           <section className="mb-16">
-            <h2 className="text-2xl font-bold text-foreground mb-6">How It Works</h2>
+            <h2 className="text-2xl font-bold text-text-primary mb-6">How It Works</h2>
             <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
               <div className="bg-card border border-border p-5 rounded-2xl">
-                <div className="w-8 h-8 rounded-full bg-merge/10 text-merge font-bold flex items-center justify-center mb-4">1</div>
-                <h3 className="font-semibold text-foreground mb-2">Select your PDFs</h3>
-                <p className="text-sm text-muted">Upload two or more PDF files you want to combine. You can select multiple files at once or add them one by one.</p>
+                <div className="w-8 h-8 rounded-md bg-brand-primary-muted text-brand-primary font-bold flex items-center justify-center mb-4">1</div>
+                <h3 className="font-semibold text-text-primary mb-2">Select your PDFs</h3>
+                <p className="text-sm text-text-muted">Upload two or more PDF files you want to combine. You can select multiple files at once or add them one by one.</p>
               </div>
               <div className="bg-card border border-border p-5 rounded-2xl">
-                <div className="w-8 h-8 rounded-full bg-merge/10 text-merge font-bold flex items-center justify-center mb-4">2</div>
-                <h3 className="font-semibold text-foreground mb-2">Reorder files</h3>
-                <p className="text-sm text-muted">Drag and drop the files in the list to arrange them in the exact order you want them to appear in the final document.</p>
+                <div className="w-8 h-8 rounded-md bg-brand-primary-muted text-brand-primary font-bold flex items-center justify-center mb-4">2</div>
+                <h3 className="font-semibold text-text-primary mb-2">Reorder files</h3>
+                <p className="text-sm text-text-muted">Drag and drop the files in the list to arrange them in the exact order you want them to appear in the final document.</p>
               </div>
               <div className="bg-card border border-border p-5 rounded-2xl">
-                <div className="w-8 h-8 rounded-full bg-merge/10 text-merge font-bold flex items-center justify-center mb-4">3</div>
-                <h3 className="font-semibold text-foreground mb-2">Merge instantly</h3>
-                <p className="text-sm text-muted">Click the merge button. Your browser will instantly combine the documents into a single cohesive PDF file without losing quality.</p>
+                <div className="w-8 h-8 rounded-md bg-brand-primary-muted text-brand-primary font-bold flex items-center justify-center mb-4">3</div>
+                <h3 className="font-semibold text-text-primary mb-2">Merge instantly</h3>
+                <p className="text-sm text-text-muted">Click the merge button. Your browser will instantly combine the documents into a single cohesive PDF file without losing quality.</p>
               </div>
               <div className="bg-card border border-border p-5 rounded-2xl">
-                <div className="w-8 h-8 rounded-full bg-merge/10 text-merge font-bold flex items-center justify-center mb-4">4</div>
-                <h3 className="font-semibold text-foreground mb-2">Download safely</h3>
-                <p className="text-sm text-muted">Save the merged PDF directly to your device. Since it never left your computer, there are no privacy concerns.</p>
+                <div className="w-8 h-8 rounded-md bg-brand-primary-muted text-brand-primary font-bold flex items-center justify-center mb-4">4</div>
+                <h3 className="font-semibold text-text-primary mb-2">Download safely</h3>
+                <p className="text-sm text-text-muted">Save the merged PDF directly to your device. Since it never left your computer, there are no privacy concerns.</p>
               </div>
             </div>
           </section>
 
           <section className="mb-16">
-            <h2 className="text-2xl font-bold text-foreground mb-6">Why Use LocalPDF to Merge?</h2>
+            <h2 className="text-2xl font-bold text-text-primary mb-6">Why Use LocalPDF to Merge?</h2>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="flex gap-3">
                 <div className="mt-1 text-success">
                   <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
                 </div>
                 <div>
-                  <h3 className="font-semibold text-foreground">100% Browser-Based Privacy</h3>
-                  <p className="text-sm text-muted">Your sensitive documents are never uploaded to our servers. All merging happens locally using your device's memory.</p>
+                  <h3 className="font-semibold text-text-primary">100% Browser-Based Privacy</h3>
+                  <p className="text-sm text-text-muted">Your sensitive documents are never uploaded to our servers. All merging happens locally using your device's memory.</p>
                 </div>
               </div>
               <div className="flex gap-3">
@@ -517,8 +526,8 @@ export default function MergePage() {
                   <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
                 </div>
                 <div>
-                  <h3 className="font-semibold text-foreground">Completely Free</h3>
-                  <p className="text-sm text-muted">We don't charge you for processing files, and we don't put features behind a paywall or require an account registration.</p>
+                  <h3 className="font-semibold text-text-primary">Completely Free</h3>
+                  <p className="text-sm text-text-muted">We don't charge you for processing files, and we don't put features behind a paywall or require an account registration.</p>
                 </div>
               </div>
               <div className="flex gap-3">
@@ -526,8 +535,8 @@ export default function MergePage() {
                   <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
                 </div>
                 <div>
-                  <h3 className="font-semibold text-foreground">No Watermarks</h3>
-                  <p className="text-sm text-muted">Unlike other free tools, we will never brand or watermark your output files. Your documents remain entirely yours.</p>
+                  <h3 className="font-semibold text-text-primary">No Watermarks</h3>
+                  <p className="text-sm text-text-muted">Unlike other free tools, we will never brand or watermark your output files. Your documents remain entirely yours.</p>
                 </div>
               </div>
               <div className="flex gap-3">
@@ -535,59 +544,59 @@ export default function MergePage() {
                   <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
                 </div>
                 <div>
-                  <h3 className="font-semibold text-foreground">Works on Any Device</h3>
-                  <p className="text-sm text-muted">Whether you're using a laptop, tablet, or smartphone, our tool works seamlessly in any modern web browser.</p>
+                  <h3 className="font-semibold text-text-primary">Works on Any Device</h3>
+                  <p className="text-sm text-text-muted">Whether you're using a laptop, tablet, or smartphone, our tool works seamlessly in any modern web browser.</p>
                 </div>
               </div>
             </div>
           </section>
 
           <section className="mb-16">
-            <h2 className="text-2xl font-bold text-foreground mb-6">Frequently Asked Questions</h2>
+            <h2 className="text-2xl font-bold text-text-primary mb-6">Frequently Asked Questions</h2>
             <div className="space-y-6">
               <div>
-                <h3 className="font-semibold text-foreground text-lg">How many PDFs can I merge at once?</h3>
-                <p className="text-muted mt-2">You can merge dozens of PDFs at once. Because the merging happens on your device rather than a remote server, the only limit is your device's memory. Most modern computers can easily merge 50+ files in one go.</p>
+                <h3 className="font-semibold text-text-primary text-lg">How many PDFs can I merge at once?</h3>
+                <p className="text-text-muted mt-2">You can merge dozens of PDFs at once. Because the merging happens on your device rather than a remote server, the only limit is your device's memory. Most modern computers can easily merge 50+ files in one go.</p>
               </div>
               <div>
-                <h3 className="font-semibold text-foreground text-lg">Will merging PDFs change the quality or formatting?</h3>
-                <p className="text-muted mt-2">No, merging PDFs with LocalPDF retains 100% of the original quality. We simply append the pages of one document to the end of another without altering the underlying images, text formatting, or metadata.</p>
+                <h3 className="font-semibold text-text-primary text-lg">Will merging PDFs change the quality or formatting?</h3>
+                <p className="text-text-muted mt-2">No, merging PDFs with LocalPDF retains 100% of the original quality. We simply append the pages of one document to the end of another without altering the underlying images, text formatting, or metadata.</p>
               </div>
               <div>
-                <h3 className="font-semibold text-foreground text-lg">Can I reorder pages before merging?</h3>
-                <p className="text-muted mt-2">Yes! After adding your PDF files, you can easily drag and drop the files in the list to change their order. The final merged PDF will combine the files in the exact sequence you arranged them.</p>
+                <h3 className="font-semibold text-text-primary text-lg">Can I reorder pages before merging?</h3>
+                <p className="text-text-muted mt-2">Yes! After adding your PDF files, you can easily drag and drop the files in the list to change their order. The final merged PDF will combine the files in the exact sequence you arranged them.</p>
               </div>
               <div>
-                <h3 className="font-semibold text-foreground text-lg">Is it safe to merge confidential documents on LocalPDF?</h3>
-                <p className="text-muted mt-2">Absolutely. LocalPDF is the safest way to merge confidential documents online because your files are never actually sent online. The merging process happens entirely locally within your web browser.</p>
+                <h3 className="font-semibold text-text-primary text-lg">Is it safe to merge confidential documents on LocalPDF?</h3>
+                <p className="text-text-muted mt-2">Absolutely. LocalPDF is the safest way to merge confidential documents online because your files are never actually sent online. The merging process happens entirely locally within your web browser.</p>
               </div>
               <div>
-                <h3 className="font-semibold text-foreground text-lg">What file size limit applies when merging PDFs?</h3>
-                <p className="text-muted mt-2">Our tool can handle files up to 500 MB. This is much larger than most cloud-based PDF tools because we don't have to worry about server storage or bandwidth costs. The processing uses your local device resources.</p>
+                <h3 className="font-semibold text-text-primary text-lg">What file size limit applies when merging PDFs?</h3>
+                <p className="text-text-muted mt-2">Our tool can handle files up to 500 MB. This is much larger than most cloud-based PDF tools because we don't have to worry about server storage or bandwidth costs. The processing uses your local device resources.</p>
               </div>
               <div>
-                <h3 className="font-semibold text-foreground text-lg">Can I merge PDFs on mobile devices?</h3>
-                <p className="text-muted mt-2">Yes, LocalPDF works flawlessly on iOS and Android devices. You can select multiple PDFs from your phone's file system and merge them directly in your mobile browser without installing any apps.</p>
+                <h3 className="font-semibold text-text-primary text-lg">Can I merge PDFs on mobile devices?</h3>
+                <p className="text-text-muted mt-2">Yes, LocalPDF works flawlessly on iOS and Android devices. You can select multiple PDFs from your phone's file system and merge them directly in your mobile browser without installing any apps.</p>
               </div>
             </div>
           </section>
 
           <section>
-            <h2 className="text-2xl font-bold text-foreground mb-6">Related Tools</h2>
+            <h2 className="text-2xl font-bold text-text-primary mb-6">Related Tools</h2>
             <div className="grid gap-4 sm:grid-cols-2">
-              <a href="/compress" className="group p-5 rounded-2xl border border-border bg-card hover:border-compress hover:bg-compress/5 transition flex items-center justify-between">
+              <a href="/compress" className="group p-5 rounded-xl border border-border-subtle bg-bg-surface shadow-sm hover:border-brand-primary hover:shadow-md transition flex items-center justify-between">
                 <div>
-                  <h3 className="font-semibold text-foreground group-hover:text-compress transition">Compress PDF</h3>
-                  <p className="text-sm text-muted mt-1">Reduce PDF file size without losing quality.</p>
+                  <h3 className="font-semibold text-text-primary group-hover:text-brand-primary transition">Compress PDF</h3>
+                  <p className="text-sm text-text-muted mt-1">Reduce PDF file size without losing quality.</p>
                 </div>
-                <div className="text-compress">→</div>
+                <div className="text-brand-primary">→</div>
               </a>
-              <a href="/split" className="group p-5 rounded-2xl border border-border bg-card hover:border-split hover:bg-split/5 transition flex items-center justify-between">
+              <a href="/split" className="group p-5 rounded-xl border border-border-subtle bg-bg-surface shadow-sm hover:border-brand-primary hover:shadow-md transition flex items-center justify-between">
                 <div>
-                  <h3 className="font-semibold text-foreground group-hover:text-split transition">Split PDF</h3>
-                  <p className="text-sm text-muted mt-1">Extract specific pages from a document.</p>
+                  <h3 className="font-semibold text-text-primary group-hover:text-brand-primary transition">Split PDF</h3>
+                  <p className="text-sm text-text-muted mt-1">Extract specific pages from a document.</p>
                 </div>
-                <div className="text-split">→</div>
+                <div className="text-brand-primary">→</div>
               </a>
             </div>
           </section>

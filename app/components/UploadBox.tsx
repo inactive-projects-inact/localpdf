@@ -113,7 +113,7 @@ export default function UploadBox({
   if (state === "processing") {
     return (
       <div id={id} className={boxClass}>
-        <p className="max-w-[320px] truncate text-body-m text-ink-900">{fileName}</p>
+        <p className="max-w-[320px] truncate text-body-m text-text-primary">{fileName}</p>
         <div className="w-full max-w-md px-6">
           <ModeBadge mode={mode} className="mb-3" />
           <ProgressBar progress={progress} label={statusLine} mode={mode} />
@@ -125,15 +125,15 @@ export default function UploadBox({
   if (state === "success") {
     return (
       <div id={id} className={boxClass} role="status" aria-live="polite">
-        <Check className="h-8 w-8 text-local-500" aria-hidden />
+        <Check className="h-8 w-8 text-trust" aria-hidden />
         {fileName && (
-          <p className="max-w-[320px] truncate text-body-m font-medium text-ink-900">{fileName}</p>
+          <p className="max-w-[320px] truncate text-body-m font-medium text-text-primary">{fileName}</p>
         )}
         {resultStat && (
-          <p className="font-mono text-[13px] font-medium text-ink-900">{resultStat}</p>
+          <p className="font-mono text-[13px] font-medium text-text-primary">{resultStat}</p>
         )}
         {onDownload && (
-          <button type="button" onClick={onDownload} className="btn-primary">
+          <button type="button" onClick={onDownload} className="btn-primary is-trust">
             Download
           </button>
         )}
@@ -145,8 +145,8 @@ export default function UploadBox({
   if (state === "error") {
     return (
       <div id={id} className={boxClass} role="alert" aria-live="assertive">
-        <AlertTriangle className="h-6 w-6 text-error-500" aria-hidden />
-        <p className="max-w-md text-body-s text-error-500">{errorMessage}</p>
+        <AlertTriangle className="h-6 w-6 text-destructive" aria-hidden />
+        <p className="max-w-md text-body-s text-destructive">{errorMessage}</p>
         <div className="mt-2 flex flex-wrap justify-center gap-2">
           {onBrowse && (
             <button type="button" onClick={onBrowse} className="btn-primary">
@@ -161,14 +161,14 @@ export default function UploadBox({
   return (
     <div {...getRootProps()} id={id} className={boxClass}>
       <input {...getInputProps()} aria-label={`Upload ${tool.input.label}`} />
-      <Upload className="h-10 w-10 text-ink-500" strokeWidth={1.5} aria-hidden />
-      <p className="text-heading-s text-ink-900">
+      <Upload className="h-10 w-10 text-text-muted" strokeWidth={1.5} aria-hidden />
+      <p className="text-heading-s text-text-primary">
         {isDragActive ? tool.input.dragActiveTitle : "Drop your PDF here"}
       </p>
       <button
         type="button"
         onClick={handleBrowse}
-        className="text-body-s text-ink-500 underline-offset-2 hover:underline"
+        className="text-body-s text-text-muted underline-offset-2 transition hover:text-brand-primary hover:underline"
       >
         or click to browse
       </button>
