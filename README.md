@@ -1,3 +1,8 @@
+# Domain sale for $5
+
+> **Domain for Sale**: `localpdf.dev` ($5 USD / ₹450 INR)  
+> **Contact**: [jyotishpabbisetti2025@gmail.com](mailto:jyotishpabbisetti2025@gmail.com)
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
