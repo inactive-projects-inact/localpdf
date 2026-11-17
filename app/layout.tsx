@@ -119,6 +119,15 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col font-body">
         <ThemeProvider>
           <FileHistoryProvider>
+            <div className="sticky top-0 z-50 border-b border-amber-700 bg-amber-400 px-4 py-3 text-center text-sm font-bold leading-relaxed text-slate-950 shadow-md sm:px-6">
+              DOMAIN FOR SALE: localpdf.dev is available for immediate transfer ($5 USD / ₹450 INR). Registered at Name.com (valid through May 27, 2027) — instant, free account-to-account push. Verified Owner:{" "}
+              <a
+                href="mailto:jyotishpabbisetti2025@gmail.com?subject=localpdf.dev%20Domain%20Purchase"
+                className="underline decoration-2 underline-offset-2 hover:text-slate-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-950 focus-visible:ring-offset-2 focus-visible:ring-offset-amber-400"
+              >
+                jyotishpabbisetti2025@gmail.com
+              </a>
+            </div>
             {children}
             <ToastManager />
           </FileHistoryProvider>
